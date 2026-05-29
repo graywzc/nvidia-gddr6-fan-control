@@ -1,0 +1,186 @@
+# nvidia-gddr6-fan-control
+
+VRAM-junction-temperature-driven fan control for NVIDIA GDDR6/GDDR6X GPUs on Linux, with a SwiftUI macOS menubar app for live monitoring and remote curve editing.
+
+Why this exists: NVIDIA's stock fan curve on Linux is driven by core temperature only. On RTX 3080/3090/A6000-class cards with GDDR6X, the memory junction temperature can sit ≥100°C while the core is happily under 70°C and the fans stay quiet. This project reads the actual VRAM junction temperature from the GPU's internal sensor, applies a user-defined fan curve, and exposes a small HTTP API so a Mac menubar app can monitor multiple GPUs and edit the curve live.
+
+## Architecture
+
+```
+┌──────────────────┐         ┌──────────────────────────────────┐
+│  macOS menubar   │ ◄────►  │  Linux host (RTX 30/40 series)   │
+│  app (SwiftUI)   │  HTTP   │  ┌─────────────────────────────┐ │
+│  ┌──────────┐    │  over   │  │ fan_control.py              │ │
+│  │ 96° 91°  │    │  Tail-  │  │  ├─ spawns gddr6 (VRAM temp)│ │
+│  └──────────┘    │  scale  │  │  ├─ applies curve via NVML  │ │
+│  click → opens   │         │  │  └─ HTTP /status, /curve    │ │
+│  curve editor    │         │  └─────────────────────────────┘ │
+└──────────────────┘         └──────────────────────────────────┘
+```
+
+- **VRAM temp source:** the [`gddr6`](https://github.com/olealgoritme/gddr6) binary by olealgoritme reads the on-die VRAM junction-temperature register via `/dev/mem`. NVML still does not expose this on consumer cards as of driver 580.
+- **Fan control:** `nvmlDeviceSetFanSpeed_v2` from NVML — no X server, no Xorg session, no Coolbits.
+- **Transport:** plaintext HTTP, bound only to the host's Tailscale interface. Tailscale handles encryption and identity.
+
+## Supported hardware
+
+Anything supported by `gddr6` upstream and with `nvmlDeviceSetFanSpeed_v2` enabled in the driver. Verified on RTX 3090 (GA102) with driver 580.159.03. Likely works on:
+
+- RTX 3070 / 3080 / 3080 Ti / 3090 / 3090 Ti
+- RTX 4070 / 4080 / 4090 (incl. 4090 D)
+- RTX A2000 / A4500 / A5000 / A6000, L4, L40S, A10
+
+See [olealgoritme/gddr6 supported GPUs](https://github.com/olealgoritme/gddr6#supported-gpus) for the full list of cards that can have their VRAM temperature read.
+
+## Dependencies
+
+### Linux
+
+- NVIDIA proprietary driver **≥ 525** (for NVML fan-control APIs). Driver 580+ recommended.
+- Python **≥ 3.9** (uses `http.server`, ctypes, only the standard library — no `pip install` needed).
+- `libpci-dev`, `cmake`, `build-essential` — only to build the `gddr6` binary.
+- `gddr6` binary — see install steps below.
+- Tailscale (optional but recommended) — provides network-layer auth so we don't need bearer tokens for the HTTP API.
+
+### macOS
+
+- macOS **≥ 13** (for SwiftUI `MenuBarExtra`).
+- Xcode Command Line Tools (`xcode-select --install`) — provides the `swift` compiler. The full Xcode IDE is **not** required.
+- Tailscale, on the same tailnet as the Linux hosts.
+
+## Install
+
+### Linux (run on each GPU host)
+
+```bash
+# 1. Build & install the gddr6 binary (the VRAM-temp reader)
+sudo apt install -y libpci-dev cmake build-essential
+cd ~/projects
+git clone https://github.com/olealgoritme/gddr6.git
+cd gddr6
+./build_install.sh    # answer 'y' to install /usr/local/bin/gddr6
+
+# 2. Install Tailscale (skip if already set up)
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+
+# 3. Install this project
+cd ~/projects
+git clone https://github.com/graywzc/nvidia-gddr6-fan-control.git
+cd nvidia-gddr6-fan-control
+sudo ./install/install-linux.sh
+```
+
+The installer copies `fan_control.py` to `/usr/local/bin/nvidia-gddr6-fan-control`, installs the systemd unit, creates `/var/lib/nvidia-gddr6-fan-control/` for the persisted curve, and enables + starts the service.
+
+Verify:
+
+```bash
+sudo systemctl status nvidia-gddr6-fan-control
+journalctl -u nvidia-gddr6-fan-control -f
+```
+
+The first log line should say `HTTP API listening on 100.x.x.x:8765` (the Tailscale IP).
+
+### macOS
+
+```bash
+# Make sure Xcode CLI tools and Tailscale are installed
+xcode-select --install
+# install Tailscale from https://tailscale.com/download/mac
+
+cd ~/projects
+git clone https://github.com/graywzc/nvidia-gddr6-fan-control.git
+cd nvidia-gddr6-fan-control
+./install/install-macos.sh
+```
+
+The installer runs `swift build -c release`, assembles `/Applications/MenubarApp.app`, and registers a per-user LaunchAgent so the app starts at every login.
+
+After install, click the menubar item → **Add Host…** and enter each Linux host's Tailscale name (e.g. `aipc1`, `aipc`) with port `8765`. The temp appears within ~1 second.
+
+## Usage
+
+### Menubar
+
+- Menubar label shows VRAM temps for each configured host, space-separated. Hottest temp colors the label (green < 85°C, yellow 85–94°C, red ≥ 95°C).
+- Click the label for a popover with per-host detail (VRAM temp, current fan %, GPU model).
+- Slider icon next to each host opens the curve editor for that host.
+
+### Curve editor
+
+- The current active segment (where the live VRAM temp falls) is highlighted.
+- Edit waypoints; the chart preview updates live.
+- **Apply** sorts the points by temperature, validates, and pushes the new curve to the host. The Linux controller switches to the new curve on its next iteration (≤ 1 s) and persists it to `/var/lib/nvidia-gddr6-fan-control/curve.json`.
+- **Revert** reloads from the host.
+
+### HTTP API
+
+Bound to the Tailscale interface only. No auth required (Tailscale handles identity).
+
+```
+GET  http://<host>:8765/status
+PUT  http://<host>:8765/curve
+       body: JSON list of [temp, fan_pct] pairs,
+             temps strictly ascending, e.g.
+             [[60,40],[80,55],[90,75],[95,90],[100,100]]
+```
+
+Example:
+
+```bash
+curl http://aipc1:8765/status
+curl -X PUT -H 'Content-Type: application/json' \
+     -d '[[60,40],[80,55],[90,75],[95,90],[100,100]]' \
+     http://aipc1:8765/curve
+```
+
+## Configuration
+
+Most options have sensible defaults; override via CLI flags or by editing the systemd unit.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--listen-tailscale` | off | Resolve and bind only to the host's Tailscale IPv4 |
+| `--listen-host` | `0.0.0.0` | HTTP bind address (ignored if `--listen-tailscale`) |
+| `--listen-port` | `8765` | HTTP port |
+| `--token-file` | none | File containing a bearer token; if unset, no auth |
+| `--state-file` | `/var/lib/nvidia-gddr6-fan-control/curve.json` | Persisted curve; use `off` to disable persistence |
+| `--gpu` | `0` | NVML GPU index to control |
+| `--gddr6-bin` | `/usr/local/bin/gddr6` | Path to the gddr6 binary |
+| `--dry-run` | off | Read temps and print decisions but never call NVML SetFanSpeed |
+
+## Troubleshooting
+
+- **`Connection refused` from the Mac:** the controller is binding to the wrong interface. Check `journalctl -u nvidia-gddr6-fan-control` — the "HTTP API listening on …" line should show your Tailscale IP. If it shows `127.0.0.1` or `0.0.0.0`, restart the service.
+- **`NVML SetFanSpeed: Insufficient Permissions`:** the service isn't running as root. The systemd unit runs as root by default; verify with `systemctl show -p User nvidia-gddr6-fan-control` (should be empty / root).
+- **VRAM temp shows `N/A`:** your GPU may not be in `gddr6`'s supported list; check with `sudo /usr/local/bin/gddr6`. If gddr6 sees it but our app doesn't, file an issue.
+- **Fans stuck at a fixed % after a crash:** `nvmlDeviceSetFanSpeed_v2` puts the GPU into manual mode and only `SetDefaultFanSpeed_v2` (or a reboot) releases it. The controller restores auto on SIGINT/SIGTERM/SIGHUP and atexit, but not on SIGKILL or power loss. To recover manually:
+  ```bash
+  sudo python3 -c "
+  import ctypes
+  m = ctypes.CDLL('libnvidia-ml.so.1')
+  m.nvmlInit_v2()
+  h = ctypes.c_void_p(); m.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h))
+  n = ctypes.c_uint(); m.nvmlDeviceGetNumFans(h, ctypes.byref(n))
+  for i in range(n.value): m.nvmlDeviceSetDefaultFanSpeed_v2(h, i)
+  m.nvmlShutdown()"
+  ```
+- **macOS menubar shows `—`:** host unreachable. Check `tailscale status` on both ends; `curl http://<host>:8765/status` from the Mac to isolate.
+
+## File layout
+
+```
+fan_control.py                          # the Linux controller
+systemd/nvidia-gddr6-fan-control.service
+install/install-linux.sh
+install/install-macos.sh
+macos/MenubarApp/
+    Package.swift
+    Sources/MenubarApp/
+        MenubarAppApp.swift             # @main, AppDelegate, MenuBarExtra scene
+        MenubarContent.swift            # popover view, host rows, Add Host window
+        CurveEditor.swift               # per-host curve editor window + chart
+        StatusPoller.swift              # 1 Hz polling, PUT /curve client
+        HostStatus.swift                # JSON models, Host config struct
+```
