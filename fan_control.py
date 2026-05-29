@@ -130,6 +130,7 @@ class State:
 class _Handler(http.server.BaseHTTPRequestHandler):
     state: "State" = None
     token: "str | None" = None
+    state_file: "str | None" = None
 
     def log_message(self, fmt, *args):
         # Quieter default logging — control loop has its own prints.
@@ -186,6 +187,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self._write_json(400, {"error": str(e)})
             return
         self.state.update(curve=new_curve)
+        if self.state_file:
+            save_persisted_curve(self.state_file, new_curve)
         self._write_json(200, {"curve": new_curve})
 
 
@@ -194,11 +197,11 @@ class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
-def start_http_server(host, port, state, token):
+def start_http_server(host, port, state, token, state_file):
     handler = type(
         "BoundHandler",
         (_Handler,),
-        {"state": state, "token": token},
+        {"state": state, "token": token, "state_file": state_file},
     )
     server = _ThreadedHTTPServer((host, port), handler)
     thread = threading.Thread(
@@ -259,6 +262,45 @@ def parse_vram_temps(chunk):
     return [int(m) for m in VRAM_RE.findall(chunk)]
 
 
+# --- Curve persistence ----------------------------------------------------
+
+DEFAULT_STATE_FILE = "/var/lib/nvidia-gddr6-fan-control/curve.json"
+
+
+def load_persisted_curve(path):
+    """Load a curve from disk. Returns None if missing/invalid (caller falls back)."""
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"WARN: failed to read {path}: {e}", file=sys.stderr, flush=True)
+        return None
+    try:
+        return validate_curve(raw)
+    except ValueError as e:
+        print(
+            f"WARN: persisted curve in {path} is invalid ({e}); using default",
+            file=sys.stderr,
+            flush=True,
+        )
+        return None
+
+
+def save_persisted_curve(path, curve):
+    """Atomically write the curve to disk. Logs and swallows write errors."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(curve, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"WARN: failed to persist curve to {path}: {e}",
+              file=sys.stderr, flush=True)
+
+
 # --- Main loop ------------------------------------------------------------
 
 def main():
@@ -298,7 +340,14 @@ def main():
         "If unset, the API has no auth (only safe if bound to a trusted "
         "interface like Tailscale or localhost).",
     )
+    parser.add_argument(
+        "--state-file",
+        default=DEFAULT_STATE_FILE,
+        help=f"Path to the persisted curve file (default: {DEFAULT_STATE_FILE}). "
+        "Use 'off' to disable persistence (curve lives in memory only).",
+    )
     args = parser.parse_args()
+    state_file = None if args.state_file.lower() == "off" else args.state_file
 
     if not args.dry_run and os.geteuid() != 0:
         print(
@@ -311,8 +360,15 @@ def main():
     # The active curve lives in shared State so HTTP PUT /curve can update it
     # without restarting the controller. The control loop reads it on each tick.
     state = State()
-    state.update(curve=validate_curve(DEFAULT_CURVE), dry_run=args.dry_run)
-    print(f"Fan curve (VRAM°C -> fan%): {DEFAULT_CURVE}", flush=True)
+    initial_curve = None
+    if state_file:
+        initial_curve = load_persisted_curve(state_file)
+    if initial_curve is None:
+        initial_curve = validate_curve(DEFAULT_CURVE)
+        print(f"Fan curve (default): {initial_curve}", flush=True)
+    else:
+        print(f"Fan curve (loaded from {state_file}): {initial_curve}", flush=True)
+    state.update(curve=initial_curve, dry_run=args.dry_run)
 
     token = None
     if args.token_file:
@@ -327,7 +383,7 @@ def main():
     if args.listen_host.lower() != "off":
         try:
             server = start_http_server(
-                args.listen_host, args.listen_port, state, token
+                args.listen_host, args.listen_port, state, token, state_file
             )
             auth_note = "with bearer-token auth" if token else "WITHOUT auth"
             print(
