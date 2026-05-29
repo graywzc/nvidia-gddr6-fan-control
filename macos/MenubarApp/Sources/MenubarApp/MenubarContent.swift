@@ -3,7 +3,11 @@ import SwiftUI
 /// The view shown when the user clicks the menubar item.
 struct MenubarContent: View {
     @EnvironmentObject var poller: StatusPoller
-    @State private var showingAddHost = false
+    // Open a real window for Add Host. A sheet attached to a MenuBarExtra
+    // popover loses keyboard focus after the popover is dismissed once,
+    // leaving its text fields inert. A standalone window doesn't have that
+    // problem.
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -20,7 +24,10 @@ struct MenubarContent: View {
             }
 
             Button {
-                showingAddHost = true
+                // Bring the app forward so the new window can take keyboard
+                // focus (accessory apps don't activate by default).
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "addHost")
             } label: {
                 Label("Add Host…", systemImage: "plus.circle")
             }
@@ -36,11 +43,6 @@ struct MenubarContent: View {
         }
         .padding(10)
         .frame(width: 280)
-        .sheet(isPresented: $showingAddHost) {
-            AddHostSheet { newHost in
-                poller.addHost(newHost)
-            }
-        }
     }
 }
 
@@ -92,9 +94,10 @@ private struct HostRow: View {
     }
 }
 
-/// Sheet for entering a new host.
-private struct AddHostSheet: View {
-    var onAdd: (Host) -> Void
+/// Window for entering a new host. Lives as a top-level `Window` scene in
+/// MenubarAppApp; opened with `openWindow(id: "addHost")`.
+struct AddHostWindow: View {
+    @EnvironmentObject var poller: StatusPoller
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var hostname = ""
@@ -115,7 +118,7 @@ private struct AddHostSheet: View {
                 Button("Cancel") { dismiss() }
                 Button("Add") {
                     let portInt = Int(port) ?? 8765
-                    onAdd(Host(
+                    poller.addHost(Host(
                         name: name.isEmpty ? hostname : name,
                         hostname: hostname,
                         port: portInt,

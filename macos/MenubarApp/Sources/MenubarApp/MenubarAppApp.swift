@@ -25,6 +25,12 @@ struct MenubarAppApp: App {
                 .environmentObject(poller)
         }
         .menuBarExtraStyle(.window)
+
+        Window("Add Host", id: "addHost") {
+            AddHostWindow()
+                .environmentObject(poller)
+        }
+        .windowResizability(.contentSize)
     }
 }
 
