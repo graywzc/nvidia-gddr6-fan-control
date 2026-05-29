@@ -129,23 +129,26 @@ struct CurveEditor: View {
     }
 
     private func apply() {
-        // Validate locally first to match server rules.
         if localCurve.count < 2 {
             statusMessage = "Curve must have at least 2 points"
             statusIsError = true
             return
         }
-        for i in 1..<localCurve.count {
-            if localCurve[i][0] <= localCurve[i - 1][0] {
-                statusMessage = "Temps must be strictly ascending (point \(i + 1))"
-                statusIsError = true
-                return
-            }
+        // Sort by temp so the user can edit values freely and have rows
+        // reorder on Apply. After sorting, the only way ascending order
+        // can still fail is duplicate temps.
+        let sorted = localCurve.sorted { $0[0] < $1[0] }
+        for i in 1..<sorted.count where sorted[i][0] == sorted[i - 1][0] {
+            statusMessage = "Duplicate temperature \(sorted[i][0])°C"
+            statusIsError = true
+            return
         }
+        localCurve = sorted
+
         guard let host = host else { return }
         isApplying = true
         statusMessage = nil
-        let curveCopy = localCurve
+        let curveCopy = sorted
         Task {
             do {
                 try await poller.putCurve(host: host, curve: curveCopy)
