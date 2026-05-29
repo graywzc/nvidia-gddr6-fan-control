@@ -262,6 +262,21 @@ def parse_vram_temps(chunk):
     return [int(m) for m in VRAM_RE.findall(chunk)]
 
 
+def _get_tailscale_ipv4():
+    """Return the host's first Tailscale IPv4, or None if unavailable."""
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    ips = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return ips[0] if ips else None
+
+
 # --- Curve persistence ----------------------------------------------------
 
 DEFAULT_STATE_FILE = "/var/lib/nvidia-gddr6-fan-control/curve.json"
@@ -325,7 +340,14 @@ def main():
     parser.add_argument(
         "--listen-host",
         default="0.0.0.0",
-        help="HTTP API bind address (default: 0.0.0.0; use 'off' to disable)",
+        help="HTTP API bind address (default: 0.0.0.0; use 'off' to disable). "
+        "Overridden if --listen-tailscale is given.",
+    )
+    parser.add_argument(
+        "--listen-tailscale",
+        action="store_true",
+        help="Bind only to the host's Tailscale IPv4 (resolved via "
+        "`tailscale ip -4`). LAN/public interfaces stay unreachable.",
     )
     parser.add_argument(
         "--listen-port",
@@ -348,6 +370,17 @@ def main():
     )
     args = parser.parse_args()
     state_file = None if args.state_file.lower() == "off" else args.state_file
+
+    if args.listen_tailscale:
+        ts_ip = _get_tailscale_ipv4()
+        if ts_ip is None:
+            print(
+                "ERROR: --listen-tailscale set but `tailscale ip -4` failed. "
+                "Is tailscaled running and logged in?",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        args.listen_host = ts_ip
 
     if not args.dry_run and os.geteuid() != 0:
         print(

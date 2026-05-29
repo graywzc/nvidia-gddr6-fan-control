@@ -1,12 +1,15 @@
 [Unit]
 Description=NVIDIA GPU fan control driven by GDDR6/GDDR6X VRAM junction temp
-After=multi-user.target
+# Start after Tailscale so --listen-tailscale can resolve the IP at boot.
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/graywzc/projects/nvidia-gddr6-fan-control/fan_control.py
+ExecStart=/usr/local/bin/nvidia-gddr6-fan-control --listen-tailscale
 Restart=on-failure
 RestartSec=5
+# stdout/stderr are captured by journald automatically.
 
 [Install]
 WantedBy=multi-user.target
