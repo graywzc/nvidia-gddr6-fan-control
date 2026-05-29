@@ -143,22 +143,50 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return False
         return hmac.compare_digest(header[7:], self.token)
 
+    def _write_json(self, code, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if not self._authorized():
             self.send_response(401)
             self.end_headers()
             return
         if self.path == "/status":
-            snap = self.state.snapshot()
-            body = json.dumps(snap).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._write_json(200, self.state.snapshot())
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_PUT(self):
+        if not self._authorized():
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path != "/curve":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 4096:
+            self._write_json(400, {"error": "missing or oversized body"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length))
+        except json.JSONDecodeError as e:
+            self._write_json(400, {"error": f"invalid JSON: {e}"})
+            return
+        try:
+            new_curve = validate_curve(body)
+        except ValueError as e:
+            self._write_json(400, {"error": str(e)})
+            return
+        self.state.update(curve=new_curve)
+        self._write_json(200, {"curve": new_curve})
 
 
 class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -181,6 +209,37 @@ def start_http_server(host, port, state, token):
 
 
 # --- Curve & parsing ------------------------------------------------------
+
+def validate_curve(value):
+    """Validate a curve from JSON: list of [temp, fan_pct] pairs.
+
+    Rules: at least 2 points; temps strictly ascending; temps in 0..150;
+    fan_pct in 0..100. Returns a normalized list of [int, int] lists.
+    """
+    if not isinstance(value, list) or len(value) < 2:
+        raise ValueError("curve must be a list of at least 2 [temp, fan_pct] pairs")
+    out = []
+    last_temp = None
+    for i, pt in enumerate(value):
+        if not isinstance(pt, (list, tuple)) or len(pt) != 2:
+            raise ValueError(f"point {i} must be a [temp, fan_pct] pair")
+        try:
+            t = int(pt[0])
+            p = int(pt[1])
+        except (TypeError, ValueError):
+            raise ValueError(f"point {i} values must be integers")
+        if not (0 <= t <= 150):
+            raise ValueError(f"point {i} temp {t} out of range 0..150")
+        if not (0 <= p <= 100):
+            raise ValueError(f"point {i} fan_pct {p} out of range 0..100")
+        if last_temp is not None and t <= last_temp:
+            raise ValueError(
+                f"temps must be strictly ascending; got {t} after {last_temp}"
+            )
+        last_temp = t
+        out.append([t, p])
+    return out
+
 
 def interp_curve(curve, temp):
     """Linearly interpolate fan % from the curve at the given temp."""
@@ -249,11 +308,11 @@ def main():
         )
         sys.exit(1)
 
-    curve = DEFAULT_CURVE
-    print(f"Fan curve (VRAM°C -> fan%): {curve}", flush=True)
-
+    # The active curve lives in shared State so HTTP PUT /curve can update it
+    # without restarting the controller. The control loop reads it on each tick.
     state = State()
-    state.update(curve=curve, dry_run=args.dry_run)
+    state.update(curve=validate_curve(DEFAULT_CURVE), dry_run=args.dry_run)
+    print(f"Fan curve (VRAM°C -> fan%): {DEFAULT_CURVE}", flush=True)
 
     token = None
     if args.token_file:
@@ -373,7 +432,9 @@ def main():
             )
             continue
         temp = temps[args.vram_source_index]
-        target_pct = interp_curve(curve, temp)
+        # Read the live curve so remote PUT /curve updates take effect immediately.
+        current_curve = state.snapshot()["curve"]
+        target_pct = interp_curve(current_curve, temp)
         # Publish to HTTP API readers — temp every tick, fan_pct after apply.
         state.update(vram_temp_c=temp)
         now = time.monotonic()

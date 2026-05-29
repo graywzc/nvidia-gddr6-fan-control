@@ -50,6 +50,7 @@ private struct HostRow: View {
     let host: Host
     let state: HostState?
     @EnvironmentObject var poller: StatusPoller
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         HStack(alignment: .center) {
@@ -58,12 +59,22 @@ private struct HostRow: View {
                     Text(host.name).font(.headline)
                     Spacer()
                     Button {
+                        NSApp.activate(ignoringOtherApps: true)
+                        openWindow(id: "curveEditor", value: host.id)
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Edit fan curve")
+                    Button {
                         poller.removeHost(host)
                     } label: {
                         Image(systemName: "minus.circle")
                             .foregroundColor(.secondary)
                     }
                     .buttonStyle(.borderless)
+                    .help("Remove host")
                 }
                 if let p = state?.lastPayload, let t = p.vramTempC {
                     HStack(spacing: 8) {

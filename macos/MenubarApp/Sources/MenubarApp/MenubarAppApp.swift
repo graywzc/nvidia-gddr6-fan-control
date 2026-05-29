@@ -31,6 +31,18 @@ struct MenubarAppApp: App {
                 .environmentObject(poller)
         }
         .windowResizability(.contentSize)
+
+        // One curve-editor window per host id. Multiple can be open at once.
+        WindowGroup("Fan Curve", id: "curveEditor", for: UUID.self) { $hostID in
+            if let id = hostID {
+                CurveEditor(hostID: id)
+                    .environmentObject(poller)
+            } else {
+                Text("Open the menubar and click the slider icon next to a host.")
+                    .padding()
+            }
+        }
+        .windowResizability(.contentSize)
     }
 }
 
