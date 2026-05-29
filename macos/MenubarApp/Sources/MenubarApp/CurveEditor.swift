@@ -238,87 +238,105 @@ private struct CurveChart: View {
     let points: [[Int]]
     let currentTemp: Int?
 
+    // Domain: temps 30..110 (broad enough for typical curves), fan 0..100.
+    private let pad: CGFloat = 12
+    private let tempMin: Double = 30
+    private let tempMax: Double = 110
+
+    private func xFor(_ t: Double, width w: CGFloat) -> CGFloat {
+        let frac = (t - tempMin) / (tempMax - tempMin)
+        return pad + CGFloat(frac) * (w - 2 * pad)
+    }
+
+    private func yFor(_ p: Double, height h: CGFloat) -> CGFloat {
+        // Flip: 0% at bottom, 100% at top.
+        let frac = p / 100.0
+        return (h - pad) - CGFloat(frac) * (h - 2 * pad)
+    }
+
     var body: some View {
         GeometryReader { geo in
-            let w = geo.size.width
-            let h = geo.size.height
-            let pad: CGFloat = 12
-
-            // Domain: temps 30..110 (broad enough for typical curves), fan 0..100.
-            let tempMin: Double = 30
-            let tempMax: Double = 110
-
-            func xFor(_ t: Double) -> CGFloat {
-                let frac = (t - tempMin) / (tempMax - tempMin)
-                return pad + CGFloat(frac) * (w - 2 * pad)
-            }
-            func yFor(_ p: Double) -> CGFloat {
-                let frac = p / 100.0
-                // Flip: 0% at bottom, 100% at top
-                return (h - pad) - CGFloat(frac) * (h - 2 * pad)
-            }
-
             ZStack {
-                // Background grid
-                Path { p in
-                    for f in stride(from: 0.0, through: 1.0, by: 0.25) {
-                        let y = yFor(f * 100)
-                        p.move(to: CGPoint(x: pad, y: y))
-                        p.addLine(to: CGPoint(x: w - pad, y: y))
-                    }
-                }
-                .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-
-                // Curve line
+                gridLayer(size: geo.size)
                 if points.count >= 2 {
-                    Path { p in
-                        for (i, pt) in points.enumerated() {
-                            let x = xFor(Double(pt[0]))
-                            let y = yFor(Double(pt[1]))
-                            if i == 0 {
-                                p.move(to: CGPoint(x: x, y: y))
-                            } else {
-                                p.addLine(to: CGPoint(x: x, y: y))
-                            }
-                        }
-                    }
-                    .stroke(Color.accentColor, lineWidth: 2)
-
-                    // Dots at each waypoint
-                    ForEach(points.indices, id: \.self) { i in
-                        let x = xFor(Double(points[i][0]))
-                        let y = yFor(Double(points[i][1]))
-                        Circle()
-                            .fill(Color.accentColor)
-                            .frame(width: 7, height: 7)
-                            .position(x: x, y: y)
-                    }
+                    curveLayer(size: geo.size)
+                    dotsLayer(size: geo.size)
                 }
-
-                // Current temp marker
                 if let t = currentTemp {
-                    let td = Double(t)
-                    if td >= tempMin && td <= tempMax {
-                        let x = xFor(td)
-                        Path { p in
-                            p.move(to: CGPoint(x: x, y: pad))
-                            p.addLine(to: CGPoint(x: x, y: h - pad))
-                        }
-                        .stroke(colorFor(temp: t).opacity(0.8), style: StrokeStyle(lineWidth: 1.5, dash: [3, 3]))
-                    }
+                    currentTempLayer(temp: t, size: geo.size)
                 }
+                axisLabels
+            }
+        }
+    }
 
-                // Axis labels
-                VStack {
-                    Spacer()
-                    HStack {
-                        Text("\(Int(tempMin))°").font(.caption2).foregroundColor(.secondary)
-                        Spacer()
-                        Text("\(Int(tempMax))°").font(.caption2).foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, pad)
+    private func gridLayer(size: CGSize) -> some View {
+        let w = size.width, h = size.height
+        return Path { p in
+            for f in stride(from: 0.0, through: 1.0, by: 0.25) {
+                let y = yFor(f * 100, height: h)
+                p.move(to: CGPoint(x: pad, y: y))
+                p.addLine(to: CGPoint(x: w - pad, y: y))
+            }
+        }
+        .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
+    }
+
+    private func curveLayer(size: CGSize) -> some View {
+        let w = size.width, h = size.height
+        return Path { p in
+            for (i, pt) in points.enumerated() {
+                let x = xFor(Double(pt[0]), width: w)
+                let y = yFor(Double(pt[1]), height: h)
+                if i == 0 {
+                    p.move(to: CGPoint(x: x, y: y))
+                } else {
+                    p.addLine(to: CGPoint(x: x, y: y))
                 }
             }
+        }
+        .stroke(Color.accentColor, lineWidth: 2)
+    }
+
+    private func dotsLayer(size: CGSize) -> some View {
+        let w = size.width, h = size.height
+        return ForEach(points.indices, id: \.self) { i in
+            Circle()
+                .fill(Color.accentColor)
+                .frame(width: 7, height: 7)
+                .position(
+                    x: xFor(Double(points[i][0]), width: w),
+                    y: yFor(Double(points[i][1]), height: h)
+                )
+        }
+    }
+
+    @ViewBuilder
+    private func currentTempLayer(temp: Int, size: CGSize) -> some View {
+        let td = Double(temp)
+        if td >= tempMin && td <= tempMax {
+            let w = size.width, h = size.height
+            let x = xFor(td, width: w)
+            Path { p in
+                p.move(to: CGPoint(x: x, y: pad))
+                p.addLine(to: CGPoint(x: x, y: h - pad))
+            }
+            .stroke(
+                colorFor(temp: temp).opacity(0.8),
+                style: StrokeStyle(lineWidth: 1.5, dash: [3, 3])
+            )
+        }
+    }
+
+    private var axisLabels: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Text("\(Int(tempMin))°").font(.caption2).foregroundColor(.secondary)
+                Spacer()
+                Text("\(Int(tempMax))°").font(.caption2).foregroundColor(.secondary)
+            }
+            .padding(.horizontal, pad)
         }
     }
 }
