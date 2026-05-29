@@ -1,8 +1,15 @@
 import SwiftUI
+import AppKit
 
 @main
 struct MenubarAppApp: App {
     @StateObject private var poller = StatusPoller()
+
+    init() {
+        // Equivalent to Info.plist LSUIElement=YES: no Dock icon, menubar only.
+        // Setting this in init() runs before the app's main scene is built.
+        NSApp.setActivationPolicy(.accessory)
+    }
 
     var body: some Scene {
         MenuBarExtra {
