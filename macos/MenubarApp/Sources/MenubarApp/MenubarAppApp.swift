@@ -1,15 +1,20 @@
 import SwiftUI
 import AppKit
 
-@main
-struct MenubarAppApp: App {
-    @StateObject private var poller = StatusPoller()
-
-    init() {
+/// In a SwiftPM SwiftUI app, NSApplication isn't bootstrapped during
+/// App.init(), so NSApp is nil there. The reliable place to set the
+/// activation policy is the AppDelegate, wired in via the adaptor below.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
         // Equivalent to Info.plist LSUIElement=YES: no Dock icon, menubar only.
-        // Setting this in init() runs before the app's main scene is built.
         NSApp.setActivationPolicy(.accessory)
     }
+}
+
+@main
+struct MenubarAppApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var poller = StatusPoller()
 
     var body: some Scene {
         MenuBarExtra {
