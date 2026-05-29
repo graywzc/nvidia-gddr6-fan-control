@@ -1,0 +1,12 @@
+[Unit]
+Description=NVIDIA GPU fan control driven by GDDR6/GDDR6X VRAM junction temp
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/graywzc/projects/nvidia-gddr6-fan-control/fan_control.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
