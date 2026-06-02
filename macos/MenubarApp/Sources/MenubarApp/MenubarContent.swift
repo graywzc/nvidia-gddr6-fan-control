@@ -85,6 +85,10 @@ private struct HostRow: View {
                             Text("fan \(fp)%")
                                 .foregroundColor(.secondary)
                         }
+                        if let pw = p.powerW {
+                            Text("\(Int(pw.rounded()))W")
+                                .foregroundColor(.secondary)
+                        }
                         if state?.isStale == true {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .foregroundColor(.yellow)
