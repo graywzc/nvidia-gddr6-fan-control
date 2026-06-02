@@ -135,6 +135,17 @@ curl -X PUT -H 'Content-Type: application/json' \
      http://aipc1:8765/curve
 ```
 
+`GET /status` returns the controller's current view, e.g.:
+
+```json
+{"vram_temp_c": 88, "power_w": 215.4, "fan_pct": 62, "gpu_name": "...",
+ "num_fans": 2, "curve": [[60,40],...], "updated_at": 1234.5,
+ "wall_time": 1700000000.0, "dry_run": false}
+```
+
+`power_w` is the current board power draw in watts (NVML `nvmlDeviceGetPowerUsage`);
+it is `null` on cards/drivers that don't expose it.
+
 ## Configuration
 
 Most options have sensible defaults; override via CLI flags or by editing the systemd unit.
@@ -168,10 +179,19 @@ Most options have sensible defaults; override via CLI flags or by editing the sy
   ```
 - **macOS menubar shows `—`:** host unreachable. Check `tailscale status` on both ends; `curl http://<host>:8765/status` from the Mac to isolate.
 
+## Tests
+
+Python unit tests (stdlib `unittest`, no GPU required):
+
+```bash
+python3 -m unittest discover -s tests
+```
+
 ## File layout
 
 ```
 fan_control.py                          # the Linux controller
+tests/test_power.py                     # power-draw plumbing tests
 systemd/nvidia-gddr6-fan-control.service
 install/install-linux.sh
 install/install-macos.sh

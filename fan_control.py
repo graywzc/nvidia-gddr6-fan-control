@@ -83,6 +83,12 @@ class NVML:
         self._call("nvmlDeviceGetFanSpeed_v2", handle, fan_index, ctypes.byref(s))
         return s.value
 
+    def get_power_usage_w(self, handle):
+        """Current board power draw in watts (NVML reports milliwatts)."""
+        mw = ctypes.c_uint()
+        self._call("nvmlDeviceGetPowerUsage", handle, ctypes.byref(mw))
+        return mw.value / 1000.0
+
     def set_fan_speed(self, handle, fan_index, percent):
         self._call("nvmlDeviceSetFanSpeed_v2", handle, fan_index, percent)
 
@@ -105,6 +111,7 @@ class State:
         self._lock = threading.Lock()
         self._d = {
             "vram_temp_c": None,
+            "power_w": None,        # current board power draw, watts
             "fan_pct": None,        # last applied fan target
             "gpu_name": None,
             "num_fans": None,
@@ -524,8 +531,14 @@ def main():
         # Read the live curve so remote PUT /curve updates take effect immediately.
         current_curve = state.snapshot()["curve"]
         target_pct = interp_curve(current_curve, temp)
-        # Publish to HTTP API readers — temp every tick, fan_pct after apply.
-        state.update(vram_temp_c=temp)
+        # Board power draw, if the GPU/driver exposes it. Not fatal if it
+        # doesn't (some cards return NotSupported) — just publish None.
+        try:
+            power_w = round(nvml.get_power_usage_w(handle), 1)
+        except RuntimeError:
+            power_w = None
+        # Publish to HTTP API readers — temp/power every tick, fan_pct after apply.
+        state.update(vram_temp_c=temp, power_w=power_w)
         now = time.monotonic()
         needs_update = (
             last_applied_pct is None

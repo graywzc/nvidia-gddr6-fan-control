@@ -3,6 +3,7 @@ import Foundation
 /// Mirrors the JSON returned by GET /status on the Linux fan_control.py.
 struct HostStatusPayload: Codable {
     let vramTempC: Int?
+    let powerW: Double?
     let fanPct: Int?
     let gpuName: String?
     let numFans: Int?
@@ -13,6 +14,7 @@ struct HostStatusPayload: Codable {
 
     enum CodingKeys: String, CodingKey {
         case vramTempC = "vram_temp_c"
+        case powerW = "power_w"
         case fanPct = "fan_pct"
         case gpuName = "gpu_name"
         case numFans = "num_fans"
