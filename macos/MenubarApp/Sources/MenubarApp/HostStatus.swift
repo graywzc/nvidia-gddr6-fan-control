@@ -4,6 +4,7 @@ import Foundation
 struct HostStatusPayload: Codable {
     let vramTempC: Int?
     let powerW: Double?
+    let gpuUtilPct: Int?
     let fanPct: Int?
     let gpuName: String?
     let numFans: Int?
@@ -15,6 +16,7 @@ struct HostStatusPayload: Codable {
     enum CodingKeys: String, CodingKey {
         case vramTempC = "vram_temp_c"
         case powerW = "power_w"
+        case gpuUtilPct = "gpu_util_pct"
         case fanPct = "fan_pct"
         case gpuName = "gpu_name"
         case numFans = "num_fans"
@@ -51,6 +53,9 @@ struct HostState {
     var lastPayload: HostStatusPayload?
     var lastFetchedAt: Date?
     var lastError: String?
+
+    /// Most-recent-last GPU util samples, capped at 60 (≈ last 60s at 1 Hz).
+    var utilHistory: [Int] = []
 
     var isStale: Bool {
         guard let t = lastFetchedAt else { return true }
