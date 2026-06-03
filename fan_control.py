@@ -51,6 +51,11 @@ VRAM_RE = re.compile(r"(\d+)\s*°C")
 
 # --- NVML bindings via ctypes ---------------------------------------------
 
+class _Utilization(ctypes.Structure):
+    """Mirrors nvmlUtilization_t: percent busy over the last sample period."""
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
 class NVML:
     def __init__(self):
         self.lib = ctypes.CDLL("libnvidia-ml.so.1")
@@ -89,6 +94,12 @@ class NVML:
         self._call("nvmlDeviceGetPowerUsage", handle, ctypes.byref(mw))
         return mw.value / 1000.0
 
+    def get_utilization_pct(self, handle):
+        """Current GPU core utilization, percent (0..100)."""
+        u = _Utilization()
+        self._call("nvmlDeviceGetUtilizationRates", handle, ctypes.byref(u))
+        return u.gpu
+
     def set_fan_speed(self, handle, fan_index, percent):
         self._call("nvmlDeviceSetFanSpeed_v2", handle, fan_index, percent)
 
@@ -112,6 +123,7 @@ class State:
         self._d = {
             "vram_temp_c": None,
             "power_w": None,        # current board power draw, watts
+            "gpu_util_pct": None,   # current GPU core utilization, percent
             "fan_pct": None,        # last applied fan target
             "gpu_name": None,
             "num_fans": None,
@@ -537,8 +549,13 @@ def main():
             power_w = round(nvml.get_power_usage_w(handle), 1)
         except RuntimeError:
             power_w = None
-        # Publish to HTTP API readers — temp/power every tick, fan_pct after apply.
-        state.update(vram_temp_c=temp, power_w=power_w)
+        # GPU core utilization, same NotSupported tolerance as power above.
+        try:
+            gpu_util = nvml.get_utilization_pct(handle)
+        except RuntimeError:
+            gpu_util = None
+        # Publish to HTTP API readers — temp/power/util every tick, fan_pct after apply.
+        state.update(vram_temp_c=temp, power_w=power_w, gpu_util_pct=gpu_util)
         now = time.monotonic()
         needs_update = (
             last_applied_pct is None

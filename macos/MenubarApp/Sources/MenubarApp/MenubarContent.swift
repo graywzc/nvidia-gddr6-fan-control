@@ -42,7 +42,7 @@ struct MenubarContent: View {
             .buttonStyle(.borderless)
         }
         .padding(10)
-        .frame(width: 280)
+        .frame(width: 360)
     }
 }
 
@@ -53,7 +53,7 @@ private struct HostRow: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        HStack(alignment: .center) {
+        HStack(alignment: .center, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack {
                     Text(host.name).font(.headline)
@@ -89,6 +89,10 @@ private struct HostRow: View {
                             Text("\(Int(pw.rounded()))W")
                                 .foregroundColor(.secondary)
                         }
+                        if let util = p.gpuUtilPct {
+                            Text("gpu \(util)%")
+                                .foregroundColor(.secondary)
+                        }
                         if state?.isStale == true {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .foregroundColor(.yellow)
@@ -104,6 +108,60 @@ private struct HostRow: View {
                 } else {
                     Text("Connecting…").foregroundColor(.secondary).font(.caption)
                 }
+            }
+
+            if let history = state?.utilHistory, history.count >= 2 {
+                Spacer(minLength: 0)
+                VStack(alignment: .trailing, spacing: 2) {
+                    UtilSparkline(history: history)
+                        .frame(width: 110, height: 40)
+                    Text("GPU %").font(.caption2).foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+}
+
+/// nvtop-style rolling line of recent GPU utilization. x is sample index,
+/// y is a fixed 0…100 domain so line height reads as absolute utilization.
+/// Styled to match CurveChart in CurveEditor.swift (Path, no chart dependency).
+private struct UtilSparkline: View {
+    let history: [Int]   // most-recent-last, 0..100
+
+    private let pad: CGFloat = 3
+
+    private func xFor(_ i: Int, width w: CGFloat) -> CGFloat {
+        guard history.count > 1 else { return pad }
+        let frac = CGFloat(i) / CGFloat(history.count - 1)
+        return pad + frac * (w - 2 * pad)
+    }
+
+    private func yFor(_ v: Int, height h: CGFloat) -> CGFloat {
+        let frac = CGFloat(v) / 100.0
+        return (h - pad) - frac * (h - 2 * pad)
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            ZStack {
+                // 0 / 50 / 100 gridlines.
+                Path { p in
+                    for f in stride(from: 0.0, through: 1.0, by: 0.5) {
+                        let y = yFor(Int(f * 100), height: h)
+                        p.move(to: CGPoint(x: pad, y: y))
+                        p.addLine(to: CGPoint(x: w - pad, y: y))
+                    }
+                }
+                .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
+
+                Path { p in
+                    for (i, v) in history.enumerated() {
+                        let pt = CGPoint(x: xFor(i, width: w), y: yFor(v, height: h))
+                        if i == 0 { p.move(to: pt) } else { p.addLine(to: pt) }
+                    }
+                }
+                .stroke(Color.accentColor, lineWidth: 1.5)
             }
         }
     }

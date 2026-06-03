@@ -61,6 +61,12 @@ final class StatusPoller: ObservableObject {
                     state.lastPayload = payload
                     state.lastFetchedAt = Date()
                     state.lastError = nil
+                    if let u = payload.gpuUtilPct {
+                        state.utilHistory.append(u)
+                        if state.utilHistory.count > 60 {
+                            state.utilHistory.removeFirst(state.utilHistory.count - 60)
+                        }
+                    }
                 case .failure(let err):
                     state.lastError = err.localizedDescription
                     // Keep lastPayload so menubar shows the last known value
