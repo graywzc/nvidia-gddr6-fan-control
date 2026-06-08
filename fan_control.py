@@ -28,6 +28,8 @@ import sys
 import threading
 import time
 
+import aipc_observer
+
 # (vram_temp_C, fan_percent). Linear interpolation between points.
 # Clamped to first/last entry outside the range.
 DEFAULT_CURVE = [
@@ -209,6 +211,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if not self._authorized():
             self.send_response(401)
             self.end_headers()
+            return
+        if self.path == "/observer" or self.path.startswith("/observer/"):
+            if not aipc_observer.handle_observer_get(self):
+                self.send_response(404)
+                self.end_headers()
             return
         if self.path == "/status":
             self._write_json(200, self.state.snapshot())
@@ -531,6 +538,30 @@ def main():
         help=f"Path to the persisted curve file (default: {DEFAULT_STATE_FILE}). "
         "Use 'off' to disable persistence (curve lives in memory only).",
     )
+    parser.add_argument(
+        "--observer",
+        dest="observer",
+        action="store_true",
+        default=True,
+        help="Enable integrated aipc observer dashboard at /observer (default: on)",
+    )
+    parser.add_argument(
+        "--no-observer",
+        dest="observer",
+        action="store_false",
+        help="Disable integrated aipc observer dashboard",
+    )
+    parser.add_argument(
+        "--observer-monitor-port",
+        type=int,
+        default=aipc_observer.DEFAULT_MONITOR_PORT,
+        help=f"llama.cpp frontend port to monitor (default: {aipc_observer.DEFAULT_MONITOR_PORT})",
+    )
+    parser.add_argument(
+        "--observer-container",
+        default=aipc_observer.DEFAULT_CONTAINER,
+        help=f"Docker container whose llama.cpp logs are tailed (default: {aipc_observer.DEFAULT_CONTAINER})",
+    )
     args = parser.parse_args()
     state_file = None if args.state_file.lower() == "off" else args.state_file
 
@@ -641,6 +672,12 @@ def main():
             print(f"Power limit set to {applied_w:g}W", flush=True)
         except RuntimeError as e:
             print(f"WARN: failed to apply power limit: {e}", file=sys.stderr)
+
+    if args.observer:
+        aipc_observer.start_observer(
+            monitor_port=args.observer_monitor_port,
+            container=args.observer_container,
+        )
 
     if args.listen_host.lower() != "off":
         try:

@@ -6,6 +6,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_DEST=/usr/local/bin/nvidia-gddr6-fan-control
+OBSERVER_DEST=/usr/local/bin/aipc_observer.py
 UNIT_NAME=nvidia-gddr6-fan-control.service
 UNIT_DEST=/etc/systemd/system/$UNIT_NAME
 
@@ -27,6 +28,9 @@ fi
 
 echo "Installing $BIN_DEST"
 install -m 755 "$REPO_ROOT/fan_control.py" "$BIN_DEST"
+
+echo "Installing $OBSERVER_DEST"
+install -m 644 "$REPO_ROOT/aipc_observer.py" "$OBSERVER_DEST"
 
 echo "Installing $UNIT_DEST"
 install -m 644 "$REPO_ROOT/systemd/$UNIT_NAME" "$UNIT_DEST"

@@ -5,6 +5,7 @@ struct MenubarContent: View {
     @EnvironmentObject var poller: StatusPoller
     let closePopover: () -> Void
     let openAddHost: () -> Void
+    let openHostDashboard: (Host) -> Void
     let openCurveEditor: (UUID) -> Void
     let openPowerLimitEditor: (UUID) -> Void
 
@@ -19,6 +20,7 @@ struct MenubarContent: View {
                     HostRow(
                         host: host,
                         state: poller.states[host.id],
+                        openHostDashboard: openHostDashboard,
                         openCurveEditor: openCurveEditor,
                         openPowerLimitEditor: openPowerLimitEditor
                     )
@@ -63,6 +65,7 @@ struct MenubarContent: View {
 private struct HostRow: View {
     let host: Host
     let state: HostState?
+    let openHostDashboard: (Host) -> Void
     let openCurveEditor: (UUID) -> Void
     let openPowerLimitEditor: (UUID) -> Void
     @EnvironmentObject var poller: StatusPoller
@@ -144,6 +147,11 @@ private struct HostRow: View {
                 }
             }
         }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            openHostDashboard(host)
+        }
+        .help("Open observer dashboard")
     }
 }
 

@@ -60,6 +60,7 @@ private final class StatusItemController: NSObject {
             rootView: MenubarContent(
                 closePopover: { [weak self] in self?.closePopover() },
                 openAddHost: { [weak self] in self?.openAddHost() },
+                openHostDashboard: { [weak self] host in self?.openHostDashboard(host: host) },
                 openCurveEditor: { [weak self] hostID in self?.openCurveEditor(hostID: hostID) },
                 openPowerLimitEditor: { [weak self] hostID in self?.openPowerLimitEditor(hostID: hostID) }
             )
@@ -116,6 +117,13 @@ private final class StatusItemController: NSObject {
             CurveEditor(hostID: hostID)
                 .environmentObject(poller)
         }
+    }
+
+    private func openHostDashboard(host: Host) {
+        guard let url = URL(string: "http://\(host.hostname):\(host.port)/observer") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     private func openPowerLimitEditor(hostID: UUID) {
