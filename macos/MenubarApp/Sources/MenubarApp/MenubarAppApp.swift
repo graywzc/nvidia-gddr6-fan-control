@@ -58,6 +58,7 @@ private final class StatusItemController: NSObject {
         popover.contentSize = NSSize(width: 700, height: 430)
         popover.contentViewController = NSHostingController(
             rootView: MenubarContent(
+                closePopover: { [weak self] in self?.closePopover() },
                 openAddHost: { [weak self] in self?.openAddHost() },
                 openCurveEditor: { [weak self] hostID in self?.openCurveEditor(hostID: hostID) },
                 openPowerLimitEditor: { [weak self] hostID in self?.openPowerLimitEditor(hostID: hostID) }
@@ -76,12 +77,16 @@ private final class StatusItemController: NSObject {
 
     @objc private func togglePopover() {
         if popover.isShown {
-            popover.performClose(nil)
+            closePopover()
             return
         }
         guard let button = statusItem.button else { return }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         popover.contentViewController?.view.window?.makeKey()
+    }
+
+    private func closePopover() {
+        popover.performClose(nil)
     }
 
     private func updateStatusTitle(hosts: [Host], states: [UUID: HostState]) {
