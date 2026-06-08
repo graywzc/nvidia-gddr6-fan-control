@@ -4,6 +4,12 @@ import Foundation
 struct HostStatusPayload: Codable {
     let vramTempC: Int?
     let powerW: Double?
+    let powerLimitW: Double?
+    let powerLimitMinW: Double?
+    let powerLimitMaxW: Double?
+    let powerLimitDefaultW: Double?
+    let tdpW: Double?
+    let powerLimitSupported: Bool?
     let gpuUtilPct: Int?
     let fanPct: Int?
     let gpuName: String?
@@ -16,6 +22,12 @@ struct HostStatusPayload: Codable {
     enum CodingKeys: String, CodingKey {
         case vramTempC = "vram_temp_c"
         case powerW = "power_w"
+        case powerLimitW = "power_limit_w"
+        case powerLimitMinW = "power_limit_min_w"
+        case powerLimitMaxW = "power_limit_max_w"
+        case powerLimitDefaultW = "power_limit_default_w"
+        case tdpW = "tdp_w"
+        case powerLimitSupported = "power_limit_supported"
         case gpuUtilPct = "gpu_util_pct"
         case fanPct = "fan_pct"
         case gpuName = "gpu_name"

@@ -116,6 +116,45 @@ final class StatusPoller: ObservableObject {
         }
     }
 
+    /// Send a new board power limit to the host. nil restores the default limit.
+    func putPowerLimit(host: Host, watts: Double?) async throws {
+        guard let url = URL(string: "http://\(host.hostname):\(host.port)/power-limit") else {
+            throw NSError(
+                domain: "MenubarApp", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "bad url"]
+            )
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "PUT"
+        req.timeoutInterval = 5
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !host.token.isEmpty {
+            req.setValue("Bearer \(host.token)", forHTTPHeaderField: "Authorization")
+        }
+        let body: [String: Any] = ["power_limit_w": watts ?? NSNull()]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
+            throw NSError(
+                domain: "MenubarApp", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "no HTTP response"]
+            )
+        }
+        if !(200..<300).contains(http.statusCode) {
+            let msg: String
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let err = obj["error"] as? String {
+                msg = err
+            } else {
+                msg = "HTTP \(http.statusCode)"
+            }
+            throw NSError(
+                domain: "MenubarApp", code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: msg]
+            )
+        }
+    }
+
     private static func fetchStatus(host: Host) async throws -> HostStatusPayload {
         guard let url = host.statusURL else {
             throw NSError(domain: "MenubarApp", code: 1, userInfo: [NSLocalizedDescriptionKey: "bad url"])

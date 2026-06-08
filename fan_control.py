@@ -94,6 +94,33 @@ class NVML:
         self._call("nvmlDeviceGetPowerUsage", handle, ctypes.byref(mw))
         return mw.value / 1000.0
 
+    def get_power_limit_w(self, handle):
+        """Current board power-management limit in watts."""
+        mw = ctypes.c_uint()
+        self._call("nvmlDeviceGetPowerManagementLimit", handle, ctypes.byref(mw))
+        return mw.value / 1000.0
+
+    def get_default_power_limit_w(self, handle):
+        """Default board power-management limit in watts."""
+        mw = ctypes.c_uint()
+        self._call("nvmlDeviceGetPowerManagementDefaultLimit", handle, ctypes.byref(mw))
+        return mw.value / 1000.0
+
+    def get_power_limit_constraints_w(self, handle):
+        """Allowed power-management limit range in watts: (min, max)."""
+        min_mw = ctypes.c_uint()
+        max_mw = ctypes.c_uint()
+        self._call(
+            "nvmlDeviceGetPowerManagementLimitConstraints",
+            handle,
+            ctypes.byref(min_mw),
+            ctypes.byref(max_mw),
+        )
+        return (min_mw.value / 1000.0, max_mw.value / 1000.0)
+
+    def set_power_limit_w(self, handle, watts):
+        self._call("nvmlDeviceSetPowerManagementLimit", handle, int(round(watts * 1000)))
+
     def get_utilization_pct(self, handle):
         """Current GPU core utilization, percent (0..100)."""
         u = _Utilization()
@@ -123,11 +150,17 @@ class State:
         self._d = {
             "vram_temp_c": None,
             "power_w": None,        # current board power draw, watts
+            "power_limit_w": None,  # current board power cap, watts
+            "power_limit_min_w": None,
+            "power_limit_max_w": None,
+            "power_limit_default_w": None,
+            "tdp_w": None,          # default VBIOS/driver board power target
             "gpu_util_pct": None,   # current GPU core utilization, percent
             "fan_pct": None,        # last applied fan target
             "gpu_name": None,
             "num_fans": None,
             "curve": None,
+            "power_limit_supported": None,
             "updated_at": 0.0,      # monotonic ts of last successful update
             "wall_time": 0.0,       # unix ts of last successful update
             "dry_run": False,
@@ -150,6 +183,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     state: "State" = None
     token: "str | None" = None
     state_file: "str | None" = None
+    apply_power_limit = None
 
     def log_message(self, fmt, *args):
         # Quieter default logging — control loop has its own prints.
@@ -187,7 +221,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(401)
             self.end_headers()
             return
-        if self.path != "/curve":
+        if self.path not in ("/curve", "/power-limit"):
             self.send_response(404)
             self.end_headers()
             return
@@ -200,15 +234,35 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError as e:
             self._write_json(400, {"error": f"invalid JSON: {e}"})
             return
+        if self.path == "/curve":
+            try:
+                new_curve = validate_curve(body)
+            except ValueError as e:
+                self._write_json(400, {"error": str(e)})
+                return
+            self.state.update(curve=new_curve)
+            if self.state_file:
+                save_persisted_state(self.state_file, self.state.snapshot())
+            self._write_json(200, {"curve": new_curve})
+            return
+
         try:
-            new_curve = validate_curve(body)
+            limit_w = validate_power_limit_request(body, self.state.snapshot())
         except ValueError as e:
             self._write_json(400, {"error": str(e)})
             return
-        self.state.update(curve=new_curve)
+        if self.apply_power_limit is None:
+            self._write_json(503, {"error": "power limit control unavailable"})
+            return
+        try:
+            applied_w = self.apply_power_limit(limit_w)
+        except RuntimeError as e:
+            self._write_json(400, {"error": str(e)})
+            return
+        self.state.update(power_limit_w=applied_w)
         if self.state_file:
-            save_persisted_curve(self.state_file, new_curve)
-        self._write_json(200, {"curve": new_curve})
+            save_persisted_state(self.state_file, self.state.snapshot())
+        self._write_json(200, {"power_limit_w": applied_w})
 
 
 class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -216,11 +270,16 @@ class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
-def start_http_server(host, port, state, token, state_file):
+def start_http_server(host, port, state, token, state_file, apply_power_limit=None):
     handler = type(
         "BoundHandler",
         (_Handler,),
-        {"state": state, "token": token, "state_file": state_file},
+        {
+            "state": state,
+            "token": token,
+            "state_file": state_file,
+            "apply_power_limit": apply_power_limit,
+        },
     )
     server = _ThreadedHTTPServer((host, port), handler)
     thread = threading.Thread(
@@ -263,6 +322,44 @@ def validate_curve(value):
     return out
 
 
+def validate_power_limit_w(value, min_w=None, max_w=None):
+    """Validate a requested power-management limit in watts."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("power limit must be a number of watts or null")
+    watts = float(value)
+    if watts <= 0:
+        raise ValueError("power limit must be greater than 0 watts")
+    if min_w is not None and watts < min_w:
+        raise ValueError(f"power limit {watts:g}W is below minimum {min_w:g}W")
+    if max_w is not None and watts > max_w:
+        raise ValueError(f"power limit {watts:g}W is above maximum {max_w:g}W")
+    return round(watts, 1)
+
+
+def validate_power_limit_request(value, state_snapshot):
+    """Validate PUT /power-limit JSON.
+
+    Accepts either a raw number/null or {"power_limit_w": number|null}. null
+    restores the GPU's default power-management limit.
+    """
+    if isinstance(value, dict):
+        if "power_limit_w" in value:
+            raw = value["power_limit_w"]
+        elif "limit_w" in value:
+            raw = value["limit_w"]
+        else:
+            raise ValueError("body must include power_limit_w")
+    else:
+        raw = value
+    if raw is None:
+        return None
+    return validate_power_limit_w(
+        raw,
+        state_snapshot.get("power_limit_min_w"),
+        state_snapshot.get("power_limit_max_w"),
+    )
+
+
 def interp_curve(curve, temp):
     """Linearly interpolate fan % from the curve at the given temp."""
     if temp <= curve[0][0]:
@@ -296,43 +393,83 @@ def _get_tailscale_ipv4():
     return ips[0] if ips else None
 
 
-# --- Curve persistence ----------------------------------------------------
+# --- State persistence ----------------------------------------------------
 
 DEFAULT_STATE_FILE = "/var/lib/nvidia-gddr6-fan-control/curve.json"
 
 
-def load_persisted_curve(path):
-    """Load a curve from disk. Returns None if missing/invalid (caller falls back)."""
+def load_persisted_state(path):
+    """Load persisted settings.
+
+    Older installs wrote the curve JSON directly as a list. Newer installs
+    write {"curve": [...], "power_limit_w": number|null}.
+    """
     try:
         with open(path, "r") as f:
             raw = json.load(f)
     except FileNotFoundError:
-        return None
+        return {}
     except (OSError, json.JSONDecodeError) as e:
         print(f"WARN: failed to read {path}: {e}", file=sys.stderr, flush=True)
-        return None
-    try:
-        return validate_curve(raw)
-    except ValueError as e:
-        print(
-            f"WARN: persisted curve in {path} is invalid ({e}); using default",
-            file=sys.stderr,
-            flush=True,
-        )
-        return None
+        return {}
+    if isinstance(raw, list):
+        raw = {"curve": raw}
+    if not isinstance(raw, dict):
+        print(f"WARN: persisted state in {path} is invalid; using defaults",
+              file=sys.stderr, flush=True)
+        return {}
+
+    out = {}
+    if "curve" in raw:
+        try:
+            out["curve"] = validate_curve(raw["curve"])
+        except ValueError as e:
+            print(
+                f"WARN: persisted curve in {path} is invalid ({e}); using default",
+                file=sys.stderr,
+                flush=True,
+            )
+    if "power_limit_w" in raw:
+        if raw["power_limit_w"] is None:
+            out["power_limit_w"] = None
+        else:
+            try:
+                out["power_limit_w"] = validate_power_limit_w(raw["power_limit_w"])
+            except ValueError as e:
+                print(
+                    f"WARN: persisted power limit in {path} is invalid ({e}); "
+                    "leaving unchanged",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    return out
 
 
-def save_persisted_curve(path, curve):
-    """Atomically write the curve to disk. Logs and swallows write errors."""
+def save_persisted_state(path, snapshot):
+    """Atomically write persistent settings. Logs and swallows write errors."""
+    data = {
+        "curve": snapshot.get("curve"),
+        "power_limit_w": snapshot.get("power_limit_w"),
+    }
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(curve, f)
+            json.dump(data, f)
         os.replace(tmp, path)
     except OSError as e:
-        print(f"WARN: failed to persist curve to {path}: {e}",
+        print(f"WARN: failed to persist state to {path}: {e}",
               file=sys.stderr, flush=True)
+
+
+def load_persisted_curve(path):
+    """Backward-compatible helper retained for tests or external imports."""
+    return load_persisted_state(path).get("curve")
+
+
+def save_persisted_curve(path, curve):
+    """Backward-compatible helper retained for tests or external imports."""
+    save_persisted_state(path, {"curve": curve, "power_limit_w": None})
 
 
 # --- Main loop ------------------------------------------------------------
@@ -355,6 +492,13 @@ def main():
         "--dry-run",
         action="store_true",
         help="Print fan decisions but do not actually change fan speed",
+    )
+    parser.add_argument(
+        "--power-limit-w",
+        type=float,
+        default=None,
+        help="Set GPU board power limit in watts at startup. Overrides the "
+        "persisted power limit for this run.",
     )
     parser.add_argument(
         "--listen-host",
@@ -412,15 +556,23 @@ def main():
     # The active curve lives in shared State so HTTP PUT /curve can update it
     # without restarting the controller. The control loop reads it on each tick.
     state = State()
-    initial_curve = None
+    persisted_state = {}
     if state_file:
-        initial_curve = load_persisted_curve(state_file)
+        persisted_state = load_persisted_state(state_file)
+    initial_curve = persisted_state.get("curve")
+    persisted_power_limit_w = persisted_state.get("power_limit_w")
+    if args.power_limit_w is not None:
+        persisted_power_limit_w = validate_power_limit_w(args.power_limit_w)
     if initial_curve is None:
         initial_curve = validate_curve(DEFAULT_CURVE)
         print(f"Fan curve (default): {initial_curve}", flush=True)
     else:
         print(f"Fan curve (loaded from {state_file}): {initial_curve}", flush=True)
-    state.update(curve=initial_curve, dry_run=args.dry_run)
+    state.update(
+        curve=initial_curve,
+        power_limit_w=persisted_power_limit_w,
+        dry_run=args.dry_run,
+    )
 
     token = None
     if args.token_file:
@@ -432,10 +584,73 @@ def main():
             )
             sys.exit(1)
 
+    nvml = NVML()
+    try:
+        handle = nvml.get_handle(args.gpu)
+        gpu_name = nvml.get_name(handle)
+        num_fans = nvml.get_num_fans(handle)
+        power_limit_supported = True
+        try:
+            min_w, max_w = nvml.get_power_limit_constraints_w(handle)
+            default_w = nvml.get_default_power_limit_w(handle)
+            current_limit_w = nvml.get_power_limit_w(handle)
+            state.update(
+                power_limit_w=round(current_limit_w, 1),
+                power_limit_min_w=round(min_w, 1),
+                power_limit_max_w=round(max_w, 1),
+                power_limit_default_w=round(default_w, 1),
+                tdp_w=round(default_w, 1),
+                power_limit_supported=True,
+            )
+        except RuntimeError as e:
+            power_limit_supported = False
+            print(f"WARN: power-limit control unavailable: {e}", file=sys.stderr)
+            state.update(power_limit_supported=False)
+        print(
+            f"Controlling GPU {args.gpu}: {gpu_name} ({num_fans} fan(s)), "
+            f"dry_run={args.dry_run}",
+            flush=True,
+        )
+        state.update(gpu_name=gpu_name, num_fans=num_fans)
+    except RuntimeError as e:
+        print(f"NVML init failed: {e}", file=sys.stderr)
+        nvml.shutdown()
+        sys.exit(1)
+
+    def apply_power_limit(limit_w):
+        if not power_limit_supported:
+            raise RuntimeError("power limit control is not supported by this GPU/driver")
+        if limit_w is None:
+            limit_w = state.snapshot()["power_limit_default_w"]
+        snap = state.snapshot()
+        limit_w = validate_power_limit_w(
+            limit_w,
+            snap.get("power_limit_min_w"),
+            snap.get("power_limit_max_w"),
+        )
+        if args.dry_run:
+            print(f"[dry-run] would set power limit={limit_w:g}W", flush=True)
+            return limit_w
+        nvml.set_power_limit_w(handle, limit_w)
+        return round(nvml.get_power_limit_w(handle), 1)
+
+    if persisted_power_limit_w is not None:
+        try:
+            applied_w = apply_power_limit(persisted_power_limit_w)
+            state.update(power_limit_w=applied_w)
+            print(f"Power limit set to {applied_w:g}W", flush=True)
+        except RuntimeError as e:
+            print(f"WARN: failed to apply power limit: {e}", file=sys.stderr)
+
     if args.listen_host.lower() != "off":
         try:
             server = start_http_server(
-                args.listen_host, args.listen_port, state, token, state_file
+                args.listen_host,
+                args.listen_port,
+                state,
+                token,
+                state_file,
+                apply_power_limit,
             )
             auth_note = "with bearer-token auth" if token else "WITHOUT auth"
             print(
@@ -450,22 +665,6 @@ def main():
             sys.exit(1)
     else:
         print("HTTP API disabled (--listen-host=off)", flush=True)
-
-    nvml = NVML()
-    try:
-        handle = nvml.get_handle(args.gpu)
-        gpu_name = nvml.get_name(handle)
-        num_fans = nvml.get_num_fans(handle)
-        print(
-            f"Controlling GPU {args.gpu}: {gpu_name} ({num_fans} fan(s)), "
-            f"dry_run={args.dry_run}",
-            flush=True,
-        )
-        state.update(gpu_name=gpu_name, num_fans=num_fans)
-    except RuntimeError as e:
-        print(f"NVML init failed: {e}", file=sys.stderr)
-        nvml.shutdown()
-        sys.exit(1)
 
     last_applied_pct = None
     last_apply_ts = 0.0
@@ -549,13 +748,22 @@ def main():
             power_w = round(nvml.get_power_usage_w(handle), 1)
         except RuntimeError:
             power_w = None
+        try:
+            current_power_limit_w = round(nvml.get_power_limit_w(handle), 1)
+        except RuntimeError:
+            current_power_limit_w = None
         # GPU core utilization, same NotSupported tolerance as power above.
         try:
             gpu_util = nvml.get_utilization_pct(handle)
         except RuntimeError:
             gpu_util = None
         # Publish to HTTP API readers — temp/power/util every tick, fan_pct after apply.
-        state.update(vram_temp_c=temp, power_w=power_w, gpu_util_pct=gpu_util)
+        state.update(
+            vram_temp_c=temp,
+            power_w=power_w,
+            power_limit_w=current_power_limit_w,
+            gpu_util_pct=gpu_util,
+        )
         now = time.monotonic()
         needs_update = (
             last_applied_pct is None

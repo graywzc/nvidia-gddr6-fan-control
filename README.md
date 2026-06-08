@@ -20,6 +20,7 @@ Why this exists: NVIDIA's stock fan curve on Linux is driven by core temperature
 
 - **VRAM temp source:** the [`gddr6`](https://github.com/olealgoritme/gddr6) binary by olealgoritme reads the on-die VRAM junction-temperature register via `/dev/mem`. NVML still does not expose this on consumer cards as of driver 580.
 - **Fan control:** `nvmlDeviceSetFanSpeed_v2` from NVML — no X server, no Xorg session, no Coolbits.
+- **Power limiting:** NVML power-management APIs apply and report the board power cap when supported by the GPU/driver.
 - **Transport:** plaintext HTTP, bound only to the host's Tailscale interface. Tailscale handles encryption and identity.
 
 ## Supported hardware
@@ -106,6 +107,7 @@ After install, click the menubar item → **Add Host…** and enter each Linux h
 - Menubar label shows VRAM temps for each configured host, space-separated. Hottest temp colors the label (green < 85°C, yellow 85–94°C, red ≥ 95°C).
 - Click the label for a popover with per-host detail (VRAM temp, current fan %, GPU model).
 - Slider icon next to each host opens the curve editor for that host.
+- Bolt icon next to each host opens the power-limit editor for that host.
 
 ### Curve editor
 
@@ -124,6 +126,9 @@ PUT  http://<host>:8765/curve
        body: JSON list of [temp, fan_pct] pairs,
              temps strictly ascending, e.g.
              [[60,40],[80,55],[90,75],[95,90],[100,100]]
+PUT  http://<host>:8765/power-limit
+       body: {"power_limit_w": 250}
+             Use null to restore the GPU default power limit.
 ```
 
 Example:
@@ -133,18 +138,29 @@ curl http://aipc1:8765/status
 curl -X PUT -H 'Content-Type: application/json' \
      -d '[[60,40],[80,55],[90,75],[95,90],[100,100]]' \
      http://aipc1:8765/curve
+curl -X PUT -H 'Content-Type: application/json' \
+     -d '{"power_limit_w":250}' \
+     http://aipc1:8765/power-limit
 ```
 
 `GET /status` returns the controller's current view, e.g.:
 
 ```json
-{"vram_temp_c": 88, "power_w": 215.4, "fan_pct": 62, "gpu_name": "...",
- "num_fans": 2, "curve": [[60,40],...], "updated_at": 1234.5,
+{"vram_temp_c": 88, "power_w": 215.4, "power_limit_w": 250.0,
+ "power_limit_min_w": 100.0, "power_limit_max_w": 450.0,
+ "power_limit_default_w": 350.0, "tdp_w": 350.0,
+ "power_limit_supported": true,
+ "fan_pct": 62, "gpu_name": "...", "num_fans": 2, "curve": [[60,40],...],
+ "updated_at": 1234.5,
  "wall_time": 1700000000.0, "dry_run": false}
 ```
 
 `power_w` is the current board power draw in watts (NVML `nvmlDeviceGetPowerUsage`);
 it is `null` on cards/drivers that don't expose it.
+`power_limit_w` is the current NVML board power cap in watts. PUT `/power-limit`
+persists the cap to the controller state file and applies it on startup.
+`tdp_w` is NVML's default power-management limit, which comes from the card's
+firmware/driver power target and is the value the macOS app labels as TDP.
 
 ## Configuration
 
@@ -156,9 +172,10 @@ Most options have sensible defaults; override via CLI flags or by editing the sy
 | `--listen-host` | `0.0.0.0` | HTTP bind address (ignored if `--listen-tailscale`) |
 | `--listen-port` | `8765` | HTTP port |
 | `--token-file` | none | File containing a bearer token; if unset, no auth |
-| `--state-file` | `/var/lib/nvidia-gddr6-fan-control/curve.json` | Persisted curve; use `off` to disable persistence |
+| `--state-file` | `/var/lib/nvidia-gddr6-fan-control/curve.json` | Persisted settings; use `off` to disable persistence |
 | `--gpu` | `0` | NVML GPU index to control |
 | `--gddr6-bin` | `/usr/local/bin/gddr6` | Path to the gddr6 binary |
+| `--power-limit-w` | none | Set GPU board power limit in watts at startup |
 | `--dry-run` | off | Read temps and print decisions but never call NVML SetFanSpeed |
 
 ## Troubleshooting

@@ -43,6 +43,17 @@ struct MenubarAppApp: App {
             }
         }
         .windowResizability(.contentSize)
+
+        WindowGroup("Power Limit", id: "powerLimitEditor", for: UUID.self) { $hostID in
+            if let id = hostID {
+                PowerLimitEditor(hostID: id)
+                    .environmentObject(poller)
+            } else {
+                Text("Open the menubar and click the bolt icon next to a host.")
+                    .padding()
+            }
+        }
+        .windowResizability(.contentSize)
     }
 }
 
