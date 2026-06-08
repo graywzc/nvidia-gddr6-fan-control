@@ -3,11 +3,9 @@ import SwiftUI
 /// The view shown when the user clicks the menubar item.
 struct MenubarContent: View {
     @EnvironmentObject var poller: StatusPoller
-    // Open a real window for Add Host. A sheet attached to a MenuBarExtra
-    // popover loses keyboard focus after the popover is dismissed once,
-    // leaving its text fields inert. A standalone window doesn't have that
-    // problem.
-    @Environment(\.openWindow) private var openWindow
+    let openAddHost: () -> Void
+    let openCurveEditor: (UUID) -> Void
+    let openPowerLimitEditor: (UUID) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -17,17 +15,19 @@ struct MenubarContent: View {
                     .padding(.vertical, 4)
             } else {
                 ForEach(poller.hosts) { host in
-                    HostRow(host: host, state: poller.states[host.id])
+                    HostRow(
+                        host: host,
+                        state: poller.states[host.id],
+                        openCurveEditor: openCurveEditor,
+                        openPowerLimitEditor: openPowerLimitEditor
+                    )
                         .padding(.vertical, 2)
                     Divider()
                 }
             }
 
             Button {
-                // Bring the app forward so the new window can take keyboard
-                // focus (accessory apps don't activate by default).
-                NSApp.activate(ignoringOtherApps: true)
-                openWindow(id: "addHost")
+                openAddHost()
             } label: {
                 Label("Add Host…", systemImage: "plus.circle")
             }
@@ -42,25 +42,25 @@ struct MenubarContent: View {
             .buttonStyle(.borderless)
         }
         .padding(10)
-        .frame(width: 360)
+        .frame(width: 700)
     }
 }
 
 private struct HostRow: View {
     let host: Host
     let state: HostState?
+    let openCurveEditor: (UUID) -> Void
+    let openPowerLimitEditor: (UUID) -> Void
     @EnvironmentObject var poller: StatusPoller
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        HStack(alignment: .center, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+        HStack(alignment: .center, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(host.name).font(.headline)
                     Spacer()
                     Button {
-                        NSApp.activate(ignoringOtherApps: true)
-                        openWindow(id: "powerLimitEditor", value: host.id)
+                        openPowerLimitEditor(host.id)
                     } label: {
                         Image(systemName: "bolt.fill")
                             .foregroundColor(.secondary)
@@ -69,8 +69,7 @@ private struct HostRow: View {
                     .help("Edit power limit")
                     .disabled(state?.lastPayload?.powerLimitSupported == false)
                     Button {
-                        NSApp.activate(ignoringOtherApps: true)
-                        openWindow(id: "curveEditor", value: host.id)
+                        openCurveEditor(host.id)
                     } label: {
                         Image(systemName: "slider.horizontal.3")
                             .foregroundColor(.secondary)
@@ -87,25 +86,23 @@ private struct HostRow: View {
                     .help("Remove host")
                 }
                 if let p = state?.lastPayload, let t = p.vramTempC {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 12) {
                         Text("\(t)°")
                             .font(.system(size: 22, weight: .semibold, design: .rounded))
                             .foregroundColor(colorFor(temp: t))
+                            .frame(width: 72, alignment: .leading)
+                            .lineLimit(1)
                         if let fp = p.fanPct {
-                            Text("fan \(fp)%")
-                                .foregroundColor(.secondary)
+                            MetricText("fan \(fp)%", width: 76)
                         }
                         if let pw = p.powerW {
-                            Text("\(Int(pw.rounded()))W")
-                                .foregroundColor(.secondary)
+                            MetricText("\(Int(pw.rounded()))W", width: 58)
                         }
                         if let limit = p.powerLimitW {
-                            Text("cap \(Int(limit.rounded()))W")
-                                .foregroundColor(.secondary)
+                            MetricText("cap \(Int(limit.rounded()))W", width: 92)
                         }
                         if let util = p.gpuUtilPct {
-                            Text("gpu \(util)%")
-                                .foregroundColor(.secondary)
+                            MetricText("gpu \(util)%", width: 76)
                         }
                         if state?.isStale == true {
                             Image(systemName: "exclamationmark.triangle.fill")
@@ -128,11 +125,29 @@ private struct HostRow: View {
                 Spacer(minLength: 0)
                 VStack(alignment: .trailing, spacing: 2) {
                     UtilSparkline(history: history)
-                        .frame(width: 110, height: 40)
+                        .frame(width: 210, height: 54)
                     Text("GPU %").font(.caption2).foregroundColor(.secondary)
                 }
             }
         }
+    }
+}
+
+private struct MetricText: View {
+    let text: String
+    let width: CGFloat
+
+    init(_ text: String, width: CGFloat) {
+        self.text = text
+        self.width = width
+    }
+
+    var body: some View {
+        Text(text)
+            .foregroundColor(.secondary)
+            .frame(width: width, alignment: .leading)
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
     }
 }
 
@@ -186,6 +201,7 @@ private struct UtilSparkline: View {
 struct AddHostWindow: View {
     @EnvironmentObject var poller: StatusPoller
     @Environment(\.dismiss) private var dismiss
+    var onClose: (() -> Void)? = nil
     @State private var name = ""
     @State private var hostname = ""
     @State private var port = "8765"
@@ -202,7 +218,7 @@ struct AddHostWindow: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel") { dismiss() }
+                Button("Cancel") { close() }
                 Button("Add") {
                     let portInt = Int(port) ?? 8765
                     poller.addHost(Host(
@@ -211,7 +227,7 @@ struct AddHostWindow: View {
                         port: portInt,
                         token: token
                     ))
-                    dismiss()
+                    close()
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(hostname.isEmpty)
@@ -219,6 +235,14 @@ struct AddHostWindow: View {
         }
         .padding(20)
         .frame(width: 380)
+    }
+
+    private func close() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
+        }
     }
 }
 

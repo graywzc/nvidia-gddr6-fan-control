@@ -278,7 +278,7 @@ def start_http_server(host, port, state, token, state_file, apply_power_limit=No
             "state": state,
             "token": token,
             "state_file": state_file,
-            "apply_power_limit": apply_power_limit,
+            "apply_power_limit": staticmethod(apply_power_limit),
         },
     )
     server = _ThreadedHTTPServer((host, port), handler)
