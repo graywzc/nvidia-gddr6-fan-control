@@ -1,0 +1,46 @@
+name: Deploy Linux GPU Hosts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "fan_control.py"
+      - "install/install-linux.sh"
+      - "systemd/nvidia-gddr6-fan-control.service"
+      - ".github/workflows/deploy-linux.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy ${{ matrix.host }}
+    runs-on: [self-hosted, linux, "${{ matrix.host }}"]
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [aipc, aipc1]
+
+    concurrency:
+      group: deploy-linux-${{ matrix.host }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Python tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Install and restart service
+        run: sudo ./install/install-linux.sh
+
+      - name: Verify service is active
+        run: |
+          if ! sudo systemctl is-active --quiet nvidia-gddr6-fan-control.service; then
+            sudo systemctl --no-pager status nvidia-gddr6-fan-control.service
+            sudo journalctl -u nvidia-gddr6-fan-control.service -n 80 --no-pager
+            exit 1
+          fi
