@@ -60,6 +60,16 @@ private struct HostRow: View {
                     Spacer()
                     Button {
                         NSApp.activate(ignoringOtherApps: true)
+                        openWindow(id: "powerLimitEditor", value: host.id)
+                    } label: {
+                        Image(systemName: "bolt.fill")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Edit power limit")
+                    .disabled(state?.lastPayload?.powerLimitSupported == false)
+                    Button {
+                        NSApp.activate(ignoringOtherApps: true)
                         openWindow(id: "curveEditor", value: host.id)
                     } label: {
                         Image(systemName: "slider.horizontal.3")
@@ -87,6 +97,10 @@ private struct HostRow: View {
                         }
                         if let pw = p.powerW {
                             Text("\(Int(pw.rounded()))W")
+                                .foregroundColor(.secondary)
+                        }
+                        if let limit = p.powerLimitW {
+                            Text("cap \(Int(limit.rounded()))W")
                                 .foregroundColor(.secondary)
                         }
                         if let util = p.gpuUtilPct {
