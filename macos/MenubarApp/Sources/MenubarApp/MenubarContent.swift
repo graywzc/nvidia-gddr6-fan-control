@@ -3,6 +3,7 @@ import SwiftUI
 /// The view shown when the user clicks the menubar item.
 struct MenubarContent: View {
     @EnvironmentObject var poller: StatusPoller
+    let closePopover: () -> Void
     let openAddHost: () -> Void
     let openCurveEditor: (UUID) -> Void
     let openPowerLimitEditor: (UUID) -> Void
@@ -35,14 +36,27 @@ struct MenubarContent: View {
 
             Divider()
 
-            Button("Quit") {
-                NSApp.terminate(nil)
+            HStack {
+                Button("Close") {
+                    closePopover()
+                }
+                .keyboardShortcut(.cancelAction)
+                .buttonStyle(.borderless)
+
+                Spacer()
+
+                Button("Quit") {
+                    NSApp.terminate(nil)
+                }
+                .keyboardShortcut("q")
+                .buttonStyle(.borderless)
             }
-            .keyboardShortcut("q")
-            .buttonStyle(.borderless)
         }
         .padding(10)
         .frame(width: 700)
+        .onExitCommand {
+            closePopover()
+        }
     }
 }
 
