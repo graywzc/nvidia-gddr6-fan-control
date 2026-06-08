@@ -5,6 +5,7 @@ import ctypes
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -109,6 +110,47 @@ class PowerLimitValidationTests(unittest.TestCase):
         self.assertIsNone(snap["power_limit_max_w"])
         self.assertIsNone(snap["power_limit_default_w"])
         self.assertIsNone(snap["tdp_w"])
+
+
+class PowerLimitHTTPTests(unittest.TestCase):
+    def test_power_limit_callback_is_not_bound_to_handler_instance(self):
+        state = fan_control.State()
+        calls = []
+        captured = {}
+
+        def apply_power_limit(limit_w):
+            calls.append(limit_w)
+            return limit_w
+
+        class FakeServer:
+            def __init__(self, address, handler):
+                captured["address"] = address
+                captured["handler"] = handler
+
+            def serve_forever(self):
+                return None
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        with mock.patch.object(fan_control, "_ThreadedHTTPServer", FakeServer), \
+             mock.patch.object(fan_control.threading, "Thread", FakeThread):
+            fan_control.start_http_server(
+                "127.0.0.1",
+                0,
+                state,
+                None,
+                None,
+                apply_power_limit,
+            )
+
+        handler_instance = object.__new__(captured["handler"])
+        self.assertEqual(handler_instance.apply_power_limit(250.0), 250.0)
+        self.assertEqual(calls, [250.0])
 
 
 if __name__ == "__main__":
