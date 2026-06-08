@@ -196,6 +196,30 @@ Most options have sensible defaults; override via CLI flags or by editing the sy
   ```
 - **macOS menubar shows `—`:** host unreachable. Check `tailscale status` on both ends; `curl http://<host>:8765/status` from the Mac to isolate.
 
+## Deployment
+
+### Linux GPU hosts
+
+Linux deployment can run automatically through GitHub Actions self-hosted
+runners. Install one runner on each GPU host and give them these labels:
+
+- `aipc`: `self-hosted`, `linux`, `aipc`
+- `aipc1`: `self-hosted`, `linux`, `aipc1`
+
+The runner user needs passwordless `sudo` for the installer because
+`install/install-linux.sh` writes `/usr/local/bin`, installs the systemd unit,
+and restarts `nvidia-gddr6-fan-control.service`.
+
+After a merge to `main`, `.github/workflows/deploy-linux.yml` deploys to both
+hosts in parallel. You can also run **Deploy Linux GPU Hosts** manually from the
+GitHub Actions tab.
+
+The macOS menubar app is still installed manually with:
+
+```bash
+./install/install-macos.sh
+```
+
 ## Tests
 
 Python unit tests (stdlib `unittest`, no GPU required):
