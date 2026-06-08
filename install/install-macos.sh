@@ -13,6 +13,7 @@ APP_BUNDLE_PATH="$APP_INSTALL_DIR/$APP_BUNDLE_NAME"
 BUNDLE_ID="com.graywzc.nvidia-gddr6-fan-menubar"
 EXECUTABLE_NAME="MenubarApp"
 PLIST_PATH="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
+UID_NUM="$(id -u)"
 
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "This script is for macOS." >&2
@@ -25,6 +26,24 @@ if ! command -v swift >/dev/null; then
     exit 1
 fi
 
+bootout_agent() {
+    launchctl bootout "gui/$UID_NUM/$BUNDLE_ID" 2>/dev/null || true
+    if [[ -f "$PLIST_PATH" ]]; then
+        launchctl bootout "gui/$UID_NUM" "$PLIST_PATH" 2>/dev/null || true
+    fi
+}
+
+bootstrap_agent() {
+    if launchctl bootstrap "gui/$UID_NUM" "$PLIST_PATH"; then
+        return 0
+    fi
+
+    echo "WARN: launchctl bootstrap failed; retrying after unloading stale agent state…" >&2
+    bootout_agent
+    sleep 1
+    launchctl bootstrap "gui/$UID_NUM" "$PLIST_PATH"
+}
+
 echo "Building release binary…"
 cd "$SWIFT_PROJECT_DIR"
 swift build -c release
@@ -36,6 +55,12 @@ if [[ ! -x "$BUILT_BIN" ]]; then
 fi
 
 echo "Assembling $APP_BUNDLE_PATH"
+# Stop any prior LaunchAgent/app before replacing the bundle. launchd can hold
+# stale state briefly if we remove the bundle out from under a running app.
+bootout_agent
+pkill -x "$EXECUTABLE_NAME" 2>/dev/null || true
+sleep 1
+
 # Remove any prior install so we don't mix old files in.
 rm -rf "$APP_BUNDLE_PATH"
 mkdir -p "$APP_BUNDLE_PATH/Contents/MacOS"
@@ -96,9 +121,8 @@ cat > "$PLIST_PATH" <<EOF
 EOF
 
 # Reload the LaunchAgent (bootout first if it's already loaded).
-UID_NUM="$(id -u)"
-launchctl bootout "gui/$UID_NUM/$BUNDLE_ID" 2>/dev/null || true
-launchctl bootstrap "gui/$UID_NUM" "$PLIST_PATH"
+bootout_agent
+bootstrap_agent
 
 # Start it now too.
 launchctl kickstart -k "gui/$UID_NUM/$BUNDLE_ID" >/dev/null 2>&1 || true
