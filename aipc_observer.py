@@ -266,7 +266,7 @@ class RequestTracker:
         if m:
             task_id = int(m.group(2))
             self.current_timing_task_id = task_id if task_id in self.active else None
-            return
+            line = line[m.end():]
 
         req = self._current_request_for_line(line)
         m = RE_PROMPT_EVAL.search(line)
@@ -367,7 +367,7 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2>GPU</h2><div id="gpuGrid" class="gpu-grid"></div></section>
 <section class="card"><h2>Summary</h2><div class="summary">
 <div class="summary-item"><div id="active" class="summary-value">0</div><div class="summary-label">Active</div></div>
-<div class="summary-item"><div id="requests" class="summary-value">0</div><div class="summary-label">Requests</div></div>
+<div class="summary-item"><div id="requests" class="summary-value">0</div><div class="summary-label">Completed</div></div>
 <div class="summary-item"><div id="gpuTemp" class="summary-value">--</div><div class="summary-label">GPU Temp</div></div>
 <div class="summary-item"><div id="memTemp" class="summary-value">--</div><div class="summary-label">VRAM Temp</div></div>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>

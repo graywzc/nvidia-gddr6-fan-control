@@ -54,6 +54,30 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertEqual(self.tracker.active[200]["completion_tokens"], 12)
         self.assertEqual(self.tracker.active[200]["gen_tps"], 8.5)
 
+    def test_prefixed_live_timing_lines_update_throughput(self):
+        self.tracker.process_line(
+            "8487.39.425.108 I slot launch_slot_: id  0 | task 380639 | processing task, is_child = 0"
+        )
+        self.tracker.process_line(
+            "8487.39.817.791 I slot print_timing: id  0 | task 380639 | prompt eval time =     328.55 ms /   267 tokens (    1.23 ms per token,   812.65 tokens per second)"
+        )
+        self.tracker.process_line(
+            "8487.39.817.793 I slot print_timing: id  0 | task 380639 |        eval time =      62.08 ms /     4 tokens (   15.52 ms per token,    64.43 tokens per second)"
+        )
+        self.tracker.process_line(
+            "8487.39.817.794 I slot print_timing: id  0 | task 380639 |       total time =     390.63 ms /   271 tokens"
+        )
+        self.tracker.process_line(
+            "8487.39.817.829 I slot      release: id  0 | task 380639 | stop processing: n_tokens = 272, truncated = 0"
+        )
+
+        request = list(self.state.requests)[0]
+        self.assertEqual(request["prompt_tokens"], 267)
+        self.assertEqual(request["completion_tokens"], 4)
+        self.assertEqual(request["total_tokens"], 272)
+        self.assertEqual(request["prompt_tps"], 812.65)
+        self.assertEqual(request["gen_tps"], 64.43)
+
     def test_ambiguous_decoded_line_is_ignored_when_multiple_tasks_are_active(self):
         self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
         self.tracker.process_line("I slot launch_slot_: id 1 | task 200 | processing task")
