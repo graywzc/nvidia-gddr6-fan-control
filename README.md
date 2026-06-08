@@ -21,6 +21,7 @@ Why this exists: NVIDIA's stock fan curve on Linux is driven by core temperature
 - **VRAM temp source:** the [`gddr6`](https://github.com/olealgoritme/gddr6) binary by olealgoritme reads the on-die VRAM junction-temperature register via `/dev/mem`. NVML still does not expose this on consumer cards as of driver 580.
 - **Fan control:** `nvmlDeviceSetFanSpeed_v2` from NVML — no X server, no Xorg session, no Coolbits.
 - **Power limiting:** NVML power-management APIs apply and report the board power cap when supported by the GPU/driver.
+- **Observer dashboard:** the controller can serve an integrated llama.cpp/GPU request dashboard at `/observer`.
 - **Transport:** plaintext HTTP, bound only to the host's Tailscale interface. Tailscale handles encryption and identity.
 
 ## Supported hardware
@@ -106,6 +107,7 @@ After install, click the menubar item → **Add Host…** and enter each Linux h
 
 - Menubar label shows VRAM temps for each configured host, space-separated. Hottest temp colors the label (green < 85°C, yellow 85–94°C, red ≥ 95°C).
 - Click the label for a popover with per-host detail (VRAM temp, current fan %, GPU model).
+- Click a host row to open that host's observer dashboard in the browser.
 - Slider icon next to each host opens the curve editor for that host.
 - Bolt icon next to each host opens the power-limit editor for that host.
 
@@ -122,6 +124,8 @@ Bound to the Tailscale interface only. No auth required (Tailscale handles ident
 
 ```
 GET  http://<host>:8765/status
+GET  http://<host>:8765/observer
+GET  http://<host>:8765/observer/api/snapshot
 PUT  http://<host>:8765/curve
        body: JSON list of [temp, fan_pct] pairs,
              temps strictly ascending, e.g.
@@ -176,6 +180,9 @@ Most options have sensible defaults; override via CLI flags or by editing the sy
 | `--gpu` | `0` | NVML GPU index to control |
 | `--gddr6-bin` | `/usr/local/bin/gddr6` | Path to the gddr6 binary |
 | `--power-limit-w` | none | Set GPU board power limit in watts at startup |
+| `--observer` / `--no-observer` | on | Enable or disable the integrated observer dashboard |
+| `--observer-monitor-port` | `8020` | llama.cpp frontend port whose TCP connections are monitored |
+| `--observer-container` | `beellama-qwen36-27b` | Docker container whose llama.cpp logs are tailed |
 | `--dry-run` | off | Read temps and print decisions but never call NVML SetFanSpeed |
 
 ## Troubleshooting
@@ -232,7 +239,9 @@ python3 -m unittest discover -s tests
 
 ```
 fan_control.py                          # the Linux controller
+aipc_observer.py                        # integrated llama.cpp/GPU observer dashboard
 tests/test_power.py                     # power-draw plumbing tests
+tests/test_observer.py                  # observer request parser tests
 systemd/nvidia-gddr6-fan-control.service
 install/install-linux.sh
 install/install-macos.sh

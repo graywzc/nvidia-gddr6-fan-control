@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "fan_control.py"
+      - "aipc_observer.py"
       - "install/install-linux.sh"
       - "systemd/nvidia-gddr6-fan-control.service"
       - ".github/workflows/deploy-linux.yml"
