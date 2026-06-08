@@ -79,5 +79,16 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertIn(200, self.tracker.active)
 
 
+class ObserverStateTests(unittest.TestCase):
+    def test_controller_status_round_trips_through_snapshot(self):
+        state = aipc_observer.ObserverState()
+        state.set_controller_status({"vram_temp_c": 88, "fan_pct": 62})
+
+        snap = state.snapshot()
+
+        self.assertEqual(snap["controller_status"]["vram_temp_c"], 88)
+        self.assertEqual(snap["controller_status"]["fan_pct"], 62)
+
+
 if __name__ == "__main__":
     unittest.main()

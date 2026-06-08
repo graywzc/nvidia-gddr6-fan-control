@@ -29,6 +29,7 @@ class ObserverState:
         self.gpu_history = deque(maxlen=600)
         self.requests = deque(maxlen=REQUEST_LOG_MAX)
         self.active_connections = {}
+        self.controller_status = {}
         self.start_time = time.time()
         self.sse_subscribers = []
 
@@ -44,6 +45,10 @@ class ObserverState:
     def set_active_connections(self, conns):
         with self.lock:
             self.active_connections = conns
+
+    def set_controller_status(self, snapshot):
+        with self.lock:
+            self.controller_status = dict(snapshot)
 
     def notify_subscribers(self):
         for evt in list(self.sse_subscribers):
@@ -77,6 +82,7 @@ class ObserverState:
                 "active_connections": dict(self.active_connections),
                 "active_count": len(self.active_connections),
                 "requests": list(self.requests),
+                "controller_status": dict(self.controller_status),
             }
 
 
@@ -329,6 +335,11 @@ class RequestTracker:
 request_tracker = RequestTracker()
 
 
+def set_controller_status(snapshot):
+    state.set_controller_status(snapshot)
+    state.notify_subscribers()
+
+
 def tail_docker_logs(container):
     try:
         proc = subprocess.Popen(
@@ -386,7 +397,7 @@ function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g
 <div class="row"><span class="label">VRAM</span><span class="value">${(g.mem_used_mib/1024).toFixed(1)} / ${(g.mem_total_mib/1024).toFixed(1)} GB</span></div><div class="bar"><div class="fill mem" style="width:${g.mem_util_pct}%"></div></div>
 <div class="row"><span class="label">Fan</span><span class="value">${g.fan_pct}%</span></div><div class="bar"><div class="fill fan" style="width:${g.fan_pct}%"></div></div>
 <div class="row"><span class="label">Power</span><span class="value">${g.power_w} / ${g.power_limit_w} W</span></div><div class="bar"><div class="fill power" style="width:${pct(g.power_w,g.power_limit_w)}%"></div></div></div>`}).join('')}
-function renderSummary(d){document.getElementById('active').textContent=d.active_count;document.getElementById('requests').textContent=d.requests.length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTemp.textContent=`${g.temp_c}°C`;gpuTemp.className='summary-value '+cls(g.temp_c);memTemp.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTemp.className='summary-value '+cls(g.mem_temp_c)}let done=d.requests.filter(r=>r.status==='completed'&&r.gen_tps>0);avgTps.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):'0'}
+function renderSummary(d){document.getElementById('active').textContent=d.active_count;document.getElementById('requests').textContent=d.requests.length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTemp.textContent=`${g.temp_c}°C`;gpuTemp.className='summary-value '+cls(g.temp_c);let vram=d.controller_status&&Number.isFinite(d.controller_status.vram_temp_c)?d.controller_status.vram_temp_c:g.mem_temp_c;memTemp.textContent=vram>=0?`${vram}°C`:'N/A';memTemp.className='summary-value '+cls(vram)}let done=d.requests.filter(r=>r.status==='completed'&&r.gen_tps>0);avgTps.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):'0'}
 function renderRequests(reqs){let recent=reqs.slice(-40).reverse();let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>P t/s</span><span>G t/s</span><span>GT</span><span>Duration</span></div>';document.getElementById('requestList').innerHTML=head+(recent.length?recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${r.total_ms?Number(r.total_ms).toFixed(0)+'ms':r.elapsed_ms?Number(r.elapsed_ms).toFixed(0)+'ms':'-'}</span></div>`).join(''):'<div class="request-row"><span class="label">No requests yet</span></div>')}
 connect();
 </script>

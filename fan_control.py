@@ -678,6 +678,7 @@ def main():
             monitor_port=args.observer_monitor_port,
             container=args.observer_container,
         )
+        aipc_observer.set_controller_status(state.snapshot())
 
     if args.listen_host.lower() != "off":
         try:
@@ -801,6 +802,8 @@ def main():
             power_limit_w=current_power_limit_w,
             gpu_util_pct=gpu_util,
         )
+        if args.observer:
+            aipc_observer.set_controller_status(state.snapshot())
         now = time.monotonic()
         needs_update = (
             last_applied_pct is None
