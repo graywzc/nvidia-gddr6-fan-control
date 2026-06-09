@@ -100,11 +100,24 @@ class ObserverState:
                 req = self.active_requests[task_id]
                 s = processing.get(task_id)
                 if s is not None:
-                    if s.get("prompt_tokens"):
-                        req["prompt_tokens"] = s["prompt_tokens"]
-                    req["completion_tokens"] = s.get("decoded", req.get("completion_tokens", 0))
+                    prompt = int(s.get("prompt_tokens") or 0)
+                    processed = int(s.get("processed_tokens") or 0)
+                    cache = int(s.get("cache_tokens") or 0)
+                    decoded = int(s.get("decoded") or 0)
+                    if prompt:
+                        req["prompt_tokens"] = prompt
+                    req["completion_tokens"] = decoded
                     req["kv_pct"] = s.get("kv_pct", 0)
                     req["cache_hit_pct"] = s.get("cache_hit_pct")
+                    if decoded > 0:
+                        # Generation has started, so the prompt is fully ingested.
+                        req["phase"] = "generating"
+                        req["prefill_pct"] = 100
+                    elif prompt:
+                        # Still ingesting the prompt: cached + recomputed / total.
+                        done = min(prompt, cache + processed)
+                        req["phase"] = "prefill"
+                        req["prefill_pct"] = int(round(100.0 * done / prompt))
                 elif now - req.get("start_time", now) > SLOTS_POLL_INTERVAL * 2:
                     del self.active_requests[task_id]
 
@@ -464,6 +477,8 @@ class RequestTracker:
                 "draft_accepted": 0,
                 "draft_generated": 0,
                 "cache_defeated": False,
+                "phase": "starting",
+                "prefill_pct": 0,
             }
             self.task_counter += 1
             self.state.add_active_request(dict(self.active[task_id]))
@@ -661,7 +676,7 @@ function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getEl
 function formatDuration(ms){if(!ms&&ms!==0)return '-';ms=Number(ms);if(!Number.isFinite(ms))return '-';if(ms>=60000)return (ms/60000).toFixed(ms>=600000?1:2)+' min';if(ms>=1000)return (ms/1000).toFixed(ms>=10000?1:2)+' sec';return ms.toFixed(0)+' ms'}
 function formatPhaseDuration(ms){return Number(ms)>0?formatDuration(ms):'-'}
 function liveElapsed(r){return formatDuration(Date.now()-(r.start_time||0)*1000)}
-function renderRequests(reqs,active){let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>`<div class="request-row live"><span class="status processing">processing</span><span>${r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>-</span><span>-</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
+function renderRequests(reqs,active){let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"><span class="status processing">${phase}</span><span>${r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>-</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
 connect();
 </script>
 </body></html>"""

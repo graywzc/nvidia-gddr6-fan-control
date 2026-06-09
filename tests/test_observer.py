@@ -197,6 +197,39 @@ class InFlightRequestTests(unittest.TestCase):
         self.state.enrich_active_from_slots([{"id_task": 100, "is_processing": False}])
         self.assertNotIn(100, self.state.active_requests)
 
+    def test_enrich_reports_prefill_phase_and_progress(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        slots = [{
+            "id_task": 100, "is_processing": True, "prompt_tokens": 10000,
+            "processed_tokens": 2500, "cache_tokens": 0, "decoded": 0,
+        }]
+        self.state.enrich_active_from_slots(slots)
+        req = self.state.active_requests[100]
+        self.assertEqual(req["phase"], "prefill")
+        self.assertEqual(req["prefill_pct"], 25)
+        self.assertEqual(req["completion_tokens"], 0)
+
+    def test_prefill_progress_counts_cached_tokens(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        slots = [{
+            "id_task": 100, "is_processing": True, "prompt_tokens": 10000,
+            "processed_tokens": 1000, "cache_tokens": 4000, "decoded": 0,
+        }]
+        self.state.enrich_active_from_slots(slots)
+        self.assertEqual(self.state.active_requests[100]["prefill_pct"], 50)
+
+    def test_enrich_switches_to_generating_once_decoding(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        slots = [{
+            "id_task": 100, "is_processing": True, "prompt_tokens": 10000,
+            "processed_tokens": 10000, "cache_tokens": 0, "decoded": 7,
+        }]
+        self.state.enrich_active_from_slots(slots)
+        req = self.state.active_requests[100]
+        self.assertEqual(req["phase"], "generating")
+        self.assertEqual(req["prefill_pct"], 100)
+        self.assertEqual(req["completion_tokens"], 7)
+
     def test_enrich_keeps_brand_new_request_not_yet_in_slots(self):
         self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
         # Just launched; /slots hasn't picked it up yet -> must not be pruned.
