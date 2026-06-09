@@ -103,5 +103,57 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertIn(200, self.tracker.active)
 
 
+    def test_truncated_release_sets_finish_reason(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 4096, truncated = 1"
+        )
+        request = list(self.state.requests)[0]
+        self.assertTrue(request["truncated"])
+        self.assertEqual(request["finish_reason"], "length")
+
+    def test_untruncated_release_finish_reason_is_stop(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 50, truncated = 0"
+        )
+        request = list(self.state.requests)[0]
+        self.assertFalse(request["truncated"])
+        self.assertEqual(request["finish_reason"], "stop")
+
+    def test_cancel_marks_active_request_and_counts(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line("W srv stop: cancel task, id_task = 100")
+
+        request = list(self.state.requests)[0]
+        self.assertEqual(request["status"], "cancelled")
+        self.assertEqual(request["finish_reason"], "cancelled")
+        self.assertEqual(self.state.cancelled_count, 1)
+        self.assertNotIn(100, self.tracker.active)
+
+    def test_cancel_of_unknown_task_only_increments_counter(self):
+        self.tracker.process_line("W srv stop: cancel task, id_task = 999")
+        self.assertEqual(self.state.cancelled_count, 1)
+        self.assertEqual(len(self.state.requests), 0)
+
+    def test_draft_acceptance_is_parsed(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "I slot print_timing: id 0 | task 100 | draft acceptance = 0.20312 (  195 accepted /   960 generated)"
+        )
+        request = self.tracker.active[100]
+        self.assertAlmostEqual(request["draft_acceptance"], 0.20312)
+        self.assertEqual(request["draft_accepted"], 195)
+        self.assertEqual(request["draft_generated"], 960)
+
+    def test_full_reprocess_marks_cache_defeated(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "W slot update_slots: id 0 | task 100 | forcing full prompt re-processing due to lack of cache data"
+        )
+        self.assertTrue(self.tracker.active[100]["cache_defeated"])
+        self.assertEqual(self.state.cache_defeated_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
