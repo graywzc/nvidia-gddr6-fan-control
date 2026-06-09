@@ -8,18 +8,25 @@ GPU stats, then serves a small dashboard at /observer with SSE updates.
 
 import json
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 from datetime import datetime
 
 DEFAULT_MONITOR_PORT = 8020
-DEFAULT_CONTAINER = "beellama-qwen36-27b"
+# None => auto-detect the container publishing the monitor port.
+DEFAULT_CONTAINER = None
 GPU_POLL_INTERVAL = 2.0
 CONN_CHECK_INTERVAL = 3.0
+MODEL_POLL_INTERVAL = 30.0
+CONTAINER_DETECT_INTERVAL = 5.0
 REQUEST_LOG_MAX = 200
+
+HOSTNAME = socket.gethostname().split(".")[0]
 
 
 class ObserverState:
@@ -31,6 +38,8 @@ class ObserverState:
         self.active_connections = {}
         self.start_time = time.time()
         self.sse_subscribers = []
+        self.model_name = None
+        self.container_name = None
 
     def add_request(self, req):
         with self.lock:
@@ -44,6 +53,14 @@ class ObserverState:
     def set_active_connections(self, conns):
         with self.lock:
             self.active_connections = conns
+
+    def set_model(self, name):
+        with self.lock:
+            self.model_name = name
+
+    def set_container(self, name):
+        with self.lock:
+            self.container_name = name
 
     def notify_subscribers(self):
         for evt in list(self.sse_subscribers):
@@ -70,6 +87,9 @@ class ObserverState:
             uptime = time.time() - self.start_time
             return {
                 "timestamp": time.time(),
+                "hostname": HOSTNAME,
+                "model": self.model_name,
+                "container": self.container_name,
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -113,6 +133,55 @@ def local_time_str(epoch):
         return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return "N/A"
+
+
+def detect_container(monitor_port):
+    """Find the running docker container publishing the monitor port."""
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            name, ports = parts[0], parts[1]
+            if f":{monitor_port}->" in ports:
+                return name
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"WARNING: observer container detection error: {e}", file=sys.stderr)
+    return None
+
+
+def detect_model(monitor_port):
+    """Query the llama.cpp frontend for the model it is currently serving."""
+    url = f"http://127.0.0.1:{monitor_port}/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    models = data.get("data") or []
+    if not models:
+        return None
+    model_id = models[0].get("id") or ""
+    # llama.cpp often reports a filesystem path; show just the model file/name.
+    return model_id.rsplit("/", 1)[-1] or None
+
+
+def poll_model(monitor_port):
+    while True:
+        model = detect_model(monitor_port)
+        if model:
+            state.set_model(model)
+        time.sleep(MODEL_POLL_INTERVAL)
 
 
 def poll_gpu_stats():
@@ -249,7 +318,7 @@ class RequestTracker:
                 "start_time_str": local_time_str(now),
                 "status": "processing",
                 "path": "/v1/chat/completions",
-                "model": "llama.cpp",
+                "model": self.state.model_name or "unknown",
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
@@ -329,25 +398,41 @@ class RequestTracker:
 request_tracker = RequestTracker()
 
 
-def tail_docker_logs(container):
-    try:
-        proc = subprocess.Popen(
-            ["docker", "logs", "-f", "--tail", "100", container],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        print(f"Observer tailing docker logs for {container}", file=sys.stderr)
-        for line in proc.stdout:
-            try:
-                request_tracker.process_line(line)
-            except Exception as e:
-                print(f"Observer log parse error: {e} ({line[:100]})", file=sys.stderr)
-    except FileNotFoundError:
-        print("WARNING: docker not found; observer request tracking disabled.",
-              file=sys.stderr)
-    except Exception as e:
-        print(f"WARNING: observer docker log tail error: {e}", file=sys.stderr)
+def tail_docker_logs(container, monitor_port):
+    """Tail llama.cpp logs, auto-detecting the container when not pinned.
+
+    Re-detects after the stream ends (container restart) so the observer keeps
+    working across redeploys without a hardcoded container name.
+    """
+    while True:
+        target = container or detect_container(monitor_port)
+        if not target:
+            time.sleep(CONTAINER_DETECT_INTERVAL)
+            continue
+        state.set_container(target)
+        try:
+            proc = subprocess.Popen(
+                ["docker", "logs", "-f", "--tail", "100", target],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print(f"Observer tailing docker logs for {target}", file=sys.stderr)
+            for line in proc.stdout:
+                try:
+                    request_tracker.process_line(line)
+                except Exception as e:
+                    print(f"Observer log parse error: {e} ({line[:100]})",
+                          file=sys.stderr)
+        except FileNotFoundError:
+            print("WARNING: docker not found; observer request tracking disabled.",
+                  file=sys.stderr)
+            return
+        except Exception as e:
+            print(f"WARNING: observer docker log tail error: {e}", file=sys.stderr)
+        # Stream ended; drop the stale container and re-detect after a pause.
+        state.set_container(None)
+        time.sleep(CONTAINER_DETECT_INTERVAL)
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -355,14 +440,14 @@ DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>aipc Observer</title>
+<title>Observer</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
-*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}
+*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}
 </style>
 </head>
 <body>
-<div class="header"><h1>aipc Observer</h1><div class="meta">Uptime <span id="uptime">0s</span> · <span id="updated">--</span></div></div>
+<div class="header"><h1 id="title">Observer</h1><div class="meta"><span id="model" class="model">--</span> · Uptime <span id="uptime">0s</span> · <span id="updated">--</span></div></div>
 <div class="grid">
 <section class="card"><h2>GPU</h2><div id="gpuGrid" class="gpu-grid"></div></section>
 <section class="card"><h2>Summary</h2><div class="summary">
@@ -378,7 +463,8 @@ DASHBOARD_HTML = """<!doctype html>
 let es;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
-function render(d){renderGpu(d.gpu_stats||[]);renderSummary(d);renderRequests(d.requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderRequests(d.requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function renderHeader(d){let host=d.hostname||'';let name=host?host+' Observer':'Observer';document.getElementById('title').textContent=name;document.title=name;document.getElementById('model').textContent=d.model||'no model';}
 function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g=>{let mt=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';return `<div class="gpu-card"><div class="gpu-name">GPU ${g.index}: ${g.name}</div>
 <div class="row"><span class="label">GPU Temp</span><span class="value ${cls(g.temp_c)}">${g.temp_c}°C</span></div><div class="bar"><div class="fill" style="width:${pct(g.temp_c,100)}%"></div></div>
 <div class="row"><span class="label">VRAM Temp</span><span class="value ${cls(g.mem_temp_c)}">${mt}</span></div>
@@ -449,12 +535,19 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
         daemon=True,
     ).start()
     threading.Thread(
+        target=poll_model,
+        args=(monitor_port,),
+        name="observer-model",
+        daemon=True,
+    ).start()
+    threading.Thread(
         target=tail_docker_logs,
-        args=(container,),
+        args=(container, monitor_port),
         name="observer-docker-logs",
         daemon=True,
     ).start()
     print(
-        f"Observer enabled at /observer (monitor :{monitor_port}, container {container})",
+        f"Observer enabled at /observer (host {HOSTNAME}, monitor :{monitor_port}, "
+        f"container {container or 'auto-detect'})",
         flush=True,
     )
