@@ -23,6 +23,7 @@ DEFAULT_CONTAINER = None
 GPU_POLL_INTERVAL = 2.0
 CONN_CHECK_INTERVAL = 3.0
 MODEL_POLL_INTERVAL = 30.0
+SLOTS_POLL_INTERVAL = 2.0
 CONTAINER_DETECT_INTERVAL = 5.0
 REQUEST_LOG_MAX = 200
 
@@ -40,6 +41,10 @@ class ObserverState:
         self.sse_subscribers = []
         self.model_name = None
         self.container_name = None
+        self.n_ctx = 0
+        self.slots = []
+        self.cancelled_count = 0
+        self.cache_defeated_count = 0
 
     def add_request(self, req):
         with self.lock:
@@ -61,6 +66,22 @@ class ObserverState:
     def set_container(self, name):
         with self.lock:
             self.container_name = name
+
+    def set_runtime(self, n_ctx):
+        with self.lock:
+            self.n_ctx = n_ctx
+
+    def set_slots(self, slots):
+        with self.lock:
+            self.slots = slots
+
+    def incr_cancelled(self):
+        with self.lock:
+            self.cancelled_count += 1
+
+    def incr_cache_defeated(self):
+        with self.lock:
+            self.cache_defeated_count += 1
 
     def notify_subscribers(self):
         for evt in list(self.sse_subscribers):
@@ -90,6 +111,10 @@ class ObserverState:
                 "hostname": HOSTNAME,
                 "model": self.model_name,
                 "container": self.container_name,
+                "n_ctx": self.n_ctx,
+                "slots": list(self.slots),
+                "cancelled_count": self.cancelled_count,
+                "cache_defeated_count": self.cache_defeated_count,
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -160,13 +185,19 @@ def detect_container(monitor_port):
     return None
 
 
+def fetch_json(url, timeout=5):
+    """GET a JSON endpoint, returning the parsed body or None on any failure."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
 def detect_model(monitor_port):
     """Query the llama.cpp frontend for the model it is currently serving."""
-    url = f"http://127.0.0.1:{monitor_port}/v1/models"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
+    data = fetch_json(f"http://127.0.0.1:{monitor_port}/v1/models")
+    if not data:
         return None
     models = data.get("data") or []
     if not models:
@@ -176,12 +207,63 @@ def detect_model(monitor_port):
     return model_id.rsplit("/", 1)[-1] or None
 
 
+def detect_n_ctx(monitor_port):
+    """Read the context window size from the llama.cpp /props endpoint."""
+    props = fetch_json(f"http://127.0.0.1:{monitor_port}/props")
+    if not props:
+        return 0
+    gen = props.get("default_generation_settings") or {}
+    return int(gen.get("n_ctx") or props.get("n_ctx") or 0)
+
+
+def summarize_slots(raw, default_n_ctx):
+    """Reduce a raw /slots payload to the cache/context fields we display."""
+    slots = []
+    for s in raw:
+        prompt = int(s.get("n_prompt_tokens") or 0)
+        cache = int(s.get("n_prompt_tokens_cache") or 0)
+        processed = int(s.get("n_prompt_tokens_processed") or 0)
+        nt = s.get("next_token") or []
+        decoded = int((nt[0] or {}).get("n_decoded") or 0) if nt else 0
+        n_ctx = int(s.get("n_ctx") or default_n_ctx or 0)
+        kv_used = prompt + decoded
+        considered = cache + processed
+        slots.append({
+            "id": s.get("id", 0),
+            "is_processing": bool(s.get("is_processing")),
+            "id_task": s.get("id_task", -1),
+            "n_ctx": n_ctx,
+            "kv_used": kv_used,
+            "kv_pct": round(100.0 * kv_used / n_ctx, 1) if n_ctx else 0,
+            "prompt_tokens": prompt,
+            "cache_tokens": cache,
+            "processed_tokens": processed,
+            # Fraction of the prompt served from cache rather than recomputed.
+            "cache_hit_pct": round(100.0 * cache / considered, 1) if considered else None,
+        })
+    return slots
+
+
 def poll_model(monitor_port):
     while True:
         model = detect_model(monitor_port)
         if model:
             state.set_model(model)
         time.sleep(MODEL_POLL_INTERVAL)
+
+
+def poll_slots(monitor_port):
+    base = f"http://127.0.0.1:{monitor_port}"
+    while True:
+        if not state.n_ctx:
+            n_ctx = detect_n_ctx(monitor_port)
+            if n_ctx:
+                state.set_runtime(n_ctx)
+        raw = fetch_json(f"{base}/slots")
+        if isinstance(raw, list):
+            state.set_slots(summarize_slots(raw, state.n_ctx))
+            state.notify_subscribers()
+        time.sleep(SLOTS_POLL_INTERVAL)
 
 
 def poll_gpu_stats():
@@ -286,7 +368,13 @@ RE_PRINT_TIMING = re.compile(
 )
 RE_RELEASE = re.compile(
     r"I\s+slot\s+release:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|\s+stop processing:\s+n_tokens\s*=\s*(\d+)"
+    r"(?:,\s*truncated\s*=\s*(\d+))?"
 )
+RE_DRAFT = re.compile(
+    r"draft acceptance\s*=\s*([\d.]+)\s*\(\s*(\d+)\s+accepted\s*/\s*(\d+)\s+generated\)"
+)
+RE_FULL_REPROC = re.compile(r"task\s+(\d+)\s+\|\s+forcing full prompt re-processing")
+RE_CANCEL = re.compile(r"cancel task,\s+id_task\s*=\s*(\d+)")
 RE_PROMPT_EVAL = re.compile(
     r"prompt eval time\s*=?\s+([\d.]+)\s*ms\s*/\s+(\d+)\s+tokens\s*\(\s*([\d.]+)\s*ms per token,\s*([\d.]+)\s+tokens per second\)"
 )
@@ -327,6 +415,12 @@ class RequestTracker:
                 "eval_ms": 0,
                 "gen_tps": 0,
                 "total_ms": 0,
+                "truncated": False,
+                "finish_reason": None,
+                "draft_acceptance": None,
+                "draft_accepted": 0,
+                "draft_generated": 0,
+                "cache_defeated": False,
             }
             self.task_counter += 1
             return
@@ -364,25 +458,58 @@ class RequestTracker:
             req["gen_tps"] = safe_float(m.group(2))
             return
 
+        m = RE_DRAFT.search(line)
+        if m and req is not None:
+            req["draft_acceptance"] = safe_float(m.group(1))
+            req["draft_accepted"] = int(m.group(2))
+            req["draft_generated"] = int(m.group(3))
+            return
+
         m = RE_RELEASE.search(line)
         if m:
             task_id = int(m.group(2))
             n_tokens = int(m.group(3))
+            truncated = m.group(4)
             if task_id not in self.active:
                 return
             req = self.active.pop(task_id)
-            if self.current_timing_task_id == task_id:
-                self.current_timing_task_id = None
-            req["status"] = "completed"
-            req["end_time"] = time.time()
-            req["end_time_str"] = local_time_str(req["end_time"])
-            req["elapsed_ms"] = (req["end_time"] - req["start_time"]) * 1000
             req["total_tokens"] = max(req["total_tokens"], n_tokens)
-            with self.state.lock:
-                conns = list(self.state.active_connections.values())
-            req["client_ip"] = conns[0]["peer_ip"] if conns else "unknown"
-            self.state.add_request(req)
-            self.state.notify_subscribers()
+            if truncated is not None:
+                req["truncated"] = bool(int(truncated))
+            req["finish_reason"] = "length" if req["truncated"] else "stop"
+            self._finalize(task_id, req, "completed")
+            return
+
+        m = RE_FULL_REPROC.search(line)
+        if m:
+            self.state.incr_cache_defeated()
+            req = self.active.get(int(m.group(1)))
+            if req is not None:
+                req["cache_defeated"] = True
+            return
+
+        m = RE_CANCEL.search(line)
+        if m:
+            task_id = int(m.group(1))
+            self.state.incr_cancelled()
+            req = self.active.pop(task_id, None)
+            if req is not None:
+                req["finish_reason"] = "cancelled"
+                self._finalize(task_id, req, "cancelled")
+            return
+
+    def _finalize(self, task_id, req, status):
+        if self.current_timing_task_id == task_id:
+            self.current_timing_task_id = None
+        req["status"] = status
+        req["end_time"] = time.time()
+        req["end_time_str"] = local_time_str(req["end_time"])
+        req["elapsed_ms"] = (req["end_time"] - req["start_time"]) * 1000
+        with self.state.lock:
+            conns = list(self.state.active_connections.values())
+        req["client_ip"] = conns[0]["peer_ip"] if conns else "unknown"
+        self.state.add_request(req)
+        self.state.notify_subscribers()
 
     def _current_request_for_line(self, line):
         m = RE_TASK_ID.search(line)
@@ -443,7 +570,7 @@ DASHBOARD_HTML = """<!doctype html>
 <title>Observer</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
-*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}
+*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}
 </style>
 </head>
 <body>
@@ -457,13 +584,21 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="memTemp" class="summary-value">--</div><div class="summary-label">VRAM Temp</div></div>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>
 </div></section>
+<section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
+<section class="card"><h2>Inference Health</h2><div class="summary">
+<div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
+<div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
+<div class="summary-item"><div id="cacheDefeat" class="summary-value">0</div><div class="summary-label">Cache Defeated</div></div>
+<div class="summary-item"><div id="draftAccept" class="summary-value">-</div><div class="summary-label">Avg Draft Accept</div></div>
+</div></section>
 <section class="card full"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
 </div>
 <script>
 let es;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
-function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderRequests(d.requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderHealth(d);renderRequests(d.requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-'}
 function renderHeader(d){let host=d.hostname||'';let name=host?host+' Observer':'Observer';document.getElementById('title').textContent=name;document.title=name;document.getElementById('model').textContent=d.model||'no model';}
 function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g=>{let mt=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';return `<div class="gpu-card"><div class="gpu-name">GPU ${g.index}: ${g.name}</div>
 <div class="row"><span class="label">GPU Temp</span><span class="value ${cls(g.temp_c)}">${g.temp_c}°C</span></div><div class="bar"><div class="fill" style="width:${pct(g.temp_c,100)}%"></div></div>
@@ -473,6 +608,10 @@ function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g
 <div class="row"><span class="label">Fan</span><span class="value">${g.fan_pct}%</span></div><div class="bar"><div class="fill fan" style="width:${g.fan_pct}%"></div></div>
 <div class="row"><span class="label">Power</span><span class="value">${g.power_w} / ${g.power_limit_w} W</span></div><div class="bar"><div class="fill power" style="width:${pct(g.power_w,g.power_limit_w)}%"></div></div></div>`}).join('')}
 function renderSummary(d){document.getElementById('active').textContent=d.active_count;document.getElementById('requests').textContent=d.requests.length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTemp.textContent=`${g.temp_c}°C`;gpuTemp.className='summary-value '+cls(g.temp_c);memTemp.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTemp.className='summary-value '+cls(g.mem_temp_c)}let done=d.requests.filter(r=>r.status==='completed'&&r.gen_tps>0);avgTps.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):'0'}
+function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getElementById('slotInfo').innerHTML=slots.length?slots.map(s=>{let hit=(s.cache_hit_pct==null)?'-':s.cache_hit_pct+'%';let badge=s.is_processing?'<span class="status processing">busy</span>':'<span class="status completed">idle</span>';return `<div class="gpu-card"><div class="gpu-name">Slot ${s.id} ${badge}</div>
+<div class="row"><span class="label">Context</span><span class="value ${cls(s.kv_pct)}">${(s.kv_used||0).toLocaleString()} / ${(s.n_ctx||nctx).toLocaleString()} (${s.kv_pct}%)</span></div><div class="bar"><div class="fill mem" style="width:${pct(s.kv_pct,100)}%"></div></div>
+<div class="row"><span class="label">Prompt cache hit</span><span class="value">${hit}</span></div><div class="bar"><div class="fill fan" style="width:${s.cache_hit_pct||0}%"></div></div>
+<div class="row"><span class="label">Cached / reproc.</span><span class="value">${(s.cache_tokens||0).toLocaleString()} / ${(s.processed_tokens||0).toLocaleString()}</span></div></div>`}).join(''):'<div class="row"><span class="label">No slot data</span></div>'}
 function formatDuration(ms){if(!ms&&ms!==0)return '-';ms=Number(ms);if(!Number.isFinite(ms))return '-';if(ms>=60000)return (ms/60000).toFixed(ms>=600000?1:2)+' min';if(ms>=1000)return (ms/1000).toFixed(ms>=10000?1:2)+' sec';return ms.toFixed(0)+' ms'}
 function formatPhaseDuration(ms){return Number(ms)>0?formatDuration(ms):'-'}
 function renderRequests(reqs){let recent=reqs.slice(-40).reverse();let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';document.getElementById('requestList').innerHTML=head+(recent.length?recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join(''):'<div class="request-row"><span class="label">No requests yet</span></div>')}
@@ -538,6 +677,12 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
         target=poll_model,
         args=(monitor_port,),
         name="observer-model",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=poll_slots,
+        args=(monitor_port,),
+        name="observer-slots",
         daemon=True,
     ).start()
     threading.Thread(
