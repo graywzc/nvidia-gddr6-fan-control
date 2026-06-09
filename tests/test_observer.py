@@ -155,5 +155,54 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertEqual(self.state.cache_defeated_count, 1)
 
 
+class InFlightRequestTests(unittest.TestCase):
+    def setUp(self):
+        self.state = aipc_observer.ObserverState()
+        self.tracker = aipc_observer.RequestTracker(self.state)
+
+    def test_launch_registers_active_request(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.assertIn(100, self.state.active_requests)
+        self.assertEqual(self.state.active_requests[100]["status"], "processing")
+
+    def test_finalize_removes_active_request(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 30, truncated = 0"
+        )
+        self.assertNotIn(100, self.state.active_requests)
+        self.assertEqual(len(self.state.requests), 1)
+
+    def test_cancel_removes_active_request(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line("W srv stop: cancel task, id_task = 100")
+        self.assertNotIn(100, self.state.active_requests)
+
+    def test_enrich_updates_live_decode_progress(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        slots = [{
+            "id_task": 100, "is_processing": True,
+            "prompt_tokens": 6000, "decoded": 42, "kv_pct": 5.9, "cache_hit_pct": 0.0,
+        }]
+        self.state.enrich_active_from_slots(slots)
+        req = self.state.active_requests[100]
+        self.assertEqual(req["completion_tokens"], 42)
+        self.assertEqual(req["prompt_tokens"], 6000)
+        self.assertEqual(req["kv_pct"], 5.9)
+
+    def test_enrich_drops_ghost_request_when_no_slot_processing(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        # Simulate a missed release: age the request past the prune window.
+        self.state.active_requests[100]["start_time"] -= 100
+        self.state.enrich_active_from_slots([{"id_task": 100, "is_processing": False}])
+        self.assertNotIn(100, self.state.active_requests)
+
+    def test_enrich_keeps_brand_new_request_not_yet_in_slots(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        # Just launched; /slots hasn't picked it up yet -> must not be pruned.
+        self.state.enrich_active_from_slots([])
+        self.assertIn(100, self.state.active_requests)
+
+
 if __name__ == "__main__":
     unittest.main()
