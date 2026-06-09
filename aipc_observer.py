@@ -23,6 +23,7 @@ DEFAULT_CONTAINER = None
 GPU_POLL_INTERVAL = 2.0
 CONN_CHECK_INTERVAL = 3.0
 MODEL_POLL_INTERVAL = 30.0
+SLOTS_POLL_INTERVAL = 2.0
 CONTAINER_DETECT_INTERVAL = 5.0
 REQUEST_LOG_MAX = 200
 
@@ -40,6 +41,8 @@ class ObserverState:
         self.sse_subscribers = []
         self.model_name = None
         self.container_name = None
+        self.n_ctx = 0
+        self.slots = []
 
     def add_request(self, req):
         with self.lock:
@@ -61,6 +64,14 @@ class ObserverState:
     def set_container(self, name):
         with self.lock:
             self.container_name = name
+
+    def set_runtime(self, n_ctx):
+        with self.lock:
+            self.n_ctx = n_ctx
+
+    def set_slots(self, slots):
+        with self.lock:
+            self.slots = slots
 
     def notify_subscribers(self):
         for evt in list(self.sse_subscribers):
@@ -90,6 +101,8 @@ class ObserverState:
                 "hostname": HOSTNAME,
                 "model": self.model_name,
                 "container": self.container_name,
+                "n_ctx": self.n_ctx,
+                "slots": list(self.slots),
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -160,13 +173,19 @@ def detect_container(monitor_port):
     return None
 
 
+def fetch_json(url, timeout=5):
+    """GET a JSON endpoint, returning the parsed body or None on any failure."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
 def detect_model(monitor_port):
     """Query the llama.cpp frontend for the model it is currently serving."""
-    url = f"http://127.0.0.1:{monitor_port}/v1/models"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
+    data = fetch_json(f"http://127.0.0.1:{monitor_port}/v1/models")
+    if not data:
         return None
     models = data.get("data") or []
     if not models:
@@ -176,12 +195,63 @@ def detect_model(monitor_port):
     return model_id.rsplit("/", 1)[-1] or None
 
 
+def detect_n_ctx(monitor_port):
+    """Read the context window size from the llama.cpp /props endpoint."""
+    props = fetch_json(f"http://127.0.0.1:{monitor_port}/props")
+    if not props:
+        return 0
+    gen = props.get("default_generation_settings") or {}
+    return int(gen.get("n_ctx") or props.get("n_ctx") or 0)
+
+
+def summarize_slots(raw, default_n_ctx):
+    """Reduce a raw /slots payload to the cache/context fields we display."""
+    slots = []
+    for s in raw:
+        prompt = int(s.get("n_prompt_tokens") or 0)
+        cache = int(s.get("n_prompt_tokens_cache") or 0)
+        processed = int(s.get("n_prompt_tokens_processed") or 0)
+        nt = s.get("next_token") or []
+        decoded = int((nt[0] or {}).get("n_decoded") or 0) if nt else 0
+        n_ctx = int(s.get("n_ctx") or default_n_ctx or 0)
+        kv_used = prompt + decoded
+        considered = cache + processed
+        slots.append({
+            "id": s.get("id", 0),
+            "is_processing": bool(s.get("is_processing")),
+            "id_task": s.get("id_task", -1),
+            "n_ctx": n_ctx,
+            "kv_used": kv_used,
+            "kv_pct": round(100.0 * kv_used / n_ctx, 1) if n_ctx else 0,
+            "prompt_tokens": prompt,
+            "cache_tokens": cache,
+            "processed_tokens": processed,
+            # Fraction of the prompt served from cache rather than recomputed.
+            "cache_hit_pct": round(100.0 * cache / considered, 1) if considered else None,
+        })
+    return slots
+
+
 def poll_model(monitor_port):
     while True:
         model = detect_model(monitor_port)
         if model:
             state.set_model(model)
         time.sleep(MODEL_POLL_INTERVAL)
+
+
+def poll_slots(monitor_port):
+    base = f"http://127.0.0.1:{monitor_port}"
+    while True:
+        if not state.n_ctx:
+            n_ctx = detect_n_ctx(monitor_port)
+            if n_ctx:
+                state.set_runtime(n_ctx)
+        raw = fetch_json(f"{base}/slots")
+        if isinstance(raw, list):
+            state.set_slots(summarize_slots(raw, state.n_ctx))
+            state.notify_subscribers()
+        time.sleep(SLOTS_POLL_INTERVAL)
 
 
 def poll_gpu_stats():
@@ -457,13 +527,14 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="memTemp" class="summary-value">--</div><div class="summary-label">VRAM Temp</div></div>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>
 </div></section>
+<section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
 <section class="card full"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
 </div>
 <script>
 let es;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
-function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderRequests(d.requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderRequests(d.requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderHeader(d){let host=d.hostname||'';let name=host?host+' Observer':'Observer';document.getElementById('title').textContent=name;document.title=name;document.getElementById('model').textContent=d.model||'no model';}
 function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g=>{let mt=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';return `<div class="gpu-card"><div class="gpu-name">GPU ${g.index}: ${g.name}</div>
 <div class="row"><span class="label">GPU Temp</span><span class="value ${cls(g.temp_c)}">${g.temp_c}°C</span></div><div class="bar"><div class="fill" style="width:${pct(g.temp_c,100)}%"></div></div>
@@ -473,6 +544,10 @@ function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g
 <div class="row"><span class="label">Fan</span><span class="value">${g.fan_pct}%</span></div><div class="bar"><div class="fill fan" style="width:${g.fan_pct}%"></div></div>
 <div class="row"><span class="label">Power</span><span class="value">${g.power_w} / ${g.power_limit_w} W</span></div><div class="bar"><div class="fill power" style="width:${pct(g.power_w,g.power_limit_w)}%"></div></div></div>`}).join('')}
 function renderSummary(d){document.getElementById('active').textContent=d.active_count;document.getElementById('requests').textContent=d.requests.length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTemp.textContent=`${g.temp_c}°C`;gpuTemp.className='summary-value '+cls(g.temp_c);memTemp.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTemp.className='summary-value '+cls(g.mem_temp_c)}let done=d.requests.filter(r=>r.status==='completed'&&r.gen_tps>0);avgTps.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):'0'}
+function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getElementById('slotInfo').innerHTML=slots.length?slots.map(s=>{let hit=(s.cache_hit_pct==null)?'-':s.cache_hit_pct+'%';let badge=s.is_processing?'<span class="status processing">busy</span>':'<span class="status completed">idle</span>';return `<div class="gpu-card"><div class="gpu-name">Slot ${s.id} ${badge}</div>
+<div class="row"><span class="label">Context</span><span class="value ${cls(s.kv_pct)}">${(s.kv_used||0).toLocaleString()} / ${(s.n_ctx||nctx).toLocaleString()} (${s.kv_pct}%)</span></div><div class="bar"><div class="fill mem" style="width:${pct(s.kv_pct,100)}%"></div></div>
+<div class="row"><span class="label">Prompt cache hit</span><span class="value">${hit}</span></div><div class="bar"><div class="fill fan" style="width:${s.cache_hit_pct||0}%"></div></div>
+<div class="row"><span class="label">Cached / reproc.</span><span class="value">${(s.cache_tokens||0).toLocaleString()} / ${(s.processed_tokens||0).toLocaleString()}</span></div></div>`}).join(''):'<div class="row"><span class="label">No slot data</span></div>'}
 function formatDuration(ms){if(!ms&&ms!==0)return '-';ms=Number(ms);if(!Number.isFinite(ms))return '-';if(ms>=60000)return (ms/60000).toFixed(ms>=600000?1:2)+' min';if(ms>=1000)return (ms/1000).toFixed(ms>=10000?1:2)+' sec';return ms.toFixed(0)+' ms'}
 function formatPhaseDuration(ms){return Number(ms)>0?formatDuration(ms):'-'}
 function renderRequests(reqs){let recent=reqs.slice(-40).reverse();let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';document.getElementById('requestList').innerHTML=head+(recent.length?recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join(''):'<div class="request-row"><span class="label">No requests yet</span></div>')}
@@ -538,6 +613,12 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
         target=poll_model,
         args=(monitor_port,),
         name="observer-model",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=poll_slots,
+        args=(monitor_port,),
+        name="observer-slots",
         daemon=True,
     ).start()
     threading.Thread(
