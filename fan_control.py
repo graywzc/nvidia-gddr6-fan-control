@@ -560,7 +560,8 @@ def main():
     parser.add_argument(
         "--observer-container",
         default=aipc_observer.DEFAULT_CONTAINER,
-        help=f"Docker container whose llama.cpp logs are tailed (default: {aipc_observer.DEFAULT_CONTAINER})",
+        help="Docker container whose llama.cpp logs are tailed "
+        "(default: auto-detect the container publishing the monitor port)",
     )
     args = parser.parse_args()
     state_file = None if args.state_file.lower() == "off" else args.state_file
