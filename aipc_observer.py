@@ -47,6 +47,9 @@ class ObserverState:
         self.cache_defeated_count = 0
         # task_id -> in-flight request dict, shown as live "processing" rows.
         self.active_requests = {}
+        # GPU index -> real VRAM temp (°C) from the gddr6 reader, since
+        # nvidia-smi reports temperature.memory as N/A on consumer cards.
+        self.vram_temps = {}
 
     def add_request(self, req):
         with self.lock:
@@ -120,6 +123,10 @@ class ObserverState:
                         req["prefill_pct"] = int(round(100.0 * done / prompt))
                 elif now - req.get("start_time", now) > SLOTS_POLL_INTERVAL * 2:
                     del self.active_requests[task_id]
+
+    def set_vram_temps(self, mapping):
+        with self.lock:
+            self.vram_temps = dict(mapping)
 
     def incr_cancelled(self):
         with self.lock:
@@ -322,6 +329,15 @@ def poll_slots(monitor_port):
         time.sleep(SLOTS_POLL_INTERVAL)
 
 
+def overlay_vram_temps(gpus, vram_temps):
+    """Replace each GPU's nvidia-smi mem temp with the gddr6 reading when known."""
+    for g in gpus:
+        real = vram_temps.get(g["index"])
+        if real is not None:
+            g["mem_temp_c"] = float(real)
+    return gpus
+
+
 def poll_gpu_stats():
     while True:
         try:
@@ -365,6 +381,10 @@ def poll_gpu_stats():
                         "power_w": safe_float(parts[10]),
                         "power_limit_w": safe_float(parts[11]),
                     })
+                # Overlay the gddr6-derived VRAM temps over nvidia-smi's N/A.
+                with state.lock:
+                    vram_temps = dict(state.vram_temps)
+                overlay_vram_temps(gpus, vram_temps)
                 if gpus:
                     state.add_gpu_stats(gpus)
                     state.notify_subscribers()

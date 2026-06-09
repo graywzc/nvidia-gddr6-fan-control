@@ -802,6 +802,11 @@ def main():
             power_limit_w=current_power_limit_w,
             gpu_util_pct=gpu_util,
         )
+        # Hand the real VRAM temps to the observer; nvidia-smi reports
+        # temperature.memory as N/A on consumer cards. Indices line up with
+        # nvidia-smi's GPU order (both enumerate in PCI order).
+        if args.observer:
+            aipc_observer.state.set_vram_temps(dict(enumerate(temps)))
         now = time.monotonic()
         needs_update = (
             last_applied_pct is None

@@ -237,5 +237,29 @@ class InFlightRequestTests(unittest.TestCase):
         self.assertIn(100, self.state.active_requests)
 
 
+class VramOverlayTests(unittest.TestCase):
+    def test_overlay_replaces_na_with_gddr6_temp(self):
+        gpus = [
+            {"index": 0, "mem_temp_c": -1},
+            {"index": 1, "mem_temp_c": -1},
+        ]
+        aipc_observer.overlay_vram_temps(gpus, {0: 30, 1: 42})
+        self.assertEqual(gpus[0]["mem_temp_c"], 30.0)
+        self.assertEqual(gpus[1]["mem_temp_c"], 42.0)
+
+    def test_overlay_leaves_gpus_without_a_reading_untouched(self):
+        gpus = [{"index": 0, "mem_temp_c": -1}, {"index": 1, "mem_temp_c": -1}]
+        aipc_observer.overlay_vram_temps(gpus, {0: 30})
+        self.assertEqual(gpus[0]["mem_temp_c"], 30.0)
+        self.assertEqual(gpus[1]["mem_temp_c"], -1)
+
+    def test_set_vram_temps_copies_mapping(self):
+        state = aipc_observer.ObserverState()
+        src = {0: 31}
+        state.set_vram_temps(src)
+        src[0] = 99
+        self.assertEqual(state.vram_temps, {0: 31})
+
+
 if __name__ == "__main__":
     unittest.main()
