@@ -207,6 +207,87 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertEqual(self.state.cache_defeated_count, 1)
 
 
+class LogSignalTests(unittest.TestCase):
+    def setUp(self):
+        self.state = aipc_observer.ObserverState()
+        self.tracker = aipc_observer.RequestTracker(self.state)
+
+    def test_warm_route_is_attached_to_next_launch_on_that_slot(self):
+        self.tracker.process_line(
+            "I slot get_available_slot: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.873 (> 0.100 thold), f_keep = 0.950"
+        )
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        req = self.tracker.active[100]
+        self.assertEqual(req["slot_route"], "warm")
+        self.assertAlmostEqual(req["route_similarity"], 0.873)
+
+    def test_lru_route_is_cold(self):
+        self.tracker.process_line(
+            "I slot get_available_slot: id  1 | task 42 | selected slot by LRU, t_last = 1781130901"
+        )
+        self.tracker.process_line("I slot launch_slot_: id 1 | task 200 | processing task")
+        req = self.tracker.active[200]
+        self.assertEqual(req["slot_route"], "cold")
+        self.assertIsNone(req["route_similarity"])
+
+    def test_route_is_consumed_only_once(self):
+        self.tracker.process_line(
+            "I slot get_available_slot: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.873 (> 0.100 thold), f_keep = 0.950"
+        )
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 101 | processing task")
+        self.assertIsNone(self.tracker.active[101]["slot_route"])
+
+    def test_route_for_one_slot_does_not_leak_to_another(self):
+        self.tracker.process_line(
+            "I slot get_available_slot: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.873 (> 0.100 thold), f_keep = 0.950"
+        )
+        self.tracker.process_line("I slot launch_slot_: id 1 | task 200 | processing task")
+        self.assertIsNone(self.tracker.active[200]["slot_route"])
+
+    def test_context_shift_counts_and_persists_to_completed_row(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "W slot update_slots: id 0 | task 100 | slot context shift, n_keep = 1, n_left = 4094, n_discard = 2047"
+        )
+        self.tracker.process_line(
+            "W slot update_slots: id 0 | task 100 | slot context shift, n_keep = 1, n_left = 4094, n_discard = 2047"
+        )
+        self.assertEqual(self.state.context_shift_count, 2)
+        self.assertEqual(self.state.active_requests[100]["context_shifts"], 2)
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 8192, truncated = 0"
+        )
+        self.assertEqual(list(self.state.requests)[0]["context_shifts"], 2)
+
+    def test_context_shift_without_known_task_still_counts_globally(self):
+        self.tracker.process_line(
+            "W slot update_slots: id 0 | task 999 | slot context shift, n_keep = 1, n_left = 4094, n_discard = 2047"
+        )
+        self.assertEqual(self.state.context_shift_count, 1)
+
+    def test_prefill_progress_updates_live_prompt_tps(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.state.enrich_active_from_slots([{
+            "id_task": 100, "is_processing": True, "prompt_tokens": 10000,
+            "processed_tokens": 4500, "cache_tokens": 0, "decoded": 0,
+            "cache_hit_pct": 0.0,
+        }])
+        self.tracker.process_line(
+            "I slot update_slots: id 0 | task 100 | prompt processing, n_tokens =   4680, progress = 0.45, t =   3.50 s / 1337.14 tokens per second"
+        )
+        live = self.state.active_requests[100]
+        self.assertAlmostEqual(live["prompt_tps"], 1337.14)
+        self.assertEqual(live["prefill_pct"], 45)
+        self.assertEqual(live["phase"], "prefill")
+        # Slot enrichment must survive the merge.
+        self.assertEqual(live["cache_hit_pct"], 0.0)
+
+    def test_update_active_request_ignores_unknown_task(self):
+        self.state.update_active_request(123, {"prompt_tps": 1.0})
+        self.assertNotIn(123, self.state.active_requests)
+
+
 class InFlightRequestTests(unittest.TestCase):
     def setUp(self):
         self.state = aipc_observer.ObserverState()
