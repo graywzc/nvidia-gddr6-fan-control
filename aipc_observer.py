@@ -86,7 +86,7 @@ class ObserverState:
 
     def remove_active_request(self, task_id):
         with self.lock:
-            self.active_requests.pop(task_id, None)
+            return self.active_requests.pop(task_id, None)
 
     def enrich_active_from_slots(self, slots):
         """Update in-flight rows with live decode progress; drop ghost rows.
@@ -112,6 +112,12 @@ class ObserverState:
                     req["completion_tokens"] = decoded
                     req["kv_pct"] = s.get("kv_pct", 0)
                     req["cache_hit_pct"] = s.get("cache_hit_pct")
+                    req["cached_tokens"] = cache
+                    req["recomputed_tokens"] = processed
+                    if decoded > 0 and not req.get("ttft_ms"):
+                        # Poll-resolution estimate; print_timing's accurate
+                        # prompt eval time overwrites this at finalize.
+                        req["ttft_ms"] = (now - req.get("start_time", now)) * 1000
                     if decoded > 0:
                         # Generation has started, so the prompt is fully ingested.
                         req["phase"] = "generating"
@@ -491,6 +497,11 @@ class RequestTracker:
                 "eval_ms": 0,
                 "gen_tps": 0,
                 "total_ms": 0,
+                "ttft_ms": 0,
+                "cache_hit_pct": None,
+                "kv_pct": 0,
+                "cached_tokens": 0,
+                "recomputed_tokens": 0,
                 "truncated": False,
                 "finish_reason": None,
                 "draft_acceptance": None,
@@ -517,6 +528,8 @@ class RequestTracker:
             req["prompt_eval_ms"] = safe_float(m.group(1))
             req["prompt_tokens"] = int(m.group(2))
             req["prompt_tps"] = safe_float(m.group(4))
+            # Time to first token: the prompt must be fully ingested first.
+            req["ttft_ms"] = req["prompt_eval_ms"]
             return
 
         m = RE_EVAL_TIME.search(line)
@@ -588,7 +601,16 @@ class RequestTracker:
         with self.state.lock:
             conns = list(self.state.active_connections.values())
         req["client_ip"] = conns[0]["peer_ip"] if conns else "unknown"
-        self.state.remove_active_request(task_id)
+        # Carry slot-derived cache/context stats (only the live row has them)
+        # onto the completed record; the tracker's accurate ttft wins over the
+        # poll-resolution estimate.
+        enriched = self.state.remove_active_request(task_id)
+        if enriched:
+            for key in ("cache_hit_pct", "kv_pct", "cached_tokens", "recomputed_tokens"):
+                if enriched.get(key) is not None:
+                    req[key] = enriched[key]
+            if not req.get("ttft_ms") and enriched.get("ttft_ms"):
+                req["ttft_ms"] = enriched["ttft_ms"]
         self.state.add_request(req)
         self.state.notify_subscribers()
 
@@ -651,7 +673,7 @@ DASHBOARD_HTML = """<!doctype html>
 <title>Observer</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
-*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
+*{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 56px 70px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
 </style>
 </head>
 <body>
@@ -696,7 +718,8 @@ function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getEl
 function formatDuration(ms){if(!ms&&ms!==0)return '-';ms=Number(ms);if(!Number.isFinite(ms))return '-';if(ms>=60000)return (ms/60000).toFixed(ms>=600000?1:2)+' min';if(ms>=1000)return (ms/1000).toFixed(ms>=10000?1:2)+' sec';return ms.toFixed(0)+' ms'}
 function formatPhaseDuration(ms){return Number(ms)>0?formatDuration(ms):'-'}
 function liveElapsed(r){return formatDuration(Date.now()-(r.start_time||0)*1000)}
-function renderRequests(reqs,active){let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"><span class="status processing">${phase}</span><span>${r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>-</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
+function cacheCell(r){if(r.cache_hit_pct==null)return '<span>-</span>';let p=Number(r.cache_hit_pct);let c=p>=70?'good':p>=30?'hot':'critical';return `<span class="${c}">${p.toFixed(0)}%</span>`}
+function renderRequests(reqs,active){let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"><span class="status processing">${phase}</span><span>${r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>-</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
 connect();
 </script>
 </body></html>"""
