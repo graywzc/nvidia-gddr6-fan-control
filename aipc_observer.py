@@ -45,6 +45,7 @@ class ObserverState:
         self.slots = []
         self.cancelled_count = 0
         self.cache_defeated_count = 0
+        self.context_shift_count = 0
         # task_id -> in-flight request dict, shown as live "processing" rows.
         self.active_requests = {}
         # GPU index -> real VRAM temp (°C) from the gddr6 reader, since
@@ -87,6 +88,13 @@ class ObserverState:
     def remove_active_request(self, task_id):
         with self.lock:
             return self.active_requests.pop(task_id, None)
+
+    def update_active_request(self, task_id, fields):
+        """Merge fields into a live row without clobbering slot enrichment."""
+        with self.lock:
+            req = self.active_requests.get(task_id)
+            if req is not None:
+                req.update(fields)
 
     def enrich_active_from_slots(self, slots):
         """Update in-flight rows with live decode progress; drop ghost rows.
@@ -142,6 +150,10 @@ class ObserverState:
         with self.lock:
             self.cache_defeated_count += 1
 
+    def incr_context_shift(self):
+        with self.lock:
+            self.context_shift_count += 1
+
     def notify_subscribers(self):
         for evt in list(self.sse_subscribers):
             try:
@@ -174,6 +186,7 @@ class ObserverState:
                 "slots": list(self.slots),
                 "cancelled_count": self.cancelled_count,
                 "cache_defeated_count": self.cache_defeated_count,
+                "context_shift_count": self.context_shift_count,
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -465,6 +478,16 @@ RE_EVAL_TIME = re.compile(
 )
 RE_TOTAL_TIME = re.compile(r"total time\s*=?\s+([\d.]+)\s*ms\s*/\s+(\d+)\s+tokens")
 RE_DECODED = re.compile(r"n_decoded\s*=\s+(\d+),\s*tg\s*=\s+([\d.]+)\s*t/s")
+RE_CTX_SHIFT = re.compile(
+    r"slot context shift,\s*n_keep\s*=\s*(\d+),\s*n_left\s*=\s*(\d+),\s*n_discard\s*=\s*(\d+)"
+)
+RE_ROUTE_WARM = re.compile(r"selected slot by LCP similarity,\s*sim_best\s*=\s*([\d.]+)")
+RE_ROUTE_LRU = re.compile(r"selected slot by LRU")
+RE_PREFILL_PROGRESS = re.compile(
+    r"prompt processing,\s*n_tokens\s*=\s*(\d+),\s*progress\s*=\s*([\d.]+),"
+    r"\s*t\s*=\s*([\d.]+)\s*s\s*/\s*([\d.]+)\s+tokens per second"
+)
+RE_SLOT_ID = re.compile(r"\bid\s+(\d+)\s+\|")
 RE_TASK_ID = re.compile(r"\btask\s+(\d+)\b")
 
 
@@ -474,11 +497,29 @@ class RequestTracker:
         self.active = {}
         self.task_counter = 0
         self.current_timing_task_id = None
+        # slot_id -> ("warm"|"cold", similarity); the selection line is logged
+        # before launch_slot_ and carries the previous task id, so it is keyed
+        # by slot and consumed by the next launch on that slot.
+        self.pending_routes = {}
 
     def process_line(self, line):
+        m = RE_ROUTE_WARM.search(line)
+        if m:
+            sid = RE_SLOT_ID.search(line)
+            if sid:
+                self.pending_routes[int(sid.group(1))] = ("warm", safe_float(m.group(1)))
+            return
+
+        if RE_ROUTE_LRU.search(line):
+            sid = RE_SLOT_ID.search(line)
+            if sid:
+                self.pending_routes[int(sid.group(1))] = ("cold", None)
+            return
+
         m = RE_LAUNCH_SLOT.search(line)
         if m:
             slot_id, task_id = int(m.group(1)), int(m.group(2))
+            route = self.pending_routes.pop(slot_id, None)
             now = time.time()
             self.active[task_id] = {
                 "id": self.task_counter,
@@ -508,6 +549,9 @@ class RequestTracker:
                 "draft_accepted": 0,
                 "draft_generated": 0,
                 "cache_defeated": False,
+                "context_shifts": 0,
+                "slot_route": route[0] if route else None,
+                "route_similarity": route[1] if route else None,
                 "phase": "starting",
                 "prefill_pct": 0,
             }
@@ -549,6 +593,28 @@ class RequestTracker:
         if m and req is not None:
             req["completion_tokens"] = int(m.group(1))
             req["gen_tps"] = safe_float(m.group(2))
+            return
+
+        m = RE_CTX_SHIFT.search(line)
+        if m:
+            self.state.incr_context_shift()
+            if req is not None:
+                req["context_shifts"] = req.get("context_shifts", 0) + 1
+                self.state.update_active_request(
+                    req["task_id"], {"context_shifts": req["context_shifts"]}
+                )
+                self.state.notify_subscribers()
+            return
+
+        m = RE_PREFILL_PROGRESS.search(line)
+        if m and req is not None:
+            req["prompt_tps"] = safe_float(m.group(4))
+            self.state.update_active_request(req["task_id"], {
+                "prompt_tps": req["prompt_tps"],
+                "phase": "prefill",
+                "prefill_pct": int(round(100 * safe_float(m.group(2)))),
+            })
+            self.state.notify_subscribers()
             return
 
         m = RE_DRAFT.search(line)
@@ -692,6 +758,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
 <div class="summary-item"><div id="cacheDefeat" class="summary-value">0</div><div class="summary-label">Cache Defeated</div></div>
+<div class="summary-item"><div id="ctxShift" class="summary-value">0</div><div class="summary-label">Ctx Shifts</div></div>
 <div class="summary-item"><div id="draftAccept" class="summary-value">-</div><div class="summary-label">Avg Draft Accept</div></div>
 </div></section>
 <section class="card full"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
@@ -701,7 +768,7 @@ let es;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
-function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-'}
+function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;document.getElementById('ctxShift').textContent=d.context_shift_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-'}
 function renderHeader(d){let host=d.hostname||'';let name=host?host+' Observer':'Observer';document.getElementById('title').textContent=name;document.title=name;document.getElementById('model').textContent=d.model||'no model';}
 function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g=>{let mt=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';return `<div class="gpu-card"><div class="gpu-name">GPU ${g.index}: ${g.name}</div>
 <div class="row"><span class="label">GPU Temp</span><span class="value ${cls(g.temp_c)}">${g.temp_c}°C</span></div><div class="bar"><div class="fill" style="width:${pct(g.temp_c,100)}%"></div></div>
@@ -718,8 +785,9 @@ function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getEl
 function formatDuration(ms){if(!ms&&ms!==0)return '-';ms=Number(ms);if(!Number.isFinite(ms))return '-';if(ms>=60000)return (ms/60000).toFixed(ms>=600000?1:2)+' min';if(ms>=1000)return (ms/1000).toFixed(ms>=10000?1:2)+' sec';return ms.toFixed(0)+' ms'}
 function formatPhaseDuration(ms){return Number(ms)>0?formatDuration(ms):'-'}
 function liveElapsed(r){return formatDuration(Date.now()-(r.start_time||0)*1000)}
-function cacheCell(r){if(r.cache_hit_pct==null)return '<span>-</span>';let p=Number(r.cache_hit_pct);let c=p>=70?'good':p>=30?'hot':'critical';return `<span class="${c}">${p.toFixed(0)}%</span>`}
-function renderRequests(reqs,active){let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"><span class="status processing">${phase}</span><span>${r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>-</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"><span class="status ${r.status}">${r.status}</span><span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
+function cacheCell(r){let t=r.slot_route?` title="slot route: ${r.slot_route}${r.route_similarity!=null?' (sim '+Number(r.route_similarity).toFixed(2)+')':''}"`:'';if(r.cache_hit_pct==null)return `<span${t}>-</span>`;let p=Number(r.cache_hit_pct);let c=p>=70?'good':p>=30?'hot':'critical';return `<span class="${c}"${t}>${p.toFixed(0)}%</span>`}
+function statusCell(r,label){let shifts=r.context_shifts||0;let t=shifts?` title="${shifts} context shift(s): oldest history was dropped to keep generating"`:'';return `<span class="status ${r.status||'processing'}"${t}>${label}${shifts?' ⇄':''}</span>`}
+function renderRequests(reqs,active){let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live">${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row">${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span><span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
 connect();
 </script>
 </body></html>"""
