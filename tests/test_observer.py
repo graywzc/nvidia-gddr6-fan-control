@@ -146,6 +146,58 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertEqual(request["draft_accepted"], 195)
         self.assertEqual(request["draft_generated"], 960)
 
+    def test_ttft_is_set_from_prompt_eval_time(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line("I slot print_timing: id 0 | task 100 |")
+        self.tracker.process_line(
+            "prompt eval time = 250.0 ms / 10 tokens ( 25.0 ms per token, 40.0 tokens per second)"
+        )
+        self.assertEqual(self.tracker.active[100]["ttft_ms"], 250.0)
+
+    def test_finalize_preserves_slot_enrichment(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.state.enrich_active_from_slots([{
+            "id_task": 100, "is_processing": True, "prompt_tokens": 8000,
+            "processed_tokens": 2000, "cache_tokens": 6000, "decoded": 5,
+            "kv_pct": 48.9, "cache_hit_pct": 75.0,
+        }])
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 8005, truncated = 0"
+        )
+        request = list(self.state.requests)[0]
+        self.assertEqual(request["cache_hit_pct"], 75.0)
+        self.assertEqual(request["kv_pct"], 48.9)
+        self.assertEqual(request["cached_tokens"], 6000)
+        self.assertEqual(request["recomputed_tokens"], 2000)
+
+    def test_ttft_fallback_survives_finalize_without_timing_lines(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.state.active_requests[100]["start_time"] -= 1.5
+        self.state.enrich_active_from_slots([{
+            "id_task": 100, "is_processing": True, "prompt_tokens": 100, "decoded": 3,
+        }])
+        self.assertGreater(self.state.active_requests[100]["ttft_ms"], 0)
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 103, truncated = 0"
+        )
+        request = list(self.state.requests)[0]
+        self.assertGreater(request["ttft_ms"], 1000)
+
+    def test_accurate_ttft_wins_over_fallback_estimate(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.state.enrich_active_from_slots([{
+            "id_task": 100, "is_processing": True, "prompt_tokens": 100, "decoded": 3,
+        }])
+        self.tracker.process_line("I slot print_timing: id 0 | task 100 |")
+        self.tracker.process_line(
+            "prompt eval time = 250.0 ms / 100 tokens ( 2.5 ms per token, 400.0 tokens per second)"
+        )
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 103, truncated = 0"
+        )
+        request = list(self.state.requests)[0]
+        self.assertEqual(request["ttft_ms"], 250.0)
+
     def test_full_reprocess_marks_cache_defeated(self):
         self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
         self.tracker.process_line(
