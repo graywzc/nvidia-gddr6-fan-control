@@ -30,6 +30,7 @@ GPU_POLL_INTERVAL = 2.0
 CONN_CHECK_INTERVAL = 3.0
 MODEL_POLL_INTERVAL = 30.0
 SLOTS_POLL_INTERVAL = 2.0
+METRICS_POLL_INTERVAL = 2.0
 CONTAINER_DETECT_INTERVAL = 5.0
 MODEL_INFO_POLL_INTERVAL = 30.0
 REPO_POLL_INTERVAL = 900.0
@@ -70,6 +71,8 @@ class ObserverState:
         # recommendation diff between local HEAD and the fetched upstream.
         self.catalog = {}
         self.catalog_diff = {}
+        # Latest scrape of the llama.cpp Prometheus /metrics endpoint.
+        self.metrics = {}
 
     def add_request(self, req):
         with self.lock:
@@ -177,6 +180,10 @@ class ObserverState:
         with self.lock:
             self.catalog_diff = dict(diff)
 
+    def set_metrics(self, metrics):
+        with self.lock:
+            self.metrics = dict(metrics)
+
     def incr_cancelled(self):
         with self.lock:
             self.cancelled_count += 1
@@ -226,6 +233,7 @@ class ObserverState:
                 "repo_info": dict(self.repo_info),
                 "catalog": dict(self.catalog),
                 "catalog_diff": dict(self.catalog_diff),
+                "metrics": dict(self.metrics),
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -852,6 +860,95 @@ def fetch_json(url, timeout=5):
         return None
 
 
+def fetch_text(url, timeout=5):
+    """GET a text endpoint, returning the body or None on any failure."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.read().decode()
+    except Exception:
+        return None
+
+
+def parse_prometheus(text):
+    """Parse Prometheus exposition text into {metric_name: float}.
+
+    llama.cpp's metrics carry no labels, but tolerate them by stripping any
+    {...} suffix from the name. Unparseable lines are skipped.
+    """
+    values = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name = parts[0].split("{", 1)[0]
+        try:
+            values[name] = float(parts[1])
+        except ValueError:
+            continue
+    return values
+
+
+# llamacpp:* metric -> snapshot key. requests_deferred is the queue depth the
+# logs can never provide (they only show a task once compute starts).
+_METRIC_KEYS = {
+    "llamacpp:requests_deferred": "queued",
+    "llamacpp:requests_processing": "processing",
+    "llamacpp:prompt_tokens_seconds": "prompt_tps_avg",
+    "llamacpp:predicted_tokens_seconds": "gen_tps_avg",
+    "llamacpp:prompt_tokens_total": "prompt_tokens_total",
+    "llamacpp:tokens_predicted_total": "gen_tokens_total",
+    "llamacpp:prompt_seconds_total": "prompt_seconds_total",
+    "llamacpp:tokens_predicted_seconds_total": "gen_seconds_total",
+    "llamacpp:n_decode_total": "decode_calls_total",
+    "llamacpp:n_busy_slots_per_decode": "busy_slots_per_decode",
+    "llamacpp:kv_cache_usage_ratio": "kv_cache_usage_ratio",
+}
+
+
+def summarize_metrics(values):
+    """Map raw Prometheus values to the dashboard's metric snapshot."""
+    out = {"available": True, "scraped_at": time.time()}
+    for raw_name, key in _METRIC_KEYS.items():
+        if raw_name in values:
+            out[key] = values[raw_name]
+    for key in ("queued", "processing", "prompt_tokens_total", "gen_tokens_total",
+                "decode_calls_total"):
+        if key in out:
+            out[key] = int(out[key])
+    return out
+
+
+def poll_metrics(monitor_port):
+    """Scrape the llama.cpp /metrics endpoint (enabled by the insight presets).
+
+    When the server runs without --metrics the endpoint 404s; report
+    available=False so the dashboard can hint at the preset instead of
+    showing stale numbers.
+    """
+    url = f"http://127.0.0.1:{monitor_port}/metrics"
+    last_queue_state = None
+    while True:
+        text = fetch_text(url)
+        values = parse_prometheus(text) if text else {}
+        if values:
+            metrics = summarize_metrics(values)
+            state.set_metrics(metrics)
+            queue_state = (metrics.get("queued"), metrics.get("processing"))
+            if queue_state != last_queue_state:
+                last_queue_state = queue_state
+                state.notify_subscribers()
+        else:
+            if state.metrics.get("available"):
+                state.set_metrics({"available": False})
+                state.notify_subscribers()
+            elif not state.metrics:
+                state.set_metrics({"available": False})
+        time.sleep(METRICS_POLL_INTERVAL)
+
+
 def detect_model(monitor_port):
     """Query the llama.cpp frontend for the model it is currently serving."""
     data = fetch_json(f"http://127.0.0.1:{monitor_port}/v1/models")
@@ -1388,6 +1485,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="gpuTemp" class="summary-value">--</div><div class="summary-label">GPU Temp</div></div>
 <div class="summary-item"><div id="memTemp" class="summary-value">--</div><div class="summary-label">VRAM Temp</div></div>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>
+<div class="summary-item"><div id="queued" class="summary-value">-</div><div class="summary-label">Queued</div></div>
 </div></section>
 <section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
@@ -1395,6 +1493,7 @@ DASHBOARD_HTML = """<!doctype html>
 <option value="baseline">baseline</option><option value="insight" selected>insight</option><option value="insight-cache">insight+cache</option>
 </select><button class="btn" onclick="doRestart()">Restart model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
+<section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
@@ -1413,7 +1512,20 @@ let es;let lastModelInfo={};let flagModalOpen=false;function pct(v,max){return M
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
-function render(d){lastActive=(d.active_requests||[]).length;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastActive=(d.active_requests||[]).length;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
+if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">/metrics disabled — restart with an insight preset to enable</span></div>';return}
+q.textContent=m.queued??'-';q.className='summary-value '+((m.queued||0)>0?'hot':'');
+let rows='';
+rows+=infoRow('Processing / queued',`${m.processing??'-'} / ${(m.queued||0)>0?`<span class="hot">${m.queued}</span>`:m.queued??'-'}`,'requests_processing / requests_deferred — queued means all slots are busy');
+if(m.prompt_tps_avg!=null)rows+=infoRow('Avg prompt t/s',Number(m.prompt_tps_avg).toFixed(1),'server-lifetime average prompt processing throughput');
+if(m.gen_tps_avg!=null)rows+=infoRow('Avg gen t/s',Number(m.gen_tps_avg).toFixed(1),'server-lifetime average generation throughput');
+if(m.prompt_tokens_total!=null)rows+=infoRow('Prompt tokens',Number(m.prompt_tokens_total).toLocaleString()+(m.prompt_seconds_total!=null?` <span class="label">(${Number(m.prompt_seconds_total).toFixed(0)}s)</span>`:''));
+if(m.gen_tokens_total!=null)rows+=infoRow('Generated tokens',Number(m.gen_tokens_total).toLocaleString()+(m.gen_seconds_total!=null?` <span class="label">(${Number(m.gen_seconds_total).toFixed(0)}s)</span>`:''));
+if(m.decode_calls_total!=null)rows+=infoRow('Decode calls',Number(m.decode_calls_total).toLocaleString());
+if(m.busy_slots_per_decode!=null)rows+=infoRow('Busy slots / decode',Number(m.busy_slots_per_decode).toFixed(2));
+if(m.kv_cache_usage_ratio!=null)rows+=infoRow('KV cache usage',(100*m.kv_cache_usage_ratio).toFixed(1)+'%');
+el.innerHTML=rows}
 async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
@@ -1624,6 +1736,12 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
         target=poll_slots,
         args=(monitor_port,),
         name="observer-slots",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=poll_metrics,
+        args=(monitor_port,),
+        name="observer-metrics",
         daemon=True,
     ).start()
     threading.Thread(

@@ -939,5 +939,61 @@ class UpdateRepoTests(unittest.TestCase):
             aipc_observer.update_repo(self.clone)
 
 
+PROMETHEUS_SAMPLE = """\
+# HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.
+# TYPE llamacpp:prompt_tokens_total counter
+llamacpp:prompt_tokens_total 16185
+llamacpp:prompt_seconds_total 13.636
+llamacpp:tokens_predicted_total 394
+llamacpp:tokens_predicted_seconds_total 5.75
+llamacpp:n_decode_total 125
+llamacpp:n_tokens_max 5016
+llamacpp:prompt_tokens_seconds 1186.93
+llamacpp:predicted_tokens_seconds 68.5217
+llamacpp:requests_processing 1
+llamacpp:requests_deferred 3
+llamacpp:n_busy_slots_per_decode 1
+"""
+
+
+class MetricsTests(unittest.TestCase):
+    def test_parse_skips_comments_and_parses_values(self):
+        values = aipc_observer.parse_prometheus(PROMETHEUS_SAMPLE)
+        self.assertEqual(values["llamacpp:prompt_tokens_total"], 16185.0)
+        self.assertEqual(values["llamacpp:requests_deferred"], 3.0)
+        self.assertNotIn("# HELP", str(values.keys()))
+
+    def test_parse_tolerates_labels_and_junk(self):
+        values = aipc_observer.parse_prometheus(
+            'metric_with{label="x"} 7\nnot a metric\nbad_value abc\n'
+        )
+        self.assertEqual(values, {"metric_with": 7.0})
+
+    def test_parse_handles_none_and_empty(self):
+        self.assertEqual(aipc_observer.parse_prometheus(None), {})
+        self.assertEqual(aipc_observer.parse_prometheus(""), {})
+
+    def test_summarize_maps_queue_and_throughput(self):
+        values = aipc_observer.parse_prometheus(PROMETHEUS_SAMPLE)
+        m = aipc_observer.summarize_metrics(values)
+        self.assertTrue(m["available"])
+        self.assertEqual(m["queued"], 3)
+        self.assertEqual(m["processing"], 1)
+        self.assertIsInstance(m["queued"], int)
+        self.assertAlmostEqual(m["gen_tps_avg"], 68.5217)
+        self.assertEqual(m["prompt_tokens_total"], 16185)
+        self.assertEqual(m["decode_calls_total"], 125)
+
+    def test_summarize_omits_absent_metrics(self):
+        m = aipc_observer.summarize_metrics({"llamacpp:requests_deferred": 0})
+        self.assertEqual(m["queued"], 0)
+        self.assertNotIn("kv_cache_usage_ratio", m)
+
+    def test_snapshot_includes_metrics(self):
+        state = aipc_observer.ObserverState()
+        state.set_metrics({"available": True, "queued": 2})
+        self.assertEqual(state.snapshot()["metrics"]["queued"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
