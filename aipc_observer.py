@@ -10,6 +10,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -342,6 +343,112 @@ def summarize_command(cmd):
     return flags
 
 
+def _entrypoint_argv(entrypoint):
+    if not entrypoint:
+        return []
+    if isinstance(entrypoint, str):
+        try:
+            return shlex.split(entrypoint)
+        except ValueError:
+            return [entrypoint]
+    return [str(tok) for tok in entrypoint if str(tok)]
+
+
+def parse_help_flags(help_text):
+    """Parse a server --help screen into flag -> help-text entries.
+
+    The descriptions come from the running binary, not from a local glossary.
+    The parser intentionally accepts the common "options column, then help"
+    layout used by llama.cpp and many related CLIs.
+    """
+    entries = {}
+    current = None
+    for raw in (help_text or "").splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            current = None
+            continue
+        flags = re.findall(r"(?<![\w-])-{1,2}[A-Za-z][A-Za-z0-9_-]*", stripped)
+        if flags:
+            # Pick the wide padding before the prose column, not the short
+            # spacing between aliases such as "-h,    --help".
+            description = ""
+            for m in reversed(list(re.finditer(r"\s{2,}", stripped))):
+                if m.start() >= 8:
+                    description = stripped[m.end():].strip()
+                    break
+            aliases = sorted(set(flags), key=flags.index)
+            for flag in aliases:
+                entries[flag] = {
+                    "aliases": aliases,
+                    "description": description,
+                }
+            current = aliases
+        elif current and (line.startswith(" ") or line.startswith("\t")):
+            extra = stripped
+            for flag in current:
+                existing = entries[flag].get("description") or ""
+                entries[flag]["description"] = (existing + " " + extra).strip()
+    return entries
+
+
+def command_guide(command, help_index):
+    """Pair live argv flags with descriptions extracted from --help."""
+    guide = []
+    argv = list(command or [])
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith("-"):
+            i += 1
+            continue
+        value = None
+        if "=" in tok and tok.startswith("--"):
+            flag, value = tok.split("=", 1)
+        else:
+            flag = tok
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                value = argv[i + 1]
+                i += 1
+        help_entry = (help_index or {}).get(flag)
+        row = {
+            "flag": flag,
+            "value": value,
+            "known": help_entry is not None,
+        }
+        if help_entry:
+            row.update(help_entry)
+        guide.append(row)
+        i += 1
+    return guide
+
+
+def inspect_container_help(name, entrypoint):
+    """Run the live container's server --help and parse flag descriptions."""
+    argv = _entrypoint_argv(entrypoint)
+    if not name or not argv:
+        return None
+    try:
+        result = subprocess.run(
+            ["docker", "exec", name, *argv, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as e:
+        return {"error": str(e)}
+    output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    if result.returncode != 0:
+        return {"error": output.strip()[-400:] or "server --help failed"}
+    index = parse_help_flags(output)
+    return {
+        "source": " ".join([*argv, "--help"]),
+        "flag_count": len(index),
+        "flags": index,
+    }
+
+
 def inspect_container(name):
     """docker-inspect the model container for image, flags, and compose origin."""
     try:
@@ -349,6 +456,7 @@ def inspect_container(name):
             [
                 "docker", "inspect", name, "--format",
                 '{"image":{{json .Config.Image}},"cmd":{{json .Config.Cmd}},'
+                '"entrypoint":{{json .Config.Entrypoint}},'
                 '"labels":{{json .Config.Labels}}}',
             ],
             capture_output=True,
@@ -363,13 +471,20 @@ def inspect_container(name):
     labels = data.get("labels") or {}
     compose_file = labels.get("com.docker.compose.project.config_files") or ""
     cmd = data.get("cmd") or []
+    help_info = inspect_container_help(name, data.get("entrypoint"))
+    help_index = (help_info or {}).get("flags") or {}
+    if help_info and "flags" in help_info:
+        help_info = {k: v for k, v in help_info.items() if k != "flags"}
     return {
         "container": name,
         "image": data.get("image"),
+        "entrypoint": _entrypoint_argv(data.get("entrypoint")),
         "compose_file": compose_file,
         "variant": variant_from_compose_path(compose_file),
         "command": cmd,
         "flags": summarize_command(cmd),
+        "help": help_info,
+        "command_guide": command_guide(cmd, help_index),
     }
 
 
@@ -1049,6 +1164,7 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 56px 70px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
+.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -1074,8 +1190,12 @@ DASHBOARD_HTML = """<!doctype html>
 </div></section>
 <section class="card full"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
 </div>
+<div id="flagModal" class="modal" onclick="if(event.target===this)closeFlagGuide()"><div class="modal-panel">
+<div class="modal-head"><h2 id="flagModalTitle">Flag guide</h2><button class="btn" onclick="closeFlagGuide()">Close</button></div>
+<div id="flagModalBody" class="modal-body"></div>
+</div></div>
 <script>
-let es;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
+let es;let lastModelInfo={};let flagModalOpen=false;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
@@ -1119,7 +1239,14 @@ function infoRow(label,value,title){return `<div class="row"><span class="label"
 let detailsState={};
 document.addEventListener('toggle',e=>{if(e.target.id)detailsState[e.target.id]=e.target.open},true);
 function det(id,defOpen,summary,body){let open=detailsState[id]!==undefined?detailsState[id]:defOpen;return `<details id="${id}"${open?' open':''}><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">${summary}</summary>${body}</details>`}
+function flagGuideTitle(mi){let guide=mi.command_guide||[];let help=mi.help||{};return help.error?`Flag guide (${guide.length}, help failed)`:help.source?`Flag guide (${guide.length}, from ${esc(help.source)})`:`Flag guide (${guide.length})`}
+function flagGuideRows(mi){let guide=mi.command_guide||[];if(!guide.length)return '<div class="row"><span class="label">No command guide yet</span></div>';let rows='<div class="flag-guide head"><span>Flag</span><span>Value</span><span>Help text</span></div>';rows+=guide.map(r=>{let desc=r.known?esc(r.description||'listed in --help without description'):'<span class="hot">not found in --help</span>';let aliases=(r.aliases||[]).filter(a=>a!==r.flag).join(', ');let title=aliases?` title="aliases: ${esc(aliases)}"`:'';return `<div class="flag-guide"><span class="mono"${title}>${esc(r.flag)}</span><span class="mono">${r.value==null?'<span class="label">switch</span>':esc(r.value)}</span><span class="flag-help">${desc}</span></div>`}).join('');let help=mi.help||{};if(help.error)rows+=`<div class="row"><span class="critical">${esc(help.error)}</span></div>`;return rows}
+function renderFlagGuideModal(mi){document.getElementById('flagModalTitle').innerHTML=flagGuideTitle(mi);document.getElementById('flagModalBody').innerHTML=flagGuideRows(mi)}
+function openFlagGuide(){flagModalOpen=true;renderFlagGuideModal(lastModelInfo);document.getElementById('flagModal').classList.add('open')}
+function closeFlagGuide(){flagModalOpen=false;document.getElementById('flagModal').classList.remove('open')}
+function renderCommandGuideButton(mi){let guide=mi.command_guide||[];if(!guide.length)return '';return `<div class="row"><span class="label">Flags</span><span class="value"><button class="btn" onclick="openFlagGuide()">${flagGuideTitle(mi)}</button></span></div>`}
 function renderModelInfo(d){let mi=d.model_info||{};let ri=d.repo_info||{};let f=mi.flags||{};let rows='';
+lastModelInfo=mi;if(flagModalOpen)renderFlagGuideModal(mi);
 if(mi.variant)rows+=infoRow('Variant',esc(mi.variant),mi.compose_file);
 if(mi.image)rows+=infoRow('Image',esc((mi.image||'').split('/').pop()),mi.image);
 if(f.ctx_size)rows+=infoRow('Context',Number(f.ctx_size).toLocaleString());
@@ -1131,6 +1258,7 @@ if(ri.head){rows+=infoRow('club-3090 HEAD',esc(ri.head)+' '+esc(ri.head_subject|
 let st=ri.error?`<span class="critical">${esc(ri.error)}</span>`:(ri.behind>0?`<span class="hot">${ri.behind} commits behind</span>`:(ri.behind===0?'<span class="good">up to date</span>':'-'));
 rows+=infoRow('Upstream',st,(ri.upstream_commits||[]).join('\\n')||ri.fetch_error||'');}
 else if(ri.error)rows+=infoRow('club-3090',`<span class="critical">${esc(ri.error)}</span>`,ri.path);
+rows+=renderCommandGuideButton(mi);
 if(mi.command&&mi.command.length)rows+=det('detCmd',false,'full server command',`<div style="font-size:11px;color:var(--dim);word-break:break-all;padding:4px 0">${esc(mi.command.join(' '))}</div>`);
 document.getElementById('modelInfo').innerHTML=rows||'<div class="row"><span class="label">No model info yet</span></div>'}
 function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;document.getElementById('ctxShift').textContent=d.context_shift_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-'}
