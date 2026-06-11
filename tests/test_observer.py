@@ -756,7 +756,23 @@ class PresetTests(unittest.TestCase):
 
     def test_build_compose_override_shape(self):
         ov = aipc_observer.build_compose_override("svc", ["--a", "1"])
-        self.assertEqual(ov, {"services": {"svc": {"command": ["--a", "1"]}}})
+        svc = ov["services"]["svc"]
+        self.assertEqual(svc["command"], ["--a", "1"])
+        self.assertNotIn("image", svc)
+
+    def test_override_always_caps_log_growth(self):
+        for ov in (
+            aipc_observer.build_compose_override("svc", ["--a"]),
+            aipc_observer.build_compose_override("svc", None, image="img:1"),
+        ):
+            logging = ov["services"]["svc"]["logging"]
+            self.assertEqual(logging["driver"], "json-file")
+            self.assertEqual(
+                logging["options"]["max-size"], aipc_observer.LOG_ROTATE_MAX_SIZE
+            )
+            self.assertEqual(
+                logging["options"]["max-file"], aipc_observer.LOG_ROTATE_MAX_FILE
+            )
 
 
 class RestartGuardTests(unittest.TestCase):
@@ -851,6 +867,15 @@ class RestartModelTests(unittest.TestCase):
         self.assertIn("--host", argv)
         # The running image is pinned so a restart can't switch images.
         self.assertEqual(svc["image"], MODEL_INFO["image"])
+        self.assertEqual(svc["logging"]["driver"], "json-file")
+        self.assertEqual(
+            svc["logging"]["options"]["max-size"],
+            aipc_observer.LOG_ROTATE_MAX_SIZE,
+        )
+        self.assertEqual(
+            svc["logging"]["options"]["max-file"],
+            aipc_observer.LOG_ROTATE_MAX_FILE,
+        )
 
     def test_compose_env_reproduces_boot_substitutions(self):
         self._restart("insight")
@@ -874,6 +899,15 @@ class RestartModelTests(unittest.TestCase):
         with open(self.override_path) as f:
             svc = json.load(f)["services"]["svc"]
         self.assertEqual(svc["image"], MODEL_INFO["image"])
+        self.assertEqual(svc["logging"]["driver"], "json-file")
+        self.assertEqual(
+            svc["logging"]["options"]["max-size"],
+            aipc_observer.LOG_ROTATE_MAX_SIZE,
+        )
+        self.assertEqual(
+            svc["logging"]["options"]["max-file"],
+            aipc_observer.LOG_ROTATE_MAX_FILE,
+        )
         self.assertNotIn("command", svc)
 
     def test_unknown_preset_is_rejected(self):
@@ -894,7 +928,9 @@ class RestartModelTests(unittest.TestCase):
 
     def test_build_compose_override_image_only(self):
         ov = aipc_observer.build_compose_override("svc", None, image="img:1")
-        self.assertEqual(ov, {"services": {"svc": {"image": "img:1"}}})
+        svc = ov["services"]["svc"]
+        self.assertEqual(svc["image"], "img:1")
+        self.assertNotIn("command", svc)
 
 
 class UpdateRepoTests(unittest.TestCase):

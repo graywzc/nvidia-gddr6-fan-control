@@ -38,6 +38,11 @@ REQUEST_LOG_MAX = 200
 # JSON is valid YAML, so the generated compose override is written as JSON.
 OVERRIDE_FILE = "/tmp/aipc-observer-compose-override.yml"
 AUDIT_LOG = "/var/log/aipc-observer-actions.log"
+# Docker log rotation applied on every controlled restart. The container
+# otherwise runs json-file with no limits, and the insight-debug preset logs
+# full request bodies — a long context is a ~400 KB log line.
+LOG_ROTATE_MAX_SIZE = "100m"
+LOG_ROTATE_MAX_FILE = "5"
 
 HOSTNAME = socket.gethostname().split(".")[0]
 
@@ -746,7 +751,16 @@ def apply_preset_to_command(cmd, tweaks):
 
 
 def build_compose_override(service, argv=None, image=None):
-    svc = {}
+    svc = {
+        # Cap docker log growth; club-3090 composes set no logging limits.
+        "logging": {
+            "driver": "json-file",
+            "options": {
+                "max-size": LOG_ROTATE_MAX_SIZE,
+                "max-file": LOG_ROTATE_MAX_FILE,
+            },
+        },
+    }
     if argv is not None:
         svc["command"] = argv
     if image:
