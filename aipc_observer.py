@@ -524,6 +524,7 @@ def inspect_container(name):
         "compose_file": compose_file,
         "variant": variant_from_compose_path(compose_file),
         "command": cmd,
+        "preset": infer_insight_preset(cmd),
         "flags": summarize_command(cmd),
         "help": help_info,
         "command_guide": command_guide(cmd, help_index),
@@ -748,6 +749,48 @@ def apply_preset_to_command(cmd, tweaks):
             if value is not None:
                 argv.append(value)
     return argv
+
+
+def _command_option_map(cmd):
+    options = {}
+    argv = list(cmd or [])
+    i = 0
+    while i < len(argv):
+        tok = str(argv[i])
+        if not tok.startswith("-"):
+            i += 1
+            continue
+        if tok.startswith("--") and "=" in tok:
+            flag, value = tok.split("=", 1)
+            options[flag] = value
+        elif i + 1 < len(argv) and not str(argv[i + 1]).startswith("-"):
+            options[tok] = str(argv[i + 1])
+            i += 1
+        else:
+            options[tok] = None
+        i += 1
+    return options
+
+
+def preset_option_map(tweaks):
+    return {flag: value for flag, value in tweaks}
+
+
+def infer_insight_preset(cmd):
+    """Infer which observer-managed insight preset the live argv matches."""
+    options = _command_option_map(cmd)
+    managed_flags = {
+        flag for tweaks in INSIGHT_PRESETS.values() for flag, _ in tweaks
+    }
+    live_managed = {
+        flag: value for flag, value in options.items() if flag in managed_flags
+    }
+    for name in ("insight-debug", "insight-cache", "insight"):
+        if live_managed == preset_option_map(INSIGHT_PRESETS[name]):
+            return name
+    if not live_managed:
+        return "baseline"
+    return "custom"
 
 
 def build_compose_override(service, argv=None, image=None):
@@ -1563,7 +1606,7 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 56px 70px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
-.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -1580,7 +1623,7 @@ DASHBOARD_HTML = """<!doctype html>
 </div></section>
 <section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
-<div class="controls"><select id="presetSel" class="btn" title="baseline: club-3090 verbatim · insight: +metrics/props/trace logs · insight-cache: insight + cache-ram 8192">
+<div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · insight: +metrics/props/trace logs · insight-cache: insight + cache-ram 8192">
 <option value="baseline">baseline</option><option value="insight">insight</option><option value="insight-cache" selected>insight+cache</option><option value="insight-debug">insight+debug</option>
 </select><button class="btn" onclick="doRestart()">Restart model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
@@ -1601,11 +1644,28 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="flagModalBody" class="modal-body"></div>
 </div></div>
 <script>
-let es;let lastModelInfo={};let flagModalOpen=false;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
+let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;
+const PRESET_LABELS={'baseline':'baseline','insight':'insight','insight-cache':'insight+cache','insight-debug':'insight+debug','custom':'custom'};
+const PRESET_DESCRIPTIONS={
+baseline:'club-3090 compose command with no observer insight flags added',
+insight:'adds /metrics, /props, verbosity 4, and timestamps for observer visibility',
+'insight-cache':'insight plus cache-ram 8192 for prompt-cache experiments',
+'insight-debug':'cache plus verbosity 5, including very chatty request/response body logs',
+custom:'live command has observer-managed flags but does not exactly match a preset'
+};
+const PRESET_OPTIONS={
+baseline:{},
+insight:{'--metrics':null,'--props':null,'--log-verbosity':'4','--log-timestamps':null},
+'insight-cache':{'--metrics':null,'--props':null,'--log-verbosity':'4','--log-timestamps':null,'--cache-ram':'8192'},
+'insight-debug':{'--metrics':null,'--props':null,'--log-verbosity':'5','--log-timestamps':null,'--cache-ram':'8192'}
+};
+const MANAGED_FLAGS=new Set(Object.values(PRESET_OPTIONS).flatMap(o=>Object.keys(o)));
+function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
-function render(d){lastActive=(d.active_requests||[]).length;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
 if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">/metrics disabled — restart with an insight preset to enable</span></div>';return}
 q.textContent=m.queued??'-';q.className='summary-value '+((m.queued||0)>0?'hot':'');
@@ -1669,10 +1729,29 @@ function renderFlagGuideModal(mi){document.getElementById('flagModalTitle').inne
 function openFlagGuide(){flagModalOpen=true;renderFlagGuideModal(lastModelInfo);document.getElementById('flagModal').classList.add('open')}
 function closeFlagGuide(){flagModalOpen=false;document.getElementById('flagModal').classList.remove('open')}
 function renderCommandGuideButton(mi){let guide=mi.command_guide||[];if(!guide.length)return '';return `<div class="row"><span class="label">Flags</span><span class="value"><button class="btn" onclick="openFlagGuide()">${flagGuideTitle(mi)}</button></span></div>`}
+function presetLabel(name){return PRESET_LABELS[name]||name||'unknown'}
+function liveOptionMap(cmd){let out={};let argv=cmd||[];for(let i=0;i<argv.length;i++){let tok=String(argv[i]);if(!tok.startsWith('-'))continue;if(tok.startsWith('--')&&tok.includes('=')){let parts=tok.split(/=(.*)/s);out[parts[0]]=parts[1]??''}else if(i+1<argv.length&&!String(argv[i+1]).startsWith('-')){out[tok]=String(argv[i+1]);i++}else out[tok]=null}return out}
+function optionText(flag,value){return value==null?flag:`${flag} ${value}`}
+function selectedPreset(){let el=document.getElementById('presetSel');return el?el.value:'insight-cache'}
+function presetDiff(mi,selected){let live=liveOptionMap(mi.command||[]);let want=PRESET_OPTIONS[selected]||{};let rows=[];MANAGED_FLAGS.forEach(flag=>{let hasLive=Object.prototype.hasOwnProperty.call(live,flag);let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(hasLive&&hasWant&&String(live[flag])!==String(want[flag]))rows.push(`<span class="cmd-add">${esc(flag)}: ${esc(live[flag]??'switch')} → ${esc(want[flag]??'switch')}</span>`);else if(!hasLive&&hasWant)rows.push(`<span class="cmd-add">add ${esc(optionText(flag,want[flag]))}</span>`);else if(hasLive&&!hasWant)rows.push(`<span class="cmd-add">remove ${esc(optionText(flag,live[flag]))}</span>`)});return rows.join('')}
+function renderPresetStatus(mi){let running=mi.preset||'unknown';let selected=selectedPreset();let cls=running==='custom'?'preset-custom':(running===selected?'preset-match':'preset-diff');let rows='';
+rows+=infoRow('Running mode',`<span class="preset-pill ${cls}">${esc(presetLabel(running))}</span>`,PRESET_DESCRIPTIONS[running]||'inferred from the live container command');
+rows+=infoRow('Selected mode',`<span class="preset-pill ${running===selected?'preset-match':'preset-diff'}">${esc(presetLabel(selected))}</span>`,PRESET_DESCRIPTIONS[selected]||'');
+rows+=infoRow('Mode difference',`<span class="label preset-desc">${esc(PRESET_DESCRIPTIONS[selected]||'')}</span>`);
+let diff=presetDiff(mi,selected);if(diff)rows+=`<div class="row"><span class="label">Selected changes</span><span class="value" style="text-align:right">${diff}</span></div>`;
+return rows}
+function commandFlagAt(argv,i){let tok=String(argv[i]);if(tok.startsWith('--')&&tok.includes('='))return tok.split('=')[0];return tok.startsWith('-')?tok:null}
+function commandTokenClass(argv,i,want,live){let flag=commandFlagAt(argv,i);let prev=i>0?commandFlagAt(argv,i-1):null;if(prev&&Object.prototype.hasOwnProperty.call(live,prev)&&String(argv[i])===String(live[prev]))flag=prev;if(!flag||!MANAGED_FLAGS.has(flag))return '';let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(!hasWant)return 'cmd-remove';let liveVal=live[flag];let wantVal=want[flag];if(String(liveVal)===String(wantVal))return 'cmd-same';return 'cmd-change'}
+function renderCommandLine(mi){let argv=mi.command||[];let selected=selectedPreset();let want=PRESET_OPTIONS[selected]||{};let live=liveOptionMap(argv);let html=argv.map((tok,i)=>{let c=commandTokenClass(argv,i,want,live);return c?`<span class="cmd-token ${c}">${esc(tok)}</span>`:esc(tok)}).join(' ');
+let additions=[];MANAGED_FLAGS.forEach(flag=>{if(!Object.prototype.hasOwnProperty.call(live,flag)&&Object.prototype.hasOwnProperty.call(want,flag))additions.push(`<span class="cmd-add">+ ${esc(optionText(flag,want[flag]))}</span>`)});
+let legend='<div class="cmd-legend"><span class="cmd-token cmd-same">same in selected mode</span><span class="cmd-token cmd-change">value changes</span><span class="cmd-token cmd-remove">removed by selected mode</span></div>';
+if(additions.length)legend+=`<div class="cmd-legend">${additions.join('')}</div>`;
+return `<div class="cmd-line">${html}</div>${legend}`}
 function renderModelInfo(d){let mi=d.model_info||{};let ri=d.repo_info||{};let f=mi.flags||{};let rows='';
 lastModelInfo=mi;if(flagModalOpen)renderFlagGuideModal(mi);
 if(mi.variant)rows+=infoRow('Variant',esc(mi.variant),mi.compose_file);
 if(mi.image)rows+=infoRow('Image',esc((mi.image||'').split('/').pop()),mi.image);
+rows+=renderPresetStatus(mi);
 if(f.ctx_size)rows+=infoRow('Context',Number(f.ctx_size).toLocaleString());
 if(f.parallel)rows+=infoRow('Slots',esc(f.parallel));
 if(f.kv_type_k||f.kv_type_v)rows+=infoRow('KV quant',esc((f.kv_type_k||'f16')+' / '+(f.kv_type_v||'f16')));
@@ -1683,7 +1762,7 @@ let st=ri.error?`<span class="critical">${esc(ri.error)}</span>`:(ri.behind>0?`<
 rows+=infoRow('Upstream',st,(ri.upstream_commits||[]).join('\\n')||ri.fetch_error||'');}
 else if(ri.error)rows+=infoRow('club-3090',`<span class="critical">${esc(ri.error)}</span>`,ri.path);
 rows+=renderCommandGuideButton(mi);
-if(mi.command&&mi.command.length)rows+=det('detCmd',false,'full server command',`<div style="font-size:11px;color:var(--dim);word-break:break-all;padding:4px 0">${esc(mi.command.join(' '))}</div>`);
+if(mi.command&&mi.command.length)rows+=det('detCmd',false,'full server command',renderCommandLine(mi));
 document.getElementById('modelInfo').innerHTML=rows||'<div class="row"><span class="label">No model info yet</span></div>'}
 function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;document.getElementById('ctxShift').textContent=d.context_shift_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-';
 let hs=d.http_statuses||{};let errs=0;let breakdown=[];Object.keys(hs).sort().forEach(k=>{breakdown.push(k+': '+hs[k]);if(Number(k)>=400)errs+=hs[k]});
