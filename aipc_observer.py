@@ -62,6 +62,10 @@ class ObserverState:
         self.model_info = {}
         # club-3090 checkout state (HEAD, commits behind upstream).
         self.repo_info = {}
+        # Variant catalog extracted from the repo's compose registry, and the
+        # recommendation diff between local HEAD and the fetched upstream.
+        self.catalog = {}
+        self.catalog_diff = {}
 
     def add_request(self, req):
         with self.lock:
@@ -161,6 +165,14 @@ class ObserverState:
         with self.lock:
             self.repo_info = dict(info)
 
+    def set_catalog(self, catalog):
+        with self.lock:
+            self.catalog = dict(catalog)
+
+    def set_catalog_diff(self, diff):
+        with self.lock:
+            self.catalog_diff = dict(diff)
+
     def incr_cancelled(self):
         with self.lock:
             self.cancelled_count += 1
@@ -208,6 +220,8 @@ class ObserverState:
                 "context_shift_count": self.context_shift_count,
                 "model_info": dict(self.model_info),
                 "repo_info": dict(self.repo_info),
+                "catalog": dict(self.catalog),
+                "catalog_diff": dict(self.catalog_diff),
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -359,21 +373,26 @@ def inspect_container(name):
     }
 
 
-def repo_git(repo, *args, timeout=60):
-    """Run git in the model repo, dropping to the repo owner when root.
+def _repo_owner_cmd(repo, cmd):
+    """Prefix cmd with runuser to drop to the repo owner when running as root.
 
-    The daemon runs as root (fan control needs it), but a root `git fetch`
-    would leave root-owned files in the user's checkout and miss their ssh
-    identity, so wrap with runuser when the repo belongs to someone else.
+    The daemon runs as root (fan control needs it), but touching the user's
+    checkout as root would leave root-owned files and miss their ssh
+    identity — and the repo's code should never execute with root privileges.
     """
-    cmd = ["git", "-C", repo, *args]
     try:
         if os.geteuid() == 0:
             owner = pwd.getpwuid(os.stat(repo).st_uid).pw_name
             if owner != "root":
-                cmd = ["runuser", "-u", owner, "--"] + cmd
+                return ["runuser", "-u", owner, "--"] + cmd
     except OSError:
         pass
+    return cmd
+
+
+def repo_git(repo, *args, timeout=60):
+    """Run git in the model repo, dropping to the repo owner when root."""
+    cmd = _repo_owner_cmd(repo, ["git", "-C", repo, *args])
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
@@ -397,6 +416,7 @@ def collect_repo_info(repo, fetch=True):
         if fetch:
             repo_git(repo, "fetch", "--quiet", timeout=120)
         info["behind"] = int(repo_git(repo, "rev-list", "--count", "HEAD..@{upstream}"))
+        info["upstream_sha"] = repo_git(repo, "rev-parse", "--short", "@{upstream}")
         if info["behind"]:
             subjects = repo_git(
                 repo, "log", "--format=%h %s", "-n", "15", "HEAD..@{upstream}"
@@ -405,6 +425,97 @@ def collect_repo_info(repo, fetch=True):
     except Exception as e:
         info["fetch_error"] = str(e)
     return info
+
+
+# club-3090's machine-readable variant catalog: a pure-data module (no
+# imports), which is what makes ref-based extraction via `git show` possible.
+REGISTRY_MODULE_PATH = "scripts/lib/profiles/compose_registry.py"
+
+# Runs in an isolated subprocess with the registry module source on stdin.
+# exec'ing repo code is confined to that process, never the daemon, and
+# _repo_owner_cmd drops it to the repo owner when the daemon is root.
+_CATALOG_EXTRACT_CODE = """
+import json, sys, types
+mod = types.ModuleType("compose_registry")
+exec(compile(sys.stdin.read(), "compose_registry.py", "exec"), mod.__dict__)
+fields = ("model", "engine", "workload", "status", "status_note", "max_ctx",
+          "compose_path", "default_port", "kv_format", "tp")
+variants = {}
+for key, val in getattr(mod, "COMPOSE_REGISTRY", {}).items():
+    if not isinstance(val, dict):
+        val = getattr(val, "__dict__", {})
+    variants[str(key)] = {f: val.get(f) for f in fields}
+defaults = {}
+for key, val in getattr(mod, "DEFAULTS", {}).items():
+    k = "/".join(str(p) for p in key) if isinstance(key, tuple) else str(key)
+    defaults[k] = val
+print(json.dumps({"variants": variants, "defaults": defaults}))
+"""
+
+
+def extract_catalog(repo, ref="HEAD"):
+    """Load the compose registry at a git ref without checking it out.
+
+    Returns {"variants": {...}, "defaults": {...}} or {"error": ...}; never
+    raises. Extracting at @{upstream} is what lets the dashboard show what
+    upstream now recommends before any pull happens.
+    """
+    try:
+        src = repo_git(repo, "show", f"{ref}:{REGISTRY_MODULE_PATH}")
+        cmd = _repo_owner_cmd(
+            repo, [sys.executable or "python3", "-c", _CATALOG_EXTRACT_CODE]
+        )
+        result = subprocess.run(
+            cmd, input=src, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                result.stderr.strip()[-300:] or "registry extraction failed"
+            )
+        catalog = json.loads(result.stdout)
+        catalog["ref"] = ref
+        return catalog
+    except Exception as e:
+        return {"error": str(e), "ref": ref}
+
+
+# Registry fields whose upstream change amounts to a changed recommendation.
+_CATALOG_DIFF_FIELDS = ("status", "max_ctx", "workload", "compose_path")
+
+
+def diff_catalogs(local, upstream):
+    """Summarize recommendation changes between two extracted catalogs."""
+    lv = local.get("variants") or {}
+    uv = upstream.get("variants") or {}
+    diff = {
+        "added": sorted(set(uv) - set(lv)),
+        "removed": sorted(set(lv) - set(uv)),
+        "changed": [],
+    }
+    for key in sorted(set(lv) & set(uv)):
+        fields = {}
+        for f in _CATALOG_DIFF_FIELDS:
+            if lv[key].get(f) != uv[key].get(f):
+                fields[f] = [lv[key].get(f), uv[key].get(f)]
+        if fields:
+            diff["changed"].append({"key": key, "fields": fields})
+    ld = local.get("defaults") or {}
+    ud = upstream.get("defaults") or {}
+    defaults = {
+        k: [ld.get(k), ud.get(k)]
+        for k in sorted(set(ld) | set(ud))
+        if ld.get(k) != ud.get(k)
+    }
+    if defaults:
+        diff["default_changes"] = defaults
+    return diff
+
+
+def catalog_has_changes(diff):
+    return bool(
+        diff.get("added") or diff.get("removed") or diff.get("changed")
+        or diff.get("default_changes")
+    )
 
 
 def fetch_json(url, timeout=5):
@@ -504,10 +615,44 @@ def poll_model_info(monitor_port):
         time.sleep(MODEL_INFO_POLL_INTERVAL)
 
 
+def refresh_catalog(repo, info, cache, observer_state=None):
+    """Re-extract the catalog when HEAD or upstream moved; update the diff.
+
+    `cache` maps sha -> extracted catalog so the subprocess only runs when a
+    ref actually changes, not on every poll.
+    """
+    st = observer_state or state
+    head = info.get("head")
+    if not head:
+        return
+    local = cache.get(head)
+    if local is None:
+        local = extract_catalog(repo, "HEAD")
+        if "error" not in local:
+            cache[head] = local
+    st.set_catalog(local)
+    upstream_sha = info.get("upstream_sha")
+    if info.get("behind") and upstream_sha and "error" not in local:
+        upstream = cache.get(upstream_sha)
+        if upstream is None:
+            upstream = extract_catalog(repo, "@{upstream}")
+            if "error" not in upstream:
+                cache[upstream_sha] = upstream
+        if "error" not in upstream:
+            st.set_catalog_diff(diff_catalogs(local, upstream))
+            return
+    st.set_catalog_diff({})
+
+
 def poll_repo(repo):
+    catalog_cache = {}
     while True:
         info = collect_repo_info(repo)
         state.set_repo_info(info)
+        try:
+            refresh_catalog(repo, info, catalog_cache)
+        except Exception as e:
+            print(f"WARNING: observer catalog refresh error: {e}", file=sys.stderr)
         state.notify_subscribers()
         time.sleep(REPO_POLL_INTERVAL)
 
@@ -919,6 +1064,7 @@ DASHBOARD_HTML = """<!doctype html>
 </div></section>
 <section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div></section>
+<section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
@@ -932,7 +1078,31 @@ DASHBOARD_HTML = """<!doctype html>
 let es;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
-function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
+function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
+if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
+let vars=c.variants||{};let keys=Object.keys(vars);
+if(!keys.length){el.innerHTML='<div class="row"><span class="label">No catalog yet</span></div>';return}
+let rows='';
+let runKey=keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0);
+if(runKey){let v=vars[runKey];
+rows+=infoRow('Running variant',esc(runKey)+' '+statusSpan(v.status),v.status_note);
+if(v.workload)rows+=infoRow('Workload',esc(v.workload));
+let cur=Number((mi.flags||{}).ctx_size||0);
+if(v.max_ctx)rows+=infoRow('Validated ctx',Number(v.max_ctx).toLocaleString()+(cur&&v.max_ctx>cur?` <span class="hot">(running ${cur.toLocaleString()} — can raise)</span>`:''));
+let topo=(v.compose_path||'').indexOf('/dual/')>=0?'dual':'single';
+let def=(c.defaults||{})[`${v.model}/${runKey.split('/')[0]}/${topo}`];
+if(def)rows+=infoRow('Curated default',esc(def)+(def===runKey?' <span class="good">(running it)</span>':' <span class="hot">(differs)</span>'));}
+let counts={};keys.forEach(k=>{let s=vars[k].status||'other';counts[s]=(counts[s]||0)+1});
+rows+=infoRow('Variants',`${keys.length} (${counts.production||0} production · ${counts.caveats||0} caveats)`);
+let dl=[];(diff.added||[]).forEach(k=>dl.push('new: '+k));
+(diff.removed||[]).forEach(k=>dl.push('removed: '+k));
+(diff.changed||[]).forEach(ch=>dl.push(ch.key+': '+Object.entries(ch.fields).map(([f,v])=>`${f} ${v[0]??'-'} → ${v[1]??'-'}`).join(', ')));
+Object.entries(diff.default_changes||{}).forEach(([k,v])=>dl.push(`default ${k}: ${v[0]??'-'} → ${v[1]??'-'}`));
+if(dl.length)rows+=`<details open><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">upstream recommendation changes (${dl.length})</summary>${dl.map(t=>`<div class="row" style="font-size:12px"><span class="hot">${esc(t)}</span></div>`).join('')}</details>`;
+else if(ri.behind>0)rows+=infoRow('Upstream',`<span class="good">no recommendation changes in ${ri.behind} pending commits</span>`);
+el.innerHTML=rows}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function infoRow(label,value,title){return `<div class="row"><span class="label">${label}</span><span class="value"${title?` title="${esc(title)}"`:''}>${value}</span></div>`}
 function renderModelInfo(d){let mi=d.model_info||{};let ri=d.repo_info||{};let f=mi.flags||{};let rows='';
