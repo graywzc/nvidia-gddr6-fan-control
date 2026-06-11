@@ -1104,16 +1104,21 @@ fits.sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a]
 let defSet=new Set(Object.values(c.defaults||{}));
 let items=fits.map(k=>{let v=vars[k];let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let ctx=v.max_ctx?` · ${Math.round(v.max_ctx/1024)}K`:'';
 return `<div class="row" style="font-size:12px"><span class="label" title="${esc(v.status_note||'')}">${mark}${esc(v.model)} · ${esc(k)}${ctx}${v.workload?' · '+esc(v.workload):''}</span>${statusSpan(v.status)}</div>`}).join('');
-rows+=`<details><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">variants for this machine (${fits.length} of ${keys.length}, ${ngpu} GPU)</summary>${items}</details>`;
+rows+=det('detVariants',false,`variants for this machine (${fits.length} of ${keys.length}, ${ngpu} GPU)`,items);
 let dl=[];(diff.added||[]).forEach(k=>dl.push('new: '+k));
 (diff.removed||[]).forEach(k=>dl.push('removed: '+k));
 (diff.changed||[]).forEach(ch=>dl.push(ch.key+': '+Object.entries(ch.fields).map(([f,v])=>`${f} ${v[0]??'-'} → ${v[1]??'-'}`).join(', ')));
 Object.entries(diff.default_changes||{}).forEach(([k,v])=>dl.push(`default ${k}: ${v[0]??'-'} → ${v[1]??'-'}`));
-if(dl.length)rows+=`<details open><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">upstream recommendation changes (${dl.length})</summary>${dl.map(t=>`<div class="row" style="font-size:12px"><span class="hot">${esc(t)}</span></div>`).join('')}</details>`;
+if(dl.length)rows+=det('detUpstream',true,`upstream recommendation changes (${dl.length})`,dl.map(t=>`<div class="row" style="font-size:12px"><span class="hot">${esc(t)}</span></div>`).join(''));
 else if(ri.behind>0)rows+=infoRow('Upstream',`<span class="good">no recommendation changes in ${ri.behind} pending commits</span>`);
 el.innerHTML=rows}
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function infoRow(label,value,title){return `<div class="row"><span class="label">${label}</span><span class="value"${title?` title="${esc(title)}"`:''}>${value}</span></div>`}
+// SSE re-renders replace innerHTML, which would reset <details> to its
+// default state; remember each toggle by id and re-apply it.
+let detailsState={};
+document.addEventListener('toggle',e=>{if(e.target.id)detailsState[e.target.id]=e.target.open},true);
+function det(id,defOpen,summary,body){let open=detailsState[id]!==undefined?detailsState[id]:defOpen;return `<details id="${id}"${open?' open':''}><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">${summary}</summary>${body}</details>`}
 function renderModelInfo(d){let mi=d.model_info||{};let ri=d.repo_info||{};let f=mi.flags||{};let rows='';
 if(mi.variant)rows+=infoRow('Variant',esc(mi.variant),mi.compose_file);
 if(mi.image)rows+=infoRow('Image',esc((mi.image||'').split('/').pop()),mi.image);
@@ -1126,7 +1131,7 @@ if(ri.head){rows+=infoRow('club-3090 HEAD',esc(ri.head)+' '+esc(ri.head_subject|
 let st=ri.error?`<span class="critical">${esc(ri.error)}</span>`:(ri.behind>0?`<span class="hot">${ri.behind} commits behind</span>`:(ri.behind===0?'<span class="good">up to date</span>':'-'));
 rows+=infoRow('Upstream',st,(ri.upstream_commits||[]).join('\\n')||ri.fetch_error||'');}
 else if(ri.error)rows+=infoRow('club-3090',`<span class="critical">${esc(ri.error)}</span>`,ri.path);
-if(mi.command&&mi.command.length)rows+=`<details><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">full server command</summary><div style="font-size:11px;color:var(--dim);word-break:break-all;padding:4px 0">${esc(mi.command.join(' '))}</div></details>`;
+if(mi.command&&mi.command.length)rows+=det('detCmd',false,'full server command',`<div style="font-size:11px;color:var(--dim);word-break:break-all;padding:4px 0">${esc(mi.command.join(' '))}</div>`);
 document.getElementById('modelInfo').innerHTML=rows||'<div class="row"><span class="label">No model info yet</span></div>'}
 function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;document.getElementById('ctxShift').textContent=d.context_shift_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-'}
 function renderHeader(d){let host=d.hostname||'';let name=host?host+' Observer':'Observer';document.getElementById('title').textContent=name;document.title=name;document.getElementById('model').textContent=d.model||'no model';}
