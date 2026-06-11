@@ -754,6 +754,39 @@ class PresetTests(unittest.TestCase):
             ("--log-verbosity", "5"), aipc_observer.INSIGHT_PRESETS["insight-debug"]
         )
 
+    def test_infers_baseline_when_no_managed_flags_are_present(self):
+        self.assertEqual(
+            aipc_observer.infer_insight_preset(
+                ["--host", "0.0.0.0", "--cache-type-k", "q5_0"]
+            ),
+            "baseline",
+        )
+
+    def test_infers_insight_cache_from_live_command(self):
+        cmd = [
+            "--host", "0.0.0.0", "--metrics", "--props", "--log-verbosity",
+            "4", "--log-timestamps", "--cache-ram", "8192",
+        ]
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-cache")
+
+    def test_infers_debug_before_cache(self):
+        cmd = [
+            "--metrics", "--props", "--log-verbosity", "5",
+            "--log-timestamps", "--cache-ram", "8192",
+        ]
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-debug")
+
+    def test_infers_custom_for_partial_managed_flags(self):
+        cmd = ["--metrics", "--log-verbosity", "2"]
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "custom")
+
+    def test_infers_equals_style_values(self):
+        cmd = [
+            "--metrics", "--props", "--log-verbosity=4",
+            "--log-timestamps", "--cache-ram=8192",
+        ]
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-cache")
+
     def test_build_compose_override_shape(self):
         ov = aipc_observer.build_compose_override("svc", ["--a", "1"])
         svc = ov["services"]["svc"]
