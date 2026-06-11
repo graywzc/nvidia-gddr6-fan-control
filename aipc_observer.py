@@ -7,6 +7,8 @@ GPU stats, then serves a small dashboard at /observer with SSE updates.
 """
 
 import json
+import os
+import pwd
 import re
 import socket
 import subprocess
@@ -20,11 +22,16 @@ from datetime import datetime
 DEFAULT_MONITOR_PORT = 8020
 # None => auto-detect the container publishing the monitor port.
 DEFAULT_CONTAINER = None
+# The club-3090 checkout that launches the model server; the observer reports
+# its version and how far it is behind upstream. Empty/None disables this.
+DEFAULT_MODEL_REPO = "/home/graywzc/projects/club-3090"
 GPU_POLL_INTERVAL = 2.0
 CONN_CHECK_INTERVAL = 3.0
 MODEL_POLL_INTERVAL = 30.0
 SLOTS_POLL_INTERVAL = 2.0
 CONTAINER_DETECT_INTERVAL = 5.0
+MODEL_INFO_POLL_INTERVAL = 30.0
+REPO_POLL_INTERVAL = 900.0
 REQUEST_LOG_MAX = 200
 
 HOSTNAME = socket.gethostname().split(".")[0]
@@ -51,6 +58,10 @@ class ObserverState:
         # GPU index -> real VRAM temp (°C) from the gddr6 reader, since
         # nvidia-smi reports temperature.memory as N/A on consumer cards.
         self.vram_temps = {}
+        # docker-inspect view of the model container (image, flags, variant).
+        self.model_info = {}
+        # club-3090 checkout state (HEAD, commits behind upstream).
+        self.repo_info = {}
 
     def add_request(self, req):
         with self.lock:
@@ -142,6 +153,14 @@ class ObserverState:
         with self.lock:
             self.vram_temps = dict(mapping)
 
+    def set_model_info(self, info):
+        with self.lock:
+            self.model_info = dict(info)
+
+    def set_repo_info(self, info):
+        with self.lock:
+            self.repo_info = dict(info)
+
     def incr_cancelled(self):
         with self.lock:
             self.cancelled_count += 1
@@ -187,6 +206,8 @@ class ObserverState:
                 "cancelled_count": self.cancelled_count,
                 "cache_defeated_count": self.cache_defeated_count,
                 "context_shift_count": self.context_shift_count,
+                "model_info": dict(self.model_info),
+                "repo_info": dict(self.repo_info),
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -262,6 +283,128 @@ def detect_container(monitor_port):
     except Exception as e:
         print(f"WARNING: observer container detection error: {e}", file=sys.stderr)
     return None
+
+
+def variant_from_compose_path(path):
+    """Reduce a compose file path to the club-3090 variant it represents.
+
+    .../models/qwen3.6-27b/beellama/compose/single/x/dflash.yml
+    -> qwen3.6-27b/beellama/single/x/dflash
+    """
+    if not path:
+        return None
+    # compose may report several config files (override case); use the first.
+    path = path.split(",")[0]
+    p = path.split("models/", 1)[-1]
+    p = p.replace("/compose/", "/")
+    if p.endswith((".yml", ".yaml")):
+        p = p.rsplit(".", 1)[0]
+    return p
+
+
+# Server flags worth surfacing on the dashboard (flag -> snapshot key).
+_NOTABLE_FLAGS = {
+    "--ctx-size": "ctx_size",
+    "-c": "ctx_size",
+    "-np": "parallel",
+    "--parallel": "parallel",
+    "--cache-ram": "cache_ram_mib",
+    "-cram": "cache_ram_mib",
+    "--cache-type-k": "kv_type_k",
+    "--cache-type-v": "kv_type_v",
+    "--spec-type": "spec_type",
+    "--flash-attn": "flash_attn",
+    "--reasoning": "reasoning",
+}
+
+
+def summarize_command(cmd):
+    """Extract the notable value-taking flags from the server command line."""
+    flags = {}
+    for i, tok in enumerate(cmd or []):
+        key = _NOTABLE_FLAGS.get(tok)
+        if key and i + 1 < len(cmd):
+            flags[key] = cmd[i + 1]
+    return flags
+
+
+def inspect_container(name):
+    """docker-inspect the model container for image, flags, and compose origin."""
+    try:
+        result = subprocess.run(
+            [
+                "docker", "inspect", name, "--format",
+                '{"image":{{json .Config.Image}},"cmd":{{json .Config.Cmd}},'
+                '"labels":{{json .Config.Labels}}}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout.strip())
+    except Exception:
+        return None
+    labels = data.get("labels") or {}
+    compose_file = labels.get("com.docker.compose.project.config_files") or ""
+    cmd = data.get("cmd") or []
+    return {
+        "container": name,
+        "image": data.get("image"),
+        "compose_file": compose_file,
+        "variant": variant_from_compose_path(compose_file),
+        "command": cmd,
+        "flags": summarize_command(cmd),
+    }
+
+
+def repo_git(repo, *args, timeout=60):
+    """Run git in the model repo, dropping to the repo owner when root.
+
+    The daemon runs as root (fan control needs it), but a root `git fetch`
+    would leave root-owned files in the user's checkout and miss their ssh
+    identity, so wrap with runuser when the repo belongs to someone else.
+    """
+    cmd = ["git", "-C", repo, *args]
+    try:
+        if os.geteuid() == 0:
+            owner = pwd.getpwuid(os.stat(repo).st_uid).pw_name
+            if owner != "root":
+                cmd = ["runuser", "-u", owner, "--"] + cmd
+    except OSError:
+        pass
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
+    return result.stdout.strip()
+
+
+def collect_repo_info(repo, fetch=True):
+    """Report the model repo's HEAD and how far it is behind its upstream."""
+    info = {"path": repo, "checked_at": time.time()}
+    try:
+        info["branch"] = repo_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+        head = repo_git(repo, "log", "-1", "--format=%h%x09%s%x09%ci")
+        parts = head.split("\t")
+        info["head"] = parts[0]
+        info["head_subject"] = parts[1] if len(parts) > 1 else ""
+        info["head_date"] = parts[2] if len(parts) > 2 else ""
+    except Exception as e:
+        info["error"] = str(e)
+        return info
+    try:
+        if fetch:
+            repo_git(repo, "fetch", "--quiet", timeout=120)
+        info["behind"] = int(repo_git(repo, "rev-list", "--count", "HEAD..@{upstream}"))
+        if info["behind"]:
+            subjects = repo_git(
+                repo, "log", "--format=%h %s", "-n", "15", "HEAD..@{upstream}"
+            )
+            info["upstream_commits"] = subjects.splitlines()
+    except Exception as e:
+        info["fetch_error"] = str(e)
+    return info
 
 
 def fetch_json(url, timeout=5):
@@ -346,6 +489,27 @@ def poll_slots(monitor_port):
             state.enrich_active_from_slots(slots)
             state.notify_subscribers()
         time.sleep(SLOTS_POLL_INTERVAL)
+
+
+def poll_model_info(monitor_port):
+    last = None
+    while True:
+        name = state.container_name or detect_container(monitor_port)
+        if name:
+            info = inspect_container(name)
+            if info and info != last:
+                state.set_model_info(info)
+                state.notify_subscribers()
+                last = info
+        time.sleep(MODEL_INFO_POLL_INTERVAL)
+
+
+def poll_repo(repo):
+    while True:
+        info = collect_repo_info(repo)
+        state.set_repo_info(info)
+        state.notify_subscribers()
+        time.sleep(REPO_POLL_INTERVAL)
 
 
 def overlay_vram_temps(gpus, vram_temps):
@@ -754,6 +918,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>
 </div></section>
 <section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
+<section class="card"><h2>Model Config</h2><div id="modelInfo"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
@@ -767,7 +932,23 @@ DASHBOARD_HTML = """<!doctype html>
 let es;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
-function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function infoRow(label,value,title){return `<div class="row"><span class="label">${label}</span><span class="value"${title?` title="${esc(title)}"`:''}>${value}</span></div>`}
+function renderModelInfo(d){let mi=d.model_info||{};let ri=d.repo_info||{};let f=mi.flags||{};let rows='';
+if(mi.variant)rows+=infoRow('Variant',esc(mi.variant),mi.compose_file);
+if(mi.image)rows+=infoRow('Image',esc((mi.image||'').split('/').pop()),mi.image);
+if(f.ctx_size)rows+=infoRow('Context',Number(f.ctx_size).toLocaleString());
+if(f.parallel)rows+=infoRow('Slots',esc(f.parallel));
+if(f.kv_type_k||f.kv_type_v)rows+=infoRow('KV quant',esc((f.kv_type_k||'f16')+' / '+(f.kv_type_v||'f16')));
+if(f.spec_type)rows+=infoRow('Spec decode',esc(f.spec_type));
+if(f.cache_ram_mib!==undefined)rows+=infoRow('Prompt cache',f.cache_ram_mib==='0'?'<span class="hot">off (cache-ram 0)</span>':esc(f.cache_ram_mib)+' MiB');
+if(ri.head){rows+=infoRow('club-3090 HEAD',esc(ri.head)+' '+esc(ri.head_subject||''),ri.head_date);
+let st=ri.error?`<span class="critical">${esc(ri.error)}</span>`:(ri.behind>0?`<span class="hot">${ri.behind} commits behind</span>`:(ri.behind===0?'<span class="good">up to date</span>':'-'));
+rows+=infoRow('Upstream',st,(ri.upstream_commits||[]).join('\\n')||ri.fetch_error||'');}
+else if(ri.error)rows+=infoRow('club-3090',`<span class="critical">${esc(ri.error)}</span>`,ri.path);
+if(mi.command&&mi.command.length)rows+=`<details><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">full server command</summary><div style="font-size:11px;color:var(--dim);word-break:break-all;padding:4px 0">${esc(mi.command.join(' '))}</div></details>`;
+document.getElementById('modelInfo').innerHTML=rows||'<div class="row"><span class="label">No model info yet</span></div>'}
 function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;document.getElementById('ctxShift').textContent=d.context_shift_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-'}
 function renderHeader(d){let host=d.hostname||'';let name=host?host+' Observer':'Observer';document.getElementById('title').textContent=name;document.title=name;document.getElementById('model').textContent=d.model||'no model';}
 function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g=>{let mt=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';return `<div class="gpu-card"><div class="gpu-name">GPU ${g.index}: ${g.name}</div>
@@ -833,7 +1014,8 @@ def handle_observer_get(handler):
     return False
 
 
-def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINER):
+def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINER,
+                   model_repo=DEFAULT_MODEL_REPO):
     global _started
     with _start_lock:
         if _started:
@@ -864,6 +1046,19 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
         name="observer-docker-logs",
         daemon=True,
     ).start()
+    threading.Thread(
+        target=poll_model_info,
+        args=(monitor_port,),
+        name="observer-model-info",
+        daemon=True,
+    ).start()
+    if model_repo:
+        threading.Thread(
+            target=poll_repo,
+            args=(model_repo,),
+            name="observer-repo",
+            daemon=True,
+        ).start()
     print(
         f"Observer enabled at /observer (host {HOSTNAME}, monitor :{monitor_port}, "
         f"container {container or 'auto-detect'})",

@@ -394,5 +394,106 @@ class VramOverlayTests(unittest.TestCase):
         self.assertEqual(state.vram_temps, {0: 31})
 
 
+class ModelInfoTests(unittest.TestCase):
+    def test_variant_from_compose_path(self):
+        path = (
+            "/home/u/projects/club-3090/models/qwen3.6-27b/beellama/compose/"
+            "single/beellama-q5ks-dflash/dflash.yml"
+        )
+        self.assertEqual(
+            aipc_observer.variant_from_compose_path(path),
+            "qwen3.6-27b/beellama/single/beellama-q5ks-dflash/dflash",
+        )
+
+    def test_variant_uses_first_of_multiple_config_files(self):
+        path = (
+            "/r/models/m/eng/compose/single/v/base.yml,"
+            "/r/models/m/eng/compose/single/v/override.yml"
+        )
+        self.assertEqual(
+            aipc_observer.variant_from_compose_path(path), "m/eng/single/v/base"
+        )
+
+    def test_variant_of_empty_path_is_none(self):
+        self.assertIsNone(aipc_observer.variant_from_compose_path(""))
+
+    def test_summarize_command_extracts_notable_flags(self):
+        cmd = [
+            "--host", "0.0.0.0", "--port", "8080", "-m", "/models/x.gguf",
+            "--spec-type", "dflash", "--ctx-size", "102400", "-np", "1",
+            "--cache-type-k", "q5_0", "--cache-type-v", "q4_1",
+            "--flash-attn", "on", "--cache-ram", "0", "--reasoning", "off",
+        ]
+        flags = aipc_observer.summarize_command(cmd)
+        self.assertEqual(flags["ctx_size"], "102400")
+        self.assertEqual(flags["parallel"], "1")
+        self.assertEqual(flags["cache_ram_mib"], "0")
+        self.assertEqual(flags["kv_type_k"], "q5_0")
+        self.assertEqual(flags["kv_type_v"], "q4_1")
+        self.assertEqual(flags["spec_type"], "dflash")
+        self.assertEqual(flags["flash_attn"], "on")
+        self.assertEqual(flags["reasoning"], "off")
+
+    def test_summarize_command_handles_empty(self):
+        self.assertEqual(aipc_observer.summarize_command([]), {})
+        self.assertEqual(aipc_observer.summarize_command(None), {})
+
+    def test_snapshot_includes_model_and_repo_info(self):
+        state = aipc_observer.ObserverState()
+        state.set_model_info({"image": "img", "flags": {"ctx_size": "1"}})
+        state.set_repo_info({"head": "abc", "behind": 2})
+        snap = state.snapshot()
+        self.assertEqual(snap["model_info"]["image"], "img")
+        self.assertEqual(snap["repo_info"]["behind"], 2)
+
+
+class RepoInfoTests(unittest.TestCase):
+    """collect_repo_info against real temporary git repos."""
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.origin = f"{self.tmp.name}/origin"
+        self.clone = f"{self.tmp.name}/clone"
+        self._git_in(self.tmp.name, "init", "-q", "-b", "main", self.origin)
+        self._commit(self.origin, "first commit")
+        self._git_in(self.tmp.name, "clone", "-q", self.origin, self.clone)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _git_in(self, cwd, *args):
+        import subprocess
+
+        subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+        )
+
+    def _commit(self, repo, message):
+        self._git_in(repo, "-c", "user.email=t@t", "-c", "user.name=t",
+                     "commit", "-q", "--allow-empty", "-m", message)
+
+    def test_up_to_date_clone_reports_zero_behind(self):
+        info = aipc_observer.collect_repo_info(self.clone, fetch=True)
+        self.assertNotIn("error", info)
+        self.assertEqual(info["branch"], "main")
+        self.assertEqual(info["behind"], 0)
+        self.assertEqual(info["head_subject"], "first commit")
+
+    def test_behind_clone_reports_count_and_subjects(self):
+        self._commit(self.origin, "upstream change A")
+        self._commit(self.origin, "upstream change B")
+        info = aipc_observer.collect_repo_info(self.clone, fetch=True)
+        self.assertEqual(info["behind"], 2)
+        self.assertEqual(len(info["upstream_commits"]), 2)
+        self.assertIn("upstream change B", info["upstream_commits"][0])
+
+    def test_missing_repo_reports_error(self):
+        info = aipc_observer.collect_repo_info(f"{self.tmp.name}/nope", fetch=False)
+        self.assertIn("error", info)
+        self.assertNotIn("head", info)
+
+
 if __name__ == "__main__":
     unittest.main()

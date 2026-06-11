@@ -563,6 +563,12 @@ def main():
         help="Docker container whose llama.cpp logs are tailed "
         "(default: auto-detect the container publishing the monitor port)",
     )
+    parser.add_argument(
+        "--observer-repo",
+        default=aipc_observer.DEFAULT_MODEL_REPO,
+        help="club-3090 checkout whose version/upstream status the observer "
+        f"reports (default: {aipc_observer.DEFAULT_MODEL_REPO}; empty to disable)",
+    )
     args = parser.parse_args()
     state_file = None if args.state_file.lower() == "off" else args.state_file
 
@@ -678,6 +684,7 @@ def main():
         aipc_observer.start_observer(
             monitor_port=args.observer_monitor_port,
             container=args.observer_container,
+            model_repo=args.observer_repo,
         )
 
     if args.listen_host.lower() != "off":
