@@ -446,6 +446,54 @@ class ModelInfoTests(unittest.TestCase):
         self.assertEqual(snap["model_info"]["image"], "img")
         self.assertEqual(snap["repo_info"]["behind"], 2)
 
+    def test_snapshot_includes_catalog_and_diff(self):
+        state = aipc_observer.ObserverState()
+        state.set_catalog({"variants": {"e/v": {"status": "production"}}})
+        state.set_catalog_diff({"added": ["e/w"]})
+        snap = state.snapshot()
+        self.assertEqual(snap["catalog"]["variants"]["e/v"]["status"], "production")
+        self.assertEqual(snap["catalog_diff"]["added"], ["e/w"])
+
+
+class CatalogDiffTests(unittest.TestCase):
+    def _catalog(self, variants, defaults=None):
+        return {"variants": variants, "defaults": defaults or {}}
+
+    def test_identical_catalogs_have_no_changes(self):
+        cat = self._catalog({"e/v": {"status": "production", "max_ctx": 1000}})
+        diff = aipc_observer.diff_catalogs(cat, cat)
+        self.assertFalse(aipc_observer.catalog_has_changes(diff))
+
+    def test_added_and_removed_variants(self):
+        local = self._catalog({"e/old": {"status": "production"}})
+        upstream = self._catalog({"e/new": {"status": "caveats"}})
+        diff = aipc_observer.diff_catalogs(local, upstream)
+        self.assertEqual(diff["added"], ["e/new"])
+        self.assertEqual(diff["removed"], ["e/old"])
+        self.assertTrue(aipc_observer.catalog_has_changes(diff))
+
+    def test_status_and_ctx_changes_are_reported_per_field(self):
+        local = self._catalog({"e/v": {"status": "caveats", "max_ctx": 1000}})
+        upstream = self._catalog({"e/v": {"status": "production", "max_ctx": 2000}})
+        diff = aipc_observer.diff_catalogs(local, upstream)
+        self.assertEqual(len(diff["changed"]), 1)
+        fields = diff["changed"][0]["fields"]
+        self.assertEqual(fields["status"], ["caveats", "production"])
+        self.assertEqual(fields["max_ctx"], [1000, 2000])
+
+    def test_status_note_change_alone_is_not_a_recommendation_change(self):
+        local = self._catalog({"e/v": {"status": "production", "status_note": "a"}})
+        upstream = self._catalog({"e/v": {"status": "production", "status_note": "b"}})
+        diff = aipc_observer.diff_catalogs(local, upstream)
+        self.assertFalse(aipc_observer.catalog_has_changes(diff))
+
+    def test_default_changes_are_reported(self):
+        local = self._catalog({}, {"m/e/single": "e/old"})
+        upstream = self._catalog({}, {"m/e/single": "e/new"})
+        diff = aipc_observer.diff_catalogs(local, upstream)
+        self.assertEqual(diff["default_changes"]["m/e/single"], ["e/old", "e/new"])
+        self.assertTrue(aipc_observer.catalog_has_changes(diff))
+
 
 class RepoInfoTests(unittest.TestCase):
     """collect_repo_info against real temporary git repos."""
@@ -493,6 +541,122 @@ class RepoInfoTests(unittest.TestCase):
         info = aipc_observer.collect_repo_info(f"{self.tmp.name}/nope", fetch=False)
         self.assertIn("error", info)
         self.assertNotIn("head", info)
+
+
+REGISTRY_V1 = '''
+COMPOSE_REGISTRY = {
+    "eng/var-a": {
+        "model": "m1", "engine": "eng-local", "workload": "fast-chat",
+        "status": "caveats", "status_note": "works with limits",
+        "max_ctx": 1000, "compose_path": "models/m1/eng/compose/single/q/a.yml",
+        "default_port": 8060, "kv_format": "q5_0", "tp": 1,
+    },
+}
+DEFAULTS = {("m1", "eng", "single"): "eng/var-a"}
+'''
+
+REGISTRY_V2 = '''
+COMPOSE_REGISTRY = {
+    "eng/var-a": {
+        "model": "m1", "engine": "eng-local", "workload": "fast-chat",
+        "status": "production", "status_note": "now validated",
+        "max_ctx": 2000, "compose_path": "models/m1/eng/compose/single/q/a.yml",
+        "default_port": 8060, "kv_format": "q5_0", "tp": 1,
+    },
+    "eng/var-b": {
+        "model": "m1", "engine": "eng-local", "workload": "tool-heavy",
+        "status": "caveats", "status_note": "new variant",
+        "max_ctx": 4000, "compose_path": "models/m1/eng/compose/single/q/b.yml",
+        "default_port": 8060, "kv_format": "q8_0", "tp": 1,
+    },
+}
+DEFAULTS = {("m1", "eng", "single"): "eng/var-b"}
+'''
+
+
+class CatalogExtractTests(unittest.TestCase):
+    """extract_catalog/refresh_catalog against real temporary git repos."""
+
+    def setUp(self):
+        import os
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.origin = f"{self.tmp.name}/origin"
+        self.clone = f"{self.tmp.name}/clone"
+        self._git_in(self.tmp.name, "init", "-q", "-b", "main", self.origin)
+        self._write_registry(self.origin, REGISTRY_V1)
+        self._commit(self.origin, "registry v1")
+        self._git_in(self.tmp.name, "clone", "-q", self.origin, self.clone)
+        self._write_registry(self.origin, REGISTRY_V2)
+        self._commit(self.origin, "registry v2")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _git_in(self, cwd, *args):
+        import subprocess
+
+        subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+        )
+
+    def _commit(self, repo, message):
+        self._git_in(repo, "add", "-A")
+        self._git_in(repo, "-c", "user.email=t@t", "-c", "user.name=t",
+                     "commit", "-q", "-m", message)
+
+    def _write_registry(self, repo, content):
+        import os
+
+        path = os.path.join(repo, aipc_observer.REGISTRY_MODULE_PATH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+
+    def test_extracts_variants_and_tuple_defaults_at_head(self):
+        cat = aipc_observer.extract_catalog(self.clone, "HEAD")
+        self.assertNotIn("error", cat)
+        self.assertEqual(cat["variants"]["eng/var-a"]["status"], "caveats")
+        self.assertEqual(cat["variants"]["eng/var-a"]["max_ctx"], 1000)
+        self.assertEqual(cat["defaults"]["m1/eng/single"], "eng/var-a")
+
+    def test_extracts_upstream_ref_after_fetch(self):
+        self._git_in(self.clone, "fetch", "-q")
+        cat = aipc_observer.extract_catalog(self.clone, "@{upstream}")
+        self.assertNotIn("error", cat)
+        self.assertEqual(cat["variants"]["eng/var-a"]["status"], "production")
+        self.assertIn("eng/var-b", cat["variants"])
+
+    def test_missing_registry_reports_error(self):
+        cat = aipc_observer.extract_catalog(self.tmp.name, "HEAD")
+        self.assertIn("error", cat)
+
+    def test_refresh_catalog_sets_state_and_upstream_diff(self):
+        obs = aipc_observer.ObserverState()
+        info = aipc_observer.collect_repo_info(self.clone, fetch=True)
+        self.assertEqual(info["behind"], 1)
+        cache = {}
+        aipc_observer.refresh_catalog(self.clone, info, cache, observer_state=obs)
+        self.assertEqual(obs.catalog["variants"]["eng/var-a"]["status"], "caveats")
+        diff = obs.catalog_diff
+        self.assertEqual(diff["added"], ["eng/var-b"])
+        changed = {c["key"]: c["fields"] for c in diff["changed"]}
+        self.assertEqual(changed["eng/var-a"]["status"], ["caveats", "production"])
+        self.assertEqual(
+            diff["default_changes"]["m1/eng/single"], ["eng/var-a", "eng/var-b"]
+        )
+        # Both refs are now cached; a second refresh must not re-extract.
+        self.assertEqual(len(cache), 2)
+
+    def test_refresh_catalog_clears_diff_when_up_to_date(self):
+        self._git_in(self.clone, "pull", "-q")
+        obs = aipc_observer.ObserverState()
+        obs.set_catalog_diff({"added": ["stale"]})
+        info = aipc_observer.collect_repo_info(self.clone, fetch=True)
+        aipc_observer.refresh_catalog(self.clone, info, {}, observer_state=obs)
+        self.assertEqual(obs.catalog["variants"]["eng/var-a"]["status"], "production")
+        self.assertEqual(obs.catalog_diff, {})
 
 
 if __name__ == "__main__":
