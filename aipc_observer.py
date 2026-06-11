@@ -34,6 +34,9 @@ CONTAINER_DETECT_INTERVAL = 5.0
 MODEL_INFO_POLL_INTERVAL = 30.0
 REPO_POLL_INTERVAL = 900.0
 REQUEST_LOG_MAX = 200
+# JSON is valid YAML, so the generated compose override is written as JSON.
+OVERRIDE_FILE = "/tmp/aipc-observer-compose-override.yml"
+AUDIT_LOG = "/var/log/aipc-observer-actions.log"
 
 HOSTNAME = socket.gethostname().split(".")[0]
 
@@ -243,6 +246,10 @@ class ObserverState:
 state = ObserverState()
 _started = False
 _start_lock = threading.Lock()
+# Filled in by start_observer; the control endpoints need them.
+_config = {"monitor_port": DEFAULT_MONITOR_PORT, "model_repo": None}
+# Set to make poll_repo refresh immediately (e.g. right after an update).
+_repo_wake = threading.Event()
 
 
 def format_duration(seconds):
@@ -450,14 +457,21 @@ def inspect_container_help(name, entrypoint):
 
 
 def inspect_container(name):
-    """docker-inspect the model container for image, flags, and compose origin."""
+    """docker-inspect the model container for image, flags, and compose origin.
+
+    Also captures the runtime facts a controlled re-launch needs to reproduce
+    the boot environment: compose service/working dir, the /models mount
+    source, the published host port, and the assigned GPU ids.
+    """
     try:
         result = subprocess.run(
             [
                 "docker", "inspect", name, "--format",
                 '{"image":{{json .Config.Image}},"cmd":{{json .Config.Cmd}},'
                 '"entrypoint":{{json .Config.Entrypoint}},'
-                '"labels":{{json .Config.Labels}}}',
+                '"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}},'
+                '"ports":{{json .HostConfig.PortBindings}},'
+                '"devices":{{json .HostConfig.DeviceRequests}}}',
             ],
             capture_output=True,
             text=True,
@@ -475,7 +489,7 @@ def inspect_container(name):
     help_index = (help_info or {}).get("flags") or {}
     if help_info and "flags" in help_info:
         help_info = {k: v for k, v in help_info.items() if k != "flags"}
-    return {
+    info = {
         "container": name,
         "image": data.get("image"),
         "entrypoint": _entrypoint_argv(data.get("entrypoint")),
@@ -485,7 +499,22 @@ def inspect_container(name):
         "flags": summarize_command(cmd),
         "help": help_info,
         "command_guide": command_guide(cmd, help_index),
+        "service": labels.get("com.docker.compose.service"),
+        "working_dir": labels.get("com.docker.compose.project.working_dir"),
     }
+    for mount in data.get("mounts") or []:
+        if mount.get("Destination") == "/models":
+            info["model_dir"] = mount.get("Source")
+    for bindings in (data.get("ports") or {}).values():
+        for b in bindings or []:
+            if b.get("HostPort"):
+                info["host_port"] = b["HostPort"]
+                break
+    for dev in data.get("devices") or []:
+        ids = dev.get("DeviceIDs")
+        if ids:
+            info["gpu_ids"] = ",".join(ids)
+    return info
 
 
 def _repo_owner_cmd(repo, cmd):
@@ -633,6 +662,187 @@ def catalog_has_changes(diff):
     )
 
 
+# --- model control plane (phase 2b) ----------------------------------------
+
+# Insight presets are command-line flag tweaks, not env vars: llama.cpp CLI
+# args take precedence over LLAMA_ARG_* env, and flags like --cache-ram are
+# already present in the compose command, so env could never override them.
+# (flag, None) appends a switch if absent; (flag, value) replaces or appends.
+INSIGHT_PRESETS = {
+    "baseline": [],
+    "insight": [
+        ("--metrics", None),
+        ("--props", None),
+        ("--log-verbosity", "4"),
+        ("--log-timestamps", None),
+    ],
+    "insight-cache": [
+        ("--metrics", None),
+        ("--props", None),
+        ("--log-verbosity", "4"),
+        ("--log-timestamps", None),
+        ("--cache-ram", "8192"),
+    ],
+}
+
+_control_lock = threading.Lock()
+
+
+def audit(action, detail, path=AUDIT_LOG):
+    line = f"{datetime.now().isoformat(timespec='seconds')} {action}: {detail}"
+    print(f"Observer control: {line}", file=sys.stderr)
+    try:
+        with open(path, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def apply_preset_to_command(cmd, tweaks):
+    """Apply preset flag tweaks to a server argv: replace values, add flags."""
+    argv = list(cmd)
+    for flag, value in tweaks:
+        if flag in argv:
+            i = argv.index(flag)
+            if value is not None and i + 1 < len(argv):
+                argv[i + 1] = value
+        else:
+            argv.append(flag)
+            if value is not None:
+                argv.append(value)
+    return argv
+
+
+def build_compose_override(service, argv=None, image=None):
+    svc = {}
+    if argv is not None:
+        svc["command"] = argv
+    if image:
+        svc["image"] = image
+    return {"services": {service: svc}}
+
+
+def check_restart_allowed(observer_state, force=False):
+    active = len(observer_state.active_requests)
+    if active and not force:
+        raise RuntimeError(
+            f"{active} request(s) currently in flight; pass force to restart anyway"
+        )
+
+
+def _run(cmd, env=None, cwd=None, timeout=600, input_text=None):
+    result = subprocess.run(
+        cmd, env=env, cwd=cwd, capture_output=True, text=True,
+        timeout=timeout, input=input_text,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            (result.stderr or result.stdout).strip()[-400:] or "command failed"
+        )
+    return result.stdout
+
+
+def _compose_env(model_info):
+    """Reproduce the compose substitution env the container was booted with.
+
+    Substitution vars (PORT, MODEL_DIR, …) only exist at compose-up time;
+    the running container's mounts/ports/devices are where their effective
+    values survive, so read them back from the inspect data.
+    """
+    env = dict(os.environ)
+    if model_info.get("host_port"):
+        env["PORT"] = env["ESTATE_PORT"] = str(model_info["host_port"])
+    if model_info.get("model_dir"):
+        env["MODEL_DIR"] = model_info["model_dir"]
+    if model_info.get("container"):
+        env["ESTATE_CONTAINER"] = model_info["container"]
+    if model_info.get("gpu_ids"):
+        env["CUDA_VISIBLE_DEVICES"] = env["ESTATE_GPUS"] = model_info["gpu_ids"]
+    return env
+
+
+def compose_baseline_command(compose_file, service, env, cwd, runner=_run):
+    """Resolve the variant's own (preset-free) command via compose config."""
+    out = runner(
+        ["docker", "compose", "-f", compose_file, "config", "--format", "json"],
+        env=env, cwd=cwd, timeout=60,
+    )
+    services = (json.loads(out).get("services") or {})
+    command = (services.get(service) or {}).get("command")
+    if not command:
+        raise RuntimeError(f"service {service!r} has no command in {compose_file}")
+    if isinstance(command, str):
+        import shlex
+
+        command = shlex.split(command)
+    return [str(tok) for tok in command]
+
+
+def restart_model(preset_name, model_info=None, runner=_run,
+                  override_path=OVERRIDE_FILE):
+    """Recreate the model container with an insight preset applied.
+
+    Presets always build on the compose file's own command (resolved via
+    `docker compose config`), never the running container's — so switching
+    insight -> baseline sheds flags instead of accumulating them.
+    """
+    tweaks = INSIGHT_PRESETS.get(preset_name)
+    if tweaks is None:
+        raise ValueError(f"unknown preset {preset_name!r}; "
+                         f"known: {', '.join(INSIGHT_PRESETS)}")
+    mi = model_info if model_info is not None else state.model_info
+    missing = [k for k in ("compose_file", "service", "working_dir", "command")
+               if not mi.get(k)]
+    if missing:
+        raise RuntimeError(f"model info incomplete ({', '.join(missing)}); "
+                           "is the model container running?")
+    compose_file = mi["compose_file"].split(",")[0]
+    env = _compose_env(mi)
+    cwd = mi["working_dir"]
+    argv = None
+    if preset_name != "baseline":
+        baseline = compose_baseline_command(compose_file, mi["service"], env,
+                                            cwd, runner=runner)
+        argv = apply_preset_to_command(baseline, tweaks)
+    # Always pin the running image: launchers may have injected a different
+    # image (e.g. BEELLAMA_IMAGE) than the compose file's fallback, and a
+    # restart must never silently switch images.
+    with open(override_path, "w") as f:
+        json.dump(
+            build_compose_override(mi["service"], argv, image=mi.get("image")),
+            f, indent=1,
+        )
+    os.chmod(override_path, 0o644)
+    audit("restart", f"preset={preset_name} variant={mi.get('variant')}")
+    runner(
+        ["docker", "compose", "-f", compose_file, "-f", override_path,
+         "up", "-d", "--remove-orphans"],
+        env=env, cwd=cwd,
+    )
+    return {"restarted": True, "preset": preset_name,
+            "variant": mi.get("variant")}
+
+
+def update_repo(repo):
+    """Fast-forward the club-3090 checkout to its upstream."""
+    before = collect_repo_info(repo, fetch=True)
+    if "error" in before:
+        raise RuntimeError(before["error"])
+    if not before.get("behind"):
+        return {"updated": False, "head": before.get("head"),
+                "detail": "already up to date"}
+    audit("update", f"{before['head']} -> {before.get('upstream_sha')} "
+                    f"({before['behind']} commits)")
+    repo_git(repo, "pull", "--ff-only", timeout=300)
+    after = collect_repo_info(repo, fetch=False)
+    return {
+        "updated": True,
+        "from": before.get("head"),
+        "to": after.get("head"),
+        "commits": before.get("upstream_commits", []),
+    }
+
+
 def fetch_json(url, timeout=5):
     """GET a JSON endpoint, returning the parsed body or None on any failure."""
     try:
@@ -769,7 +979,8 @@ def poll_repo(repo):
         except Exception as e:
             print(f"WARNING: observer catalog refresh error: {e}", file=sys.stderr)
         state.notify_subscribers()
-        time.sleep(REPO_POLL_INTERVAL)
+        _repo_wake.wait(timeout=REPO_POLL_INTERVAL)
+        _repo_wake.clear()
 
 
 def overlay_vram_temps(gpus, vram_temps):
@@ -1164,7 +1375,7 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px 60px 56px 70px 74px 78px 74px 60px 78px 1fr;gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
-.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -1179,7 +1390,10 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>
 </div></section>
 <section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
-<section class="card"><h2>Model Config</h2><div id="modelInfo"></div></section>
+<section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
+<div class="controls"><select id="presetSel" class="btn" title="baseline: club-3090 verbatim · insight: +metrics/props/trace logs · insight-cache: insight + cache-ram 8192">
+<option value="baseline">baseline</option><option value="insight" selected>insight</option><option value="insight-cache">insight+cache</option>
+</select><button class="btn" onclick="doRestart()">Restart model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
@@ -1198,7 +1412,12 @@ DASHBOARD_HTML = """<!doctype html>
 let es;let lastModelInfo={};let flagModalOpen=false;function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
-function render(d){renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+let lastActive=0;
+function render(d){lastActive=(d.active_requests||[]).length;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
+function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
+function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});return `restarted with ${r.preset} (model reloading…)`})}
 function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
 if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
@@ -1326,6 +1545,59 @@ def handle_observer_get(handler):
     return False
 
 
+def _send_json(handler, code, payload):
+    body = json.dumps(payload).encode()
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def handle_observer_post(handler):
+    """Control endpoints: update the club-3090 checkout / restart the model.
+
+    Single-flight: only one control action at a time per host. The Tailscale
+    binding is the auth boundary, matching the existing PUT /curve design.
+    """
+    path = handler.path.split("?", 1)[0]
+    if path not in ("/observer/api/update", "/observer/api/restart"):
+        return False
+    body = {}
+    length = int(handler.headers.get("Content-Length") or 0)
+    if length > 4096:
+        _send_json(handler, 400, {"error": "oversized body"})
+        return True
+    if length > 0:
+        try:
+            body = json.loads(handler.rfile.read(length))
+        except json.JSONDecodeError as e:
+            _send_json(handler, 400, {"error": f"invalid JSON: {e}"})
+            return True
+    if not _control_lock.acquire(blocking=False):
+        _send_json(handler, 409, {"error": "another control action is running"})
+        return True
+    try:
+        if path == "/observer/api/update":
+            repo = _config.get("model_repo")
+            if not repo:
+                _send_json(handler, 503, {"error": "no model repo configured"})
+                return True
+            result = update_repo(repo)
+            _repo_wake.set()
+        else:
+            check_restart_allowed(state, force=bool(body.get("force")))
+            result = restart_model(str(body.get("preset", "insight")))
+        _send_json(handler, 200, result)
+    except ValueError as e:
+        _send_json(handler, 400, {"error": str(e)})
+    except Exception as e:
+        _send_json(handler, 409, {"error": str(e)})
+    finally:
+        _control_lock.release()
+    return True
+
+
 def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINER,
                    model_repo=DEFAULT_MODEL_REPO):
     global _started
@@ -1333,6 +1605,8 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
         if _started:
             return
         _started = True
+    _config["monitor_port"] = monitor_port
+    _config["model_repo"] = model_repo or None
     threading.Thread(target=poll_gpu_stats, name="observer-gpu", daemon=True).start()
     threading.Thread(
         target=monitor_connections,

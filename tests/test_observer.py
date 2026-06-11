@@ -718,5 +718,226 @@ class CatalogExtractTests(unittest.TestCase):
         self.assertEqual(obs.catalog_diff, {})
 
 
+class PresetTests(unittest.TestCase):
+    def test_appends_missing_flags(self):
+        argv = aipc_observer.apply_preset_to_command(
+            ["--host", "0.0.0.0"], [("--metrics", None), ("--log-verbosity", "4")]
+        )
+        self.assertEqual(
+            argv, ["--host", "0.0.0.0", "--metrics", "--log-verbosity", "4"]
+        )
+
+    def test_replaces_existing_flag_value(self):
+        argv = aipc_observer.apply_preset_to_command(
+            ["--cache-ram", "0", "--port", "8080"], [("--cache-ram", "8192")]
+        )
+        self.assertEqual(argv, ["--cache-ram", "8192", "--port", "8080"])
+
+    def test_boolean_flag_is_not_duplicated(self):
+        argv = aipc_observer.apply_preset_to_command(
+            ["--metrics"], [("--metrics", None)]
+        )
+        self.assertEqual(argv, ["--metrics"])
+
+    def test_original_command_is_not_mutated(self):
+        cmd = ["--cache-ram", "0"]
+        aipc_observer.apply_preset_to_command(cmd, [("--cache-ram", "8192")])
+        self.assertEqual(cmd, ["--cache-ram", "0"])
+
+    def test_known_presets(self):
+        self.assertEqual(
+            set(aipc_observer.INSIGHT_PRESETS),
+            {"baseline", "insight", "insight-cache"},
+        )
+        self.assertEqual(aipc_observer.INSIGHT_PRESETS["baseline"], [])
+
+    def test_build_compose_override_shape(self):
+        ov = aipc_observer.build_compose_override("svc", ["--a", "1"])
+        self.assertEqual(ov, {"services": {"svc": {"command": ["--a", "1"]}}})
+
+
+class RestartGuardTests(unittest.TestCase):
+    def test_blocks_when_requests_in_flight(self):
+        st = aipc_observer.ObserverState()
+        st.active_requests[1] = {"task_id": 1}
+        with self.assertRaises(RuntimeError):
+            aipc_observer.check_restart_allowed(st)
+
+    def test_force_overrides_in_flight_guard(self):
+        st = aipc_observer.ObserverState()
+        st.active_requests[1] = {"task_id": 1}
+        aipc_observer.check_restart_allowed(st, force=True)
+
+    def test_allows_when_idle(self):
+        aipc_observer.check_restart_allowed(aipc_observer.ObserverState())
+
+
+class FakeRunner:
+    def __init__(self, config_json=""):
+        self.calls = []
+        self.config_json = config_json
+
+    def __call__(self, cmd, env=None, cwd=None, timeout=600, input_text=None):
+        self.calls.append({"cmd": list(cmd), "env": dict(env or {}), "cwd": cwd})
+        if "config" in cmd:
+            return self.config_json
+        return ""
+
+
+MODEL_INFO = {
+    "container": "beellama-qwen36-27b",
+    "image": "ghcr.io/anbeeld/beellama.cpp:server-cuda-v0.3.0",
+    "compose_file": "/repo/models/m/eng/compose/single/q/dflash.yml",
+    "service": "svc",
+    "working_dir": "/repo/models/m/eng/compose/single/q",
+    "command": ["--ctx-size", "102400"],
+    "variant": "m/eng/single/q/dflash",
+    "host_port": "8020",
+    "model_dir": "/home/u/models",
+    "gpu_ids": "0",
+}
+
+CONFIG_JSON = (
+    '{"services": {"svc": {"command": '
+    '["--host", "0.0.0.0", "--ctx-size", "102400", "--cache-ram", "0"]}}}'
+)
+
+
+class RestartModelTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
+        tmp.close()
+        self.override_path = tmp.name
+        self.runner = FakeRunner(CONFIG_JSON)
+
+    def tearDown(self):
+        import os
+
+        os.unlink(self.override_path)
+
+    def _restart(self, preset, model_info=None):
+        return aipc_observer.restart_model(
+            preset,
+            model_info=dict(MODEL_INFO) if model_info is None else model_info,
+            runner=self.runner,
+            override_path=self.override_path,
+        )
+
+    def test_insight_cache_resolves_baseline_then_ups_with_override(self):
+        import json
+
+        result = self._restart("insight-cache")
+        self.assertTrue(result["restarted"])
+        self.assertEqual(len(self.runner.calls), 2)
+        config_call, up_call = self.runner.calls
+        self.assertIn("config", config_call["cmd"])
+        self.assertEqual(
+            up_call["cmd"],
+            ["docker", "compose", "-f", MODEL_INFO["compose_file"],
+             "-f", self.override_path, "up", "-d", "--remove-orphans"],
+        )
+        with open(self.override_path) as f:
+            override = json.load(f)
+        svc = override["services"]["svc"]
+        argv = svc["command"]
+        self.assertIn("--metrics", argv)
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "8192")
+        # Built on the compose baseline, not the running command.
+        self.assertIn("--host", argv)
+        # The running image is pinned so a restart can't switch images.
+        self.assertEqual(svc["image"], MODEL_INFO["image"])
+
+    def test_compose_env_reproduces_boot_substitutions(self):
+        self._restart("insight")
+        env = self.runner.calls[-1]["env"]
+        self.assertEqual(env["PORT"], "8020")
+        self.assertEqual(env["ESTATE_PORT"], "8020")
+        self.assertEqual(env["MODEL_DIR"], "/home/u/models")
+        self.assertEqual(env["ESTATE_CONTAINER"], "beellama-qwen36-27b")
+        self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0")
+
+    def test_baseline_skips_config_but_still_pins_image(self):
+        import json
+
+        self._restart("baseline")
+        self.assertEqual(len(self.runner.calls), 1)
+        self.assertEqual(
+            self.runner.calls[0]["cmd"],
+            ["docker", "compose", "-f", MODEL_INFO["compose_file"],
+             "-f", self.override_path, "up", "-d", "--remove-orphans"],
+        )
+        with open(self.override_path) as f:
+            svc = json.load(f)["services"]["svc"]
+        self.assertEqual(svc["image"], MODEL_INFO["image"])
+        self.assertNotIn("command", svc)
+
+    def test_unknown_preset_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self._restart("turbo")
+        self.assertEqual(self.runner.calls, [])
+
+    def test_incomplete_model_info_is_rejected(self):
+        with self.assertRaises(RuntimeError):
+            self._restart("insight", model_info={"command": ["--x"]})
+        self.assertEqual(self.runner.calls, [])
+
+    def test_multi_config_file_uses_first(self):
+        mi = dict(MODEL_INFO)
+        mi["compose_file"] = "/repo/a.yml,/repo/b.yml"
+        self._restart("baseline", model_info=mi)
+        self.assertEqual(self.runner.calls[0]["cmd"][3], "/repo/a.yml")
+
+    def test_build_compose_override_image_only(self):
+        ov = aipc_observer.build_compose_override("svc", None, image="img:1")
+        self.assertEqual(ov, {"services": {"svc": {"image": "img:1"}}})
+
+
+class UpdateRepoTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.origin = f"{self.tmp.name}/origin"
+        self.clone = f"{self.tmp.name}/clone"
+        self._git_in(self.tmp.name, "init", "-q", "-b", "main", self.origin)
+        self._commit(self.origin, "first commit")
+        self._git_in(self.tmp.name, "clone", "-q", self.origin, self.clone)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _git_in(self, cwd, *args):
+        import subprocess
+
+        subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+        )
+
+    def _commit(self, repo, message):
+        self._git_in(repo, "-c", "user.email=t@t", "-c", "user.name=t",
+                     "commit", "-q", "--allow-empty", "-m", message)
+
+    def test_pulls_when_behind(self):
+        self._commit(self.origin, "upstream change")
+        result = aipc_observer.update_repo(self.clone)
+        self.assertTrue(result["updated"])
+        self.assertNotEqual(result["from"], result["to"])
+        self.assertEqual(len(result["commits"]), 1)
+        info = aipc_observer.collect_repo_info(self.clone, fetch=False)
+        self.assertEqual(info["behind"], 0)
+
+    def test_noop_when_up_to_date(self):
+        result = aipc_observer.update_repo(self.clone)
+        self.assertFalse(result["updated"])
+
+    def test_diverged_branch_fails_instead_of_merging(self):
+        self._commit(self.clone, "local change")
+        self._commit(self.origin, "upstream change")
+        with self.assertRaises(RuntimeError):
+            aipc_observer.update_repo(self.clone)
+
+
 if __name__ == "__main__":
     unittest.main()

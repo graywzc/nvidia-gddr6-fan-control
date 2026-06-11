@@ -223,6 +223,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
+    def do_POST(self):
+        if not self._authorized():
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path.startswith("/observer/"):
+            if not aipc_observer.handle_observer_post(self):
+                self.send_response(404)
+                self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_PUT(self):
         if not self._authorized():
             self.send_response(401)
