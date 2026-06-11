@@ -1096,6 +1096,15 @@ let def=(c.defaults||{})[`${v.model}/${runKey.split('/')[0]}/${topo}`];
 if(def)rows+=infoRow('Curated default',esc(def)+(def===runKey?' <span class="good">(running it)</span>':' <span class="hot">(differs)</span>'));}
 let counts={};keys.forEach(k=>{let s=vars[k].status||'other';counts[s]=(counts[s]||0)+1});
 rows+=infoRow('Variants',`${keys.length} (${counts.production||0} production · ${counts.caveats||0} caveats)`);
+let ngpu=(d.gpu_stats||[]).length||1;
+let reqGpus=p=>p.indexOf('/multi4/')>=0?4:(p.indexOf('/dual/')>=0?2:1);
+let fits=keys.filter(k=>reqGpus(vars[k].compose_path||'')<=ngpu&&(vars[k].tp||1)<=ngpu);
+let order={production:0,caveats:1};
+fits.sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
+let defSet=new Set(Object.values(c.defaults||{}));
+let items=fits.map(k=>{let v=vars[k];let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let ctx=v.max_ctx?` · ${Math.round(v.max_ctx/1024)}K`:'';
+return `<div class="row" style="font-size:12px"><span class="label" title="${esc(v.status_note||'')}">${mark}${esc(v.model)} · ${esc(k)}${ctx}${v.workload?' · '+esc(v.workload):''}</span>${statusSpan(v.status)}</div>`}).join('');
+rows+=`<details><summary class="label" style="cursor:pointer;font-size:12px;padding:4px 0">variants for this machine (${fits.length} of ${keys.length}, ${ngpu} GPU)</summary>${items}</details>`;
 let dl=[];(diff.added||[]).forEach(k=>dl.push('new: '+k));
 (diff.removed||[]).forEach(k=>dl.push('removed: '+k));
 (diff.changed||[]).forEach(ch=>dl.push(ch.key+': '+Object.entries(ch.fields).map(([f,v])=>`${f} ${v[0]??'-'} → ${v[1]??'-'}`).join(', ')));
