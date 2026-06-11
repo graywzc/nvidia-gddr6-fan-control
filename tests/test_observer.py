@@ -438,6 +438,65 @@ class ModelInfoTests(unittest.TestCase):
         self.assertEqual(aipc_observer.summarize_command([]), {})
         self.assertEqual(aipc_observer.summarize_command(None), {})
 
+    def test_parse_help_flags_extracts_aliases_and_continuations(self):
+        help_text = """
+usage: llama-server [options]
+
+  -m, --model FNAME              model path
+                                 loaded from disk
+  -h,    --help, --usage                  print usage and exit
+      --ctx-size N               size of the prompt context
+      --metrics                  enable prometheus endpoint
+"""
+        flags = aipc_observer.parse_help_flags(help_text)
+        self.assertEqual(flags["--model"]["description"],
+                         "model path loaded from disk")
+        self.assertEqual(flags["-m"]["aliases"], ["-m", "--model"])
+        self.assertEqual(flags["--usage"]["description"],
+                         "print usage and exit")
+        self.assertEqual(flags["--ctx-size"]["description"],
+                         "size of the prompt context")
+        self.assertEqual(flags["--metrics"]["description"],
+                         "enable prometheus endpoint")
+
+    def test_command_guide_uses_help_and_marks_unknown_flags(self):
+        help_index = aipc_observer.parse_help_flags(
+            "  --ctx-size N    size of the prompt context\n"
+            "  --metrics       enable prometheus endpoint\n"
+        )
+        guide = aipc_observer.command_guide(
+            ["--ctx-size", "102400", "--metrics", "--fork-only", "x"],
+            help_index,
+        )
+        self.assertEqual(guide[0]["flag"], "--ctx-size")
+        self.assertEqual(guide[0]["value"], "102400")
+        self.assertTrue(guide[0]["known"])
+        self.assertEqual(guide[0]["description"], "size of the prompt context")
+        self.assertIsNone(guide[1]["value"])
+        self.assertTrue(guide[1]["known"])
+        self.assertEqual(guide[2]["flag"], "--fork-only")
+        self.assertEqual(guide[2]["value"], "x")
+        self.assertFalse(guide[2]["known"])
+
+    def test_command_guide_handles_equals_values(self):
+        help_index = aipc_observer.parse_help_flags(
+            "  --host HOST    ip address to listen on\n"
+        )
+        guide = aipc_observer.command_guide(["--host=0.0.0.0"], help_index)
+        self.assertEqual(guide[0]["flag"], "--host")
+        self.assertEqual(guide[0]["value"], "0.0.0.0")
+        self.assertTrue(guide[0]["known"])
+
+    def test_entrypoint_argv_handles_strings_and_lists(self):
+        self.assertEqual(
+            aipc_observer._entrypoint_argv('/app/server --mode serve'),
+            ["/app/server", "--mode", "serve"],
+        )
+        self.assertEqual(
+            aipc_observer._entrypoint_argv(["/app/server"]),
+            ["/app/server"],
+        )
+
     def test_snapshot_includes_model_and_repo_info(self):
         state = aipc_observer.ObserverState()
         state.set_model_info({"image": "img", "flags": {"ctx_size": "1"}})
