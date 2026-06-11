@@ -58,6 +58,10 @@ class ObserverState:
         self.cancelled_count = 0
         self.cache_defeated_count = 0
         self.context_shift_count = 0
+        # HTTP status -> count for completion POSTs, from trace access logs.
+        self.http_statuses = {}
+        # Reasoning-budget deactivations other than a natural end.
+        self.budget_hit_count = 0
         # task_id -> in-flight request dict, shown as live "processing" rows.
         self.active_requests = {}
         # GPU index -> real VRAM temp (°C) from the gddr6 reader, since
@@ -192,6 +196,15 @@ class ObserverState:
         with self.lock:
             self.cache_defeated_count += 1
 
+    def incr_http_status(self, status):
+        with self.lock:
+            key = str(status)
+            self.http_statuses[key] = self.http_statuses.get(key, 0) + 1
+
+    def incr_budget_hit(self):
+        with self.lock:
+            self.budget_hit_count += 1
+
     def incr_context_shift(self):
         with self.lock:
             self.context_shift_count += 1
@@ -229,6 +242,8 @@ class ObserverState:
                 "cancelled_count": self.cancelled_count,
                 "cache_defeated_count": self.cache_defeated_count,
                 "context_shift_count": self.context_shift_count,
+                "http_statuses": dict(self.http_statuses),
+                "budget_hit_count": self.budget_hit_count,
                 "model_info": dict(self.model_info),
                 "repo_info": dict(self.repo_info),
                 "catalog": dict(self.catalog),
@@ -688,6 +703,15 @@ INSIGHT_PRESETS = {
         ("--metrics", None),
         ("--props", None),
         ("--log-verbosity", "4"),
+        ("--log-timestamps", None),
+        ("--cache-ram", "8192"),
+    ],
+    # Debug verbosity logs full request/response bodies — the passive path to
+    # grouping agent requests by session. Very chatty; use for experiments.
+    "insight-debug": [
+        ("--metrics", None),
+        ("--props", None),
+        ("--log-verbosity", "5"),
         ("--log-timestamps", None),
         ("--cache-ram", "8192"),
     ],
@@ -1215,6 +1239,13 @@ RE_CTX_SHIFT = re.compile(
 )
 RE_ROUTE_WARM = re.compile(r"selected slot by LCP similarity,\s*sim_best\s*=\s*([\d.]+)")
 RE_ROUTE_LRU = re.compile(r"selected slot by LRU")
+# Trace-level (-lv 4) lines from the insight presets:
+RE_ACCESS = re.compile(r"done request:\s+(\w+)\s+(\S+)\s+\S+\s+(\d{3})")
+RE_ADAPTIVE_DM = re.compile(r"adaptive dm:\s+(\w+)\s*=\s*([\d.-]+)\s+n_max\s*=\s*(\d+)")
+RE_GRAPHS_REUSED = re.compile(r"graphs reused\s*=\s*(\d+)")
+RE_NEW_PROMPT = re.compile(r"new prompt,.*task\.n_tokens\s*=\s*(\d+)")
+RE_CACHED_TOKENS = re.compile(r"cached n_tokens\s*=\s*(\d+),\s*memory_seq_rm")
+RE_BUDGET_OFF = re.compile(r"reasoning-budget:\s+deactivated\s+\(([^)]+)\)")
 RE_PREFILL_PROGRESS = re.compile(
     r"prompt processing,\s*n_tokens\s*=\s*(\d+),\s*progress\s*=\s*([\d.]+),"
     r"\s*t\s*=\s*([\d.]+)\s*s\s*/\s*([\d.]+)\s+tokens per second"
@@ -1235,6 +1266,20 @@ class RequestTracker:
         self.pending_routes = {}
 
     def process_line(self, line):
+        m = RE_ACCESS.search(line)
+        if m:
+            method, path, status = m.group(1), m.group(2), int(m.group(3))
+            # Only completion POSTs; the observer's own GET polling is noise.
+            if method == "POST" and not path.startswith("/props"):
+                self.state.incr_http_status(status)
+            return
+
+        m = RE_BUDGET_OFF.search(line)
+        if m:
+            if m.group(1).strip() != "natural end":
+                self.state.incr_budget_hit()
+            return
+
         m = RE_ROUTE_WARM.search(line)
         if m:
             sid = RE_SLOT_ID.search(line)
@@ -1354,6 +1399,38 @@ class RequestTracker:
             req["draft_acceptance"] = safe_float(m.group(1))
             req["draft_accepted"] = int(m.group(2))
             req["draft_generated"] = int(m.group(3))
+            return
+
+        m = RE_ADAPTIVE_DM.search(line)
+        if m and req is not None:
+            req["dm_controller"] = m.group(1)
+            req["dm_rate"] = safe_float(m.group(2))
+            req["draft_n_max"] = int(m.group(3))
+            return
+
+        m = RE_GRAPHS_REUSED.search(line)
+        if m and req is not None:
+            req["graphs_reused"] = int(m.group(1))
+            return
+
+        m = RE_NEW_PROMPT.search(line)
+        if m and req is not None:
+            # Earliest prompt-size signal: logged at ingest start, before the
+            # first /slots poll catches the row.
+            if not req.get("prompt_tokens"):
+                req["prompt_tokens"] = int(m.group(1))
+                self.state.update_active_request(
+                    req["task_id"], {"prompt_tokens": req["prompt_tokens"]}
+                )
+                self.state.notify_subscribers()
+            return
+
+        m = RE_CACHED_TOKENS.search(line)
+        if m and req is not None:
+            req["cached_tokens"] = int(m.group(1))
+            self.state.update_active_request(
+                req["task_id"], {"cached_tokens": req["cached_tokens"]}
+            )
             return
 
         m = RE_RELEASE.search(line)
@@ -1490,7 +1567,7 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
 <div class="controls"><select id="presetSel" class="btn" title="baseline: club-3090 verbatim · insight: +metrics/props/trace logs · insight-cache: insight + cache-ram 8192">
-<option value="baseline">baseline</option><option value="insight" selected>insight</option><option value="insight-cache">insight+cache</option>
+<option value="baseline">baseline</option><option value="insight">insight</option><option value="insight-cache" selected>insight+cache</option><option value="insight-debug">insight+debug</option>
 </select><button class="btn" onclick="doRestart()">Restart model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
@@ -1500,6 +1577,8 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="cacheDefeat" class="summary-value">0</div><div class="summary-label">Cache Defeated</div></div>
 <div class="summary-item"><div id="ctxShift" class="summary-value">0</div><div class="summary-label">Ctx Shifts</div></div>
 <div class="summary-item"><div id="draftAccept" class="summary-value">-</div><div class="summary-label">Avg Draft Accept</div></div>
+<div class="summary-item"><div id="httpErrors" class="summary-value">0</div><div class="summary-label">HTTP Errors</div></div>
+<div class="summary-item"><div id="budgetHits" class="summary-value">0</div><div class="summary-label">Budget Hits</div></div>
 </div></section>
 <section class="card full"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
 </div>
@@ -1592,7 +1671,10 @@ else if(ri.error)rows+=infoRow('club-3090',`<span class="critical">${esc(ri.erro
 rows+=renderCommandGuideButton(mi);
 if(mi.command&&mi.command.length)rows+=det('detCmd',false,'full server command',`<div style="font-size:11px;color:var(--dim);word-break:break-all;padding:4px 0">${esc(mi.command.join(' '))}</div>`);
 document.getElementById('modelInfo').innerHTML=rows||'<div class="row"><span class="label">No model info yet</span></div>'}
-function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;document.getElementById('ctxShift').textContent=d.context_shift_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-'}
+function renderHealth(d){let reqs=d.requests||[];let comp=reqs.filter(r=>r.status==='completed');let trunc=comp.filter(r=>r.truncated).length;document.getElementById('truncRate').textContent=comp.length?(100*trunc/comp.length).toFixed(0)+'%':'0%';document.getElementById('cancelled').textContent=d.cancelled_count||0;document.getElementById('cacheDefeat').textContent=d.cache_defeated_count||0;document.getElementById('ctxShift').textContent=d.context_shift_count||0;let dr=reqs.filter(r=>r.draft_acceptance!=null);document.getElementById('draftAccept').textContent=dr.length?(100*dr.reduce((s,r)=>s+r.draft_acceptance,0)/dr.length).toFixed(0)+'%':'-';
+let hs=d.http_statuses||{};let errs=0;let breakdown=[];Object.keys(hs).sort().forEach(k=>{breakdown.push(k+': '+hs[k]);if(Number(k)>=400)errs+=hs[k]});
+let he=document.getElementById('httpErrors');he.textContent=errs;he.className='summary-value '+(errs?'critical':'');he.parentElement.title=breakdown.join(', ')||'no completion POSTs seen';
+let bh=document.getElementById('budgetHits');bh.textContent=d.budget_hit_count||0;bh.parentElement.title='reasoning-budget deactivations other than a natural end'}
 function renderHeader(d){let host=d.hostname||'';let name=host?host+' Observer':'Observer';document.getElementById('title').textContent=name;document.title=name;document.getElementById('model').textContent=d.model||'no model';}
 function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g=>{let mt=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';return `<div class="gpu-card"><div class="gpu-name">GPU ${g.index}: ${g.name}</div>
 <div class="row"><span class="label">GPU Temp</span><span class="value ${cls(g.temp_c)}">${g.temp_c}°C</span></div><div class="bar"><div class="fill" style="width:${pct(g.temp_c,100)}%"></div></div>

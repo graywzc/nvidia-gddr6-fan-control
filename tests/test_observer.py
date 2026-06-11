@@ -747,9 +747,12 @@ class PresetTests(unittest.TestCase):
     def test_known_presets(self):
         self.assertEqual(
             set(aipc_observer.INSIGHT_PRESETS),
-            {"baseline", "insight", "insight-cache"},
+            {"baseline", "insight", "insight-cache", "insight-debug"},
         )
         self.assertEqual(aipc_observer.INSIGHT_PRESETS["baseline"], [])
+        self.assertIn(
+            ("--log-verbosity", "5"), aipc_observer.INSIGHT_PRESETS["insight-debug"]
+        )
 
     def test_build_compose_override_shape(self):
         ov = aipc_observer.build_compose_override("svc", ["--a", "1"])
@@ -993,6 +996,90 @@ class MetricsTests(unittest.TestCase):
         state = aipc_observer.ObserverState()
         state.set_metrics({"available": True, "queued": 2})
         self.assertEqual(state.snapshot()["metrics"]["queued"], 2)
+
+
+class TraceLogTests(unittest.TestCase):
+    """Lines that only appear at -lv 4 (the insight presets)."""
+
+    def setUp(self):
+        self.state = aipc_observer.ObserverState()
+        self.tracker = aipc_observer.RequestTracker(self.state)
+
+    def test_completion_post_status_is_counted(self):
+        self.tracker.process_line(
+            "0.06.1 I srv log_server_r: done request: "
+            "POST /v1/chat/completions 172.18.0.1 200"
+        )
+        self.tracker.process_line(
+            "0.07.1 I srv log_server_r: done request: "
+            "POST /v1/chat/completions 172.18.0.1 500"
+        )
+        self.assertEqual(self.state.http_statuses, {"200": 1, "500": 1})
+        snap = self.state.snapshot()
+        self.assertEqual(snap["http_statuses"]["500"], 1)
+
+    def test_observer_get_polling_is_ignored(self):
+        self.tracker.process_line(
+            "0.06.1 I srv log_server_r: done request: GET /slots 172.18.0.1 200"
+        )
+        self.assertEqual(self.state.http_statuses, {})
+
+    def test_budget_hit_counts_only_non_natural_ends(self):
+        self.tracker.process_line("I reasoning-budget: deactivated (natural end)")
+        self.assertEqual(self.state.budget_hit_count, 0)
+        self.tracker.process_line(
+            "I reasoning-budget: deactivated (budget exhausted)"
+        )
+        self.assertEqual(self.state.budget_hit_count, 1)
+        self.assertEqual(self.state.snapshot()["budget_hit_count"], 1)
+
+    def test_adaptive_dm_and_graphs_reused_attach_to_task(self):
+        self.tracker.process_line(
+            "I slot launch_slot_: id 0 | task 100 | processing task"
+        )
+        self.tracker.process_line(
+            "I slot print_timing: id 0 | task 100 | adaptive dm: fringe=0.44 n_max=24"
+        )
+        self.tracker.process_line(
+            "I slot print_timing: id 0 | task 100 | graphs reused = 117"
+        )
+        req = self.tracker.active[100]
+        self.assertEqual(req["dm_controller"], "fringe")
+        self.assertAlmostEqual(req["dm_rate"], 0.44)
+        self.assertEqual(req["draft_n_max"], 24)
+        self.assertEqual(req["graphs_reused"], 117)
+
+    def test_new_prompt_sets_early_prompt_tokens_on_live_row(self):
+        self.tracker.process_line(
+            "I slot launch_slot_: id 0 | task 100 | processing task"
+        )
+        self.tracker.process_line(
+            "I slot update_slots: id 0 | task 100 | new prompt, n_ctx_slot = 102400,"
+            " n_keep = 0, task.n_tokens = 5016"
+        )
+        self.assertEqual(self.tracker.active[100]["prompt_tokens"], 5016)
+        self.assertEqual(self.state.active_requests[100]["prompt_tokens"], 5016)
+
+    def test_new_prompt_does_not_overwrite_known_prompt_size(self):
+        self.tracker.process_line(
+            "I slot launch_slot_: id 0 | task 100 | processing task"
+        )
+        self.tracker.active[100]["prompt_tokens"] = 4000
+        self.tracker.process_line(
+            "I slot update_slots: id 0 | task 100 | new prompt, n_ctx_slot = 102400,"
+            " n_keep = 0, task.n_tokens = 5016"
+        )
+        self.assertEqual(self.tracker.active[100]["prompt_tokens"], 4000)
+
+    def test_cached_tokens_attach_to_live_row(self):
+        self.tracker.process_line(
+            "I slot launch_slot_: id 0 | task 100 | processing task"
+        )
+        self.tracker.process_line(
+            "I slot update_slots: id 0 | task 100 | cached n_tokens = 4903,"
+            " memory_seq_rm [4903, end)"
+        )
+        self.assertEqual(self.tracker.active[100]["cached_tokens"], 4903)
 
 
 if __name__ == "__main__":
