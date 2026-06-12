@@ -1161,7 +1161,7 @@ def _wait_for_model_info(monitor_port, timeout=120):
 
 
 def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
-                   info_getter=None):
+                   info_getter=None, override_path=OVERRIDE_FILE):
     """Background body of a model switch; releases the control lock when done.
 
     switch.sh always boots the variant verbatim; the preset re-up afterwards
@@ -1179,7 +1179,8 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                       "rotation (one more model reload)…"
         )
         info = (info_getter or _wait_for_model_info)(monitor_port)
-        restart_model(preset, model_info=info, runner=runner)
+        restart_model(preset, model_info=info, runner=runner,
+                      override_path=override_path)
         _set_control_status(
             "switch", f"switched to {variant} (preset {preset})", done=True, ok=True
         )
