@@ -1373,21 +1373,32 @@ class SwitchModelTests(unittest.TestCase):
 
 class SwitchWorkerTests(unittest.TestCase):
     def setUp(self):
+        import tempfile
+
         # The worker releases the module control lock; hold it like the
         # endpoint does before handing off.
         self.assertTrue(aipc_observer._control_lock.acquire(blocking=False))
         self.saved_status = aipc_observer.state.control_status
+        # Never touch the real OVERRIDE_FILE: on the deploy host it exists
+        # root-owned (written by the daemon), so tests must use their own.
+        tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
+        tmp.close()
+        self.override_path = tmp.name
 
     def tearDown(self):
+        import os
+
         if aipc_observer._control_lock.locked():
             aipc_observer._control_lock.release()
         aipc_observer.state.set_control_status(self.saved_status)
+        os.unlink(self.override_path)
 
     def test_baseline_switch_still_reups_for_log_rotation(self):
         runner = FakeRunner()
         aipc_observer._switch_worker(
             "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
             info_getter=lambda port: dict(MODEL_INFO),
+            override_path=self.override_path,
         )
         status = aipc_observer.state.control_status
         self.assertTrue(status["done"])
@@ -1399,13 +1410,14 @@ class SwitchWorkerTests(unittest.TestCase):
         self.assertIn("scripts/switch.sh", runner.calls[0]["cmd"])
         up_cmd = runner.calls[1]["cmd"]
         self.assertIn("up", up_cmd)
-        self.assertIn(aipc_observer.OVERRIDE_FILE, up_cmd)
+        self.assertIn(self.override_path, up_cmd)
 
     def test_preset_switch_resolves_config_then_reups(self):
         runner = FakeRunner(CONFIG_JSON)
         aipc_observer._switch_worker(
             "/repo", "eng/prod", "insight", 8020, False, runner=runner,
             info_getter=lambda port: dict(MODEL_INFO),
+            override_path=self.override_path,
         )
         self.assertTrue(aipc_observer.state.control_status["ok"])
         # switch.sh + compose config + compose up.
