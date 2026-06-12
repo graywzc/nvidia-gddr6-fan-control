@@ -86,6 +86,8 @@ class ObserverState:
         self.catalog_diff = {}
         # Latest scrape of the llama.cpp Prometheus /metrics endpoint.
         self.metrics = {}
+        # Progress of the current/last async control action (model switch).
+        self.control_status = {}
 
     def add_request(self, req):
         with self.lock:
@@ -197,6 +199,10 @@ class ObserverState:
         with self.lock:
             self.metrics = dict(metrics)
 
+    def set_control_status(self, status):
+        with self.lock:
+            self.control_status = dict(status)
+
     def incr_cancelled(self):
         with self.lock:
             self.cancelled_count += 1
@@ -258,6 +264,8 @@ class ObserverState:
                 "catalog": dict(self.catalog),
                 "catalog_diff": dict(self.catalog_diff),
                 "metrics": dict(self.metrics),
+                "control_status": dict(self.control_status),
+                "control_busy": _control_lock.locked(),
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -1087,6 +1095,99 @@ def update_repo(repo):
     }
 
 
+# --- model switching (variant change via club-3090's switch.sh) -------------
+
+# switch.sh waits for readiness itself (READY_TIMEOUT defaults to 600 s),
+# plus image pull and model load on top.
+SWITCH_TIMEOUT = 1200.0
+
+
+def validate_switch(variant, catalog, force=False):
+    """Check the requested variant against the extracted compose registry."""
+    variants = (catalog or {}).get("variants") or {}
+    if not variants:
+        raise RuntimeError("variant catalog not loaded yet; try again shortly")
+    entry = variants.get(variant)
+    if entry is None:
+        raise ValueError(f"unknown variant {variant!r}")
+    status = entry.get("status")
+    if status not in ("production", "caveats") and not force:
+        raise ValueError(
+            f"variant {variant!r} has status {status!r}; pass force to switch anyway"
+        )
+    return entry
+
+
+def switch_model(repo, variant, monitor_port, force=False, runner=_run):
+    """Boot a different club-3090 variant via scripts/switch.sh.
+
+    switch.sh is the repo's own gated path: it stops the running compose,
+    runs hardware/weights preflight, boots the variant, and waits for the
+    server to answer on READY_URL.
+    """
+    env = dict(os.environ)
+    env["PORT"] = str(monitor_port)
+    env["READY_URL"] = f"http://localhost:{monitor_port}/v1/models"
+    cmd = ["bash", "scripts/switch.sh"]
+    if force:
+        cmd.append("--force")
+    cmd.append(variant)
+    runner(_repo_owner_cmd(repo, cmd), env=env, cwd=repo, timeout=SWITCH_TIMEOUT)
+
+
+def _set_control_status(action, detail, done=False, ok=None):
+    state.set_control_status({
+        "action": action,
+        "detail": detail,
+        "done": done,
+        "ok": ok,
+        "updated_at": time.time(),
+    })
+    state.notify_subscribers()
+
+
+def _wait_for_model_info(monitor_port, timeout=120):
+    """Wait for the freshly booted container to become inspectable."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        name = detect_container(monitor_port)
+        if name:
+            info = inspect_container(name)
+            if info and all(info.get(k) for k in
+                            ("compose_file", "service", "working_dir", "command")):
+                return info
+        time.sleep(2)
+    raise RuntimeError("new container did not become inspectable in time")
+
+
+def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run):
+    """Background body of a model switch; releases the control lock when done."""
+    try:
+        _set_control_status(
+            "switch", f"switching to {variant} — old model stopping, "
+                      "new model loading (takes a few minutes)…"
+        )
+        switch_model(repo, variant, monitor_port, force=force, runner=runner)
+        if preset != "baseline":
+            _set_control_status(
+                "switch", f"{variant} is up; applying preset {preset} "
+                          "(one more model reload)…"
+            )
+            info = _wait_for_model_info(monitor_port)
+            restart_model(preset, model_info=info, runner=runner)
+        _set_control_status(
+            "switch", f"switched to {variant} (preset {preset})", done=True, ok=True
+        )
+        audit("switch-done", f"variant={variant} preset={preset}")
+    except Exception as e:
+        audit("switch-failed", f"variant={variant}: {e}")
+        _set_control_status(
+            "switch", f"switch to {variant} failed: {e}", done=True, ok=False
+        )
+    finally:
+        _control_lock.release()
+
+
 def fetch_json(url, timeout=5):
     """GET a JSON endpoint, returning the parsed body or None on any failure."""
     try:
@@ -1866,7 +1967,14 @@ function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+let lastBusy=false;
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
+if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120))st.textContent=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+(cs.detail||'');
+document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy)}
+function doSwitch(v,status){let p=document.getElementById('presetSel').value;let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
+if(!confirm(`Switch model to '${v}' with preset '${p}'?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`))return;
+ctlPost('/observer/api/switch',{variant:v,preset:p,force:lastActive>0||(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
 if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">/metrics disabled — restart with an insight preset to enable</span></div>';return}
@@ -1909,7 +2017,8 @@ let order={production:0,caveats:1};
 fits.sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let defSet=new Set(Object.values(c.defaults||{}));
 let items=fits.map(k=>{let v=vars[k];let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let ctx=v.max_ctx?` · ${Math.round(v.max_ctx/1024)}K`:'';
-return `<div class="row" style="font-size:12px"><span class="label" title="${esc(v.status_note||'')}">${mark}${esc(v.model)} · ${esc(k)}${ctx}${v.workload?' · '+esc(v.workload):''}</span>${statusSpan(v.status)}</div>`}).join('');
+let sw=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doSwitch('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>switch</button>`;
+return `<div class="row" style="font-size:12px"><span class="label" title="${esc(v.status_note||'')}">${mark}${esc(v.model)} · ${esc(k)}${ctx}${v.workload?' · '+esc(v.workload):''}</span><span style="display:flex;gap:8px;align-items:center">${statusSpan(v.status)}${sw}</span></div>`}).join('');
 rows+=det('detVariants',false,`variants for this machine (${fits.length} of ${keys.length}, ${ngpu} GPU)`,items);
 let dl=[];(diff.added||[]).forEach(k=>dl.push('new: '+k));
 (diff.removed||[]).forEach(k=>dl.push('removed: '+k));
@@ -2062,7 +2171,8 @@ def handle_observer_post(handler):
     binding is the auth boundary, matching the existing PUT /curve design.
     """
     path = handler.path.split("?", 1)[0]
-    if path not in ("/observer/api/update", "/observer/api/restart"):
+    if path not in ("/observer/api/update", "/observer/api/restart",
+                    "/observer/api/switch"):
         return False
     body = {}
     length = int(handler.headers.get("Content-Length") or 0)
@@ -2078,6 +2188,7 @@ def handle_observer_post(handler):
     if not _control_lock.acquire(blocking=False):
         _send_json(handler, 409, {"error": "another control action is running"})
         return True
+    release = True
     try:
         if path == "/observer/api/update":
             repo = _config.get("model_repo")
@@ -2086,16 +2197,40 @@ def handle_observer_post(handler):
                 return True
             result = update_repo(repo)
             _repo_wake.set()
+        elif path == "/observer/api/switch":
+            repo = _config.get("model_repo")
+            if not repo:
+                _send_json(handler, 503, {"error": "no model repo configured"})
+                return True
+            variant = str(body.get("variant", ""))
+            preset = str(body.get("preset", "baseline"))
+            force = bool(body.get("force"))
+            if preset not in INSIGHT_PRESETS:
+                raise ValueError(f"unknown preset {preset!r}")
+            validate_switch(variant, state.catalog, force=force)
+            check_restart_allowed(state, force=force)
+            audit("switch", f"variant={variant} preset={preset} force={force}")
+            # Long-running (minutes): hand off to a worker that owns the
+            # control lock; progress streams via control_status over SSE.
+            threading.Thread(
+                target=_switch_worker,
+                args=(repo, variant, preset, _config["monitor_port"], force),
+                name="observer-switch",
+                daemon=True,
+            ).start()
+            release = False
+            result = {"started": True, "variant": variant, "preset": preset}
         else:
             check_restart_allowed(state, force=bool(body.get("force")))
             result = restart_model(str(body.get("preset", "insight")))
-        _send_json(handler, 200, result)
+        _send_json(handler, 202 if path.endswith("/switch") else 200, result)
     except ValueError as e:
         _send_json(handler, 400, {"error": str(e)})
     except Exception as e:
         _send_json(handler, 409, {"error": str(e)})
     finally:
-        _control_lock.release()
+        if release:
+            _control_lock.release()
     return True
 
 
