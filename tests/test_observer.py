@@ -1383,16 +1383,35 @@ class SwitchWorkerTests(unittest.TestCase):
             aipc_observer._control_lock.release()
         aipc_observer.state.set_control_status(self.saved_status)
 
-    def test_baseline_switch_sets_done_and_releases_lock(self):
+    def test_baseline_switch_still_reups_for_log_rotation(self):
         runner = FakeRunner()
-        aipc_observer._switch_worker("/repo", "eng/prod", "baseline", 8020,
-                                     False, runner=runner)
+        aipc_observer._switch_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
+            info_getter=lambda port: dict(MODEL_INFO),
+        )
         status = aipc_observer.state.control_status
         self.assertTrue(status["done"])
         self.assertTrue(status["ok"])
         self.assertFalse(aipc_observer._control_lock.locked())
-        # baseline: only switch.sh ran, no preset re-up.
-        self.assertEqual(len(runner.calls), 1)
+        # switch.sh, then the baseline re-up (override = log rotation +
+        # image pin only; no compose-config call for baseline).
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("scripts/switch.sh", runner.calls[0]["cmd"])
+        up_cmd = runner.calls[1]["cmd"]
+        self.assertIn("up", up_cmd)
+        self.assertIn(aipc_observer.OVERRIDE_FILE, up_cmd)
+
+    def test_preset_switch_resolves_config_then_reups(self):
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer._switch_worker(
+            "/repo", "eng/prod", "insight", 8020, False, runner=runner,
+            info_getter=lambda port: dict(MODEL_INFO),
+        )
+        self.assertTrue(aipc_observer.state.control_status["ok"])
+        # switch.sh + compose config + compose up.
+        self.assertEqual(len(runner.calls), 3)
+        self.assertIn("config", runner.calls[1]["cmd"])
+        self.assertIn("up", runner.calls[2]["cmd"])
 
     def test_failed_switch_reports_error_and_releases_lock(self):
         def failing_runner(cmd, env=None, cwd=None, timeout=600, input_text=None):

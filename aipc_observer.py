@@ -1160,21 +1160,26 @@ def _wait_for_model_info(monitor_port, timeout=120):
     raise RuntimeError("new container did not become inspectable in time")
 
 
-def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run):
-    """Background body of a model switch; releases the control lock when done."""
+def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
+                   info_getter=None):
+    """Background body of a model switch; releases the control lock when done.
+
+    switch.sh always boots the variant verbatim; the preset re-up afterwards
+    runs for every preset — baseline included — because the override is also
+    what applies log rotation and the image pin.
+    """
     try:
         _set_control_status(
             "switch", f"switching to {variant} — old model stopping, "
                       "new model loading (takes a few minutes)…"
         )
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
-        if preset != "baseline":
-            _set_control_status(
-                "switch", f"{variant} is up; applying preset {preset} "
-                          "(one more model reload)…"
-            )
-            info = _wait_for_model_info(monitor_port)
-            restart_model(preset, model_info=info, runner=runner)
+        _set_control_status(
+            "switch", f"{variant} is up; applying preset {preset} + log "
+                      "rotation (one more model reload)…"
+        )
+        info = (info_getter or _wait_for_model_info)(monitor_port)
+        restart_model(preset, model_info=info, runner=runner)
         _set_control_status(
             "switch", f"switched to {variant} (preset {preset})", done=True, ok=True
         )
