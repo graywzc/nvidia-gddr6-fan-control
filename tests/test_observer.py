@@ -1323,5 +1323,115 @@ class TraceLogTests(unittest.TestCase):
         self.assertEqual(self.tracker.active[100]["cached_tokens"], 4903)
 
 
+SWITCH_CATALOG = {
+    "variants": {
+        "eng/prod": {"status": "production", "model": "m1"},
+        "eng/cav": {"status": "caveats", "model": "m1"},
+        "eng/exp": {"status": "experimental", "model": "m1"},
+    },
+    "defaults": {},
+}
+
+
+class ValidateSwitchTests(unittest.TestCase):
+    def test_production_and_caveats_are_allowed(self):
+        for key in ("eng/prod", "eng/cav"):
+            entry = aipc_observer.validate_switch(key, SWITCH_CATALOG)
+            self.assertEqual(entry["model"], "m1")
+
+    def test_unknown_variant_is_rejected(self):
+        with self.assertRaises(ValueError):
+            aipc_observer.validate_switch("eng/nope", SWITCH_CATALOG)
+
+    def test_experimental_needs_force(self):
+        with self.assertRaises(ValueError):
+            aipc_observer.validate_switch("eng/exp", SWITCH_CATALOG)
+        aipc_observer.validate_switch("eng/exp", SWITCH_CATALOG, force=True)
+
+    def test_missing_catalog_is_a_runtime_error(self):
+        with self.assertRaises(RuntimeError):
+            aipc_observer.validate_switch("eng/prod", {})
+
+
+class SwitchModelTests(unittest.TestCase):
+    def test_runs_switch_sh_with_port_env(self):
+        runner = FakeRunner()
+        aipc_observer.switch_model("/repo", "eng/prod", 8020, runner=runner)
+        call = runner.calls[0]
+        self.assertEqual(call["cmd"][-3:], ["bash", "scripts/switch.sh", "eng/prod"])
+        self.assertEqual(call["cwd"], "/repo")
+        self.assertEqual(call["env"]["PORT"], "8020")
+        self.assertEqual(call["env"]["READY_URL"],
+                         "http://localhost:8020/v1/models")
+
+    def test_force_flag_precedes_variant(self):
+        runner = FakeRunner()
+        aipc_observer.switch_model("/repo", "eng/exp", 8020, force=True,
+                                   runner=runner)
+        self.assertEqual(runner.calls[0]["cmd"][-2:], ["--force", "eng/exp"])
+
+
+class SwitchWorkerTests(unittest.TestCase):
+    def setUp(self):
+        # The worker releases the module control lock; hold it like the
+        # endpoint does before handing off.
+        self.assertTrue(aipc_observer._control_lock.acquire(blocking=False))
+        self.saved_status = aipc_observer.state.control_status
+
+    def tearDown(self):
+        if aipc_observer._control_lock.locked():
+            aipc_observer._control_lock.release()
+        aipc_observer.state.set_control_status(self.saved_status)
+
+    def test_baseline_switch_still_reups_for_log_rotation(self):
+        runner = FakeRunner()
+        aipc_observer._switch_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
+            info_getter=lambda port: dict(MODEL_INFO),
+        )
+        status = aipc_observer.state.control_status
+        self.assertTrue(status["done"])
+        self.assertTrue(status["ok"])
+        self.assertFalse(aipc_observer._control_lock.locked())
+        # switch.sh, then the baseline re-up (override = log rotation +
+        # image pin only; no compose-config call for baseline).
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("scripts/switch.sh", runner.calls[0]["cmd"])
+        up_cmd = runner.calls[1]["cmd"]
+        self.assertIn("up", up_cmd)
+        self.assertIn(aipc_observer.OVERRIDE_FILE, up_cmd)
+
+    def test_preset_switch_resolves_config_then_reups(self):
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer._switch_worker(
+            "/repo", "eng/prod", "insight", 8020, False, runner=runner,
+            info_getter=lambda port: dict(MODEL_INFO),
+        )
+        self.assertTrue(aipc_observer.state.control_status["ok"])
+        # switch.sh + compose config + compose up.
+        self.assertEqual(len(runner.calls), 3)
+        self.assertIn("config", runner.calls[1]["cmd"])
+        self.assertIn("up", runner.calls[2]["cmd"])
+
+    def test_failed_switch_reports_error_and_releases_lock(self):
+        def failing_runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
+            raise RuntimeError("preflight: not enough free VRAM")
+
+        aipc_observer._switch_worker("/repo", "eng/prod", "baseline", 8020,
+                                     False, runner=failing_runner)
+        status = aipc_observer.state.control_status
+        self.assertTrue(status["done"])
+        self.assertFalse(status["ok"])
+        self.assertIn("not enough free VRAM", status["detail"])
+        self.assertFalse(aipc_observer._control_lock.locked())
+
+    def test_snapshot_reports_control_fields(self):
+        st = aipc_observer.ObserverState()
+        st.set_control_status({"action": "switch", "done": False})
+        snap = st.snapshot()
+        self.assertEqual(snap["control_status"]["action"], "switch")
+        self.assertTrue(snap["control_busy"])
+
+
 if __name__ == "__main__":
     unittest.main()
