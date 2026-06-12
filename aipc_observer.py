@@ -807,8 +807,9 @@ def apply_preset_to_command(cmd, tweaks):
     """Apply preset flag tweaks to a server argv: replace values, add flags."""
     argv = list(cmd)
     for flag, value in tweaks:
-        if flag in argv:
-            i = argv.index(flag)
+        i = next((j for j, tok in enumerate(argv) if normalize_preset_flag(tok) == flag),
+                 None)
+        if i is not None:
             if value is not None and i + 1 < len(argv):
                 argv[i + 1] = value
         else:
@@ -816,6 +817,15 @@ def apply_preset_to_command(cmd, tweaks):
             if value is not None:
                 argv.append(value)
     return argv
+
+
+PRESET_FLAG_ALIASES = {
+    "-lv": "--log-verbosity",
+}
+
+
+def normalize_preset_flag(flag):
+    return PRESET_FLAG_ALIASES.get(flag, flag)
 
 
 def _command_option_map(cmd):
@@ -829,18 +839,19 @@ def _command_option_map(cmd):
             continue
         if tok.startswith("--") and "=" in tok:
             flag, value = tok.split("=", 1)
-            options[flag] = value
+            options[normalize_preset_flag(flag)] = value
         elif i + 1 < len(argv) and not str(argv[i + 1]).startswith("-"):
-            options[tok] = str(argv[i + 1])
+            options[normalize_preset_flag(tok)] = str(argv[i + 1])
             i += 1
         else:
-            options[tok] = None
+            options[normalize_preset_flag(tok)] = None
         i += 1
     return options
 
 
 def preset_option_map(tweaks):
-    return {flag: value for flag, value in tweaks}
+    options = {normalize_preset_flag(flag): value for flag, value in tweaks}
+    return options
 
 
 def infer_insight_preset(cmd):
@@ -852,6 +863,8 @@ def infer_insight_preset(cmd):
     live_managed = {
         flag: value for flag, value in options.items() if flag in managed_flags
     }
+    if live_managed.get("--cache-ram") == "0":
+        live_managed.pop("--cache-ram")
     for name in ("insight-debug", "insight-cache", "insight"):
         if live_managed == preset_option_map(INSIGHT_PRESETS[name]):
             return name
@@ -1741,6 +1754,8 @@ insight:{'--metrics':null,'--props':null,'--log-verbosity':'4','--log-timestamps
 'insight-debug':{'--metrics':null,'--props':null,'--log-verbosity':'5','--log-timestamps':null,'--cache-ram':'8192'}
 };
 const MANAGED_FLAGS=new Set(Object.values(PRESET_OPTIONS).flatMap(o=>Object.keys(o)));
+const PRESET_FLAG_ALIASES={'-lv':'--log-verbosity'};
+function presetFlag(flag){return PRESET_FLAG_ALIASES[flag]||flag}
 function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
@@ -1811,7 +1826,7 @@ function openFlagGuide(){flagModalOpen=true;renderFlagGuideModal(lastModelInfo);
 function closeFlagGuide(){flagModalOpen=false;document.getElementById('flagModal').classList.remove('open')}
 function renderCommandGuideButton(mi){let guide=mi.command_guide||[];if(!guide.length)return '';return `<div class="row"><span class="label">Flags</span><span class="value"><button class="btn" onclick="openFlagGuide()">${flagGuideTitle(mi)}</button></span></div>`}
 function presetLabel(name){return PRESET_LABELS[name]||name||'unknown'}
-function liveOptionMap(cmd){let out={};let argv=cmd||[];for(let i=0;i<argv.length;i++){let tok=String(argv[i]);if(!tok.startsWith('-'))continue;if(tok.startsWith('--')&&tok.includes('=')){let parts=tok.split(/=(.*)/s);out[parts[0]]=parts[1]??''}else if(i+1<argv.length&&!String(argv[i+1]).startsWith('-')){out[tok]=String(argv[i+1]);i++}else out[tok]=null}return out}
+function liveOptionMap(cmd){let out={};let argv=cmd||[];for(let i=0;i<argv.length;i++){let tok=String(argv[i]);if(!tok.startsWith('-'))continue;if(tok.startsWith('--')&&tok.includes('=')){let parts=tok.split(/=(.*)/s);out[presetFlag(parts[0])]=parts[1]??''}else if(i+1<argv.length&&!String(argv[i+1]).startsWith('-')){out[presetFlag(tok)]=String(argv[i+1]);i++}else out[presetFlag(tok)]=null}if(out['--cache-ram']==='0')delete out['--cache-ram'];return out}
 function optionText(flag,value){return value==null?flag:`${flag} ${value}`}
 function selectedPreset(){let el=document.getElementById('presetSel');return el?el.value:'insight-cache'}
 function presetDiff(mi,selected){let live=liveOptionMap(mi.command||[]);let want=PRESET_OPTIONS[selected]||{};let rows=[];MANAGED_FLAGS.forEach(flag=>{let hasLive=Object.prototype.hasOwnProperty.call(live,flag);let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(hasLive&&hasWant&&String(live[flag])!==String(want[flag]))rows.push(`<span class="cmd-add">${esc(flag)}: ${esc(live[flag]??'switch')} → ${esc(want[flag]??'switch')}</span>`);else if(!hasLive&&hasWant)rows.push(`<span class="cmd-add">add ${esc(optionText(flag,want[flag]))}</span>`);else if(hasLive&&!hasWant)rows.push(`<span class="cmd-add">remove ${esc(optionText(flag,live[flag]))}</span>`)});return rows.join('')}
@@ -1821,7 +1836,7 @@ rows+=infoRow('Selected mode',`<span class="preset-pill ${running===selected?'pr
 rows+=infoRow('Mode difference',`<span class="label preset-desc">${esc(PRESET_DESCRIPTIONS[selected]||'')}</span>`);
 let diff=presetDiff(mi,selected);if(diff)rows+=`<div class="row"><span class="label">Selected changes</span><span class="value" style="text-align:right">${diff}</span></div>`;
 return rows}
-function commandFlagAt(argv,i){let tok=String(argv[i]);if(tok.startsWith('--')&&tok.includes('='))return tok.split('=')[0];return tok.startsWith('-')?tok:null}
+function commandFlagAt(argv,i){let tok=String(argv[i]);if(tok.startsWith('--')&&tok.includes('='))return presetFlag(tok.split('=')[0]);return tok.startsWith('-')?presetFlag(tok):null}
 function commandTokenClass(argv,i,want,live){let flag=commandFlagAt(argv,i);let prev=i>0?commandFlagAt(argv,i-1):null;if(prev&&Object.prototype.hasOwnProperty.call(live,prev)&&String(argv[i])===String(live[prev]))flag=prev;if(!flag||!MANAGED_FLAGS.has(flag))return '';let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(!hasWant)return 'cmd-remove';let liveVal=live[flag];let wantVal=want[flag];if(String(liveVal)===String(wantVal))return 'cmd-same';return 'cmd-change'}
 function renderCommandLine(mi){let argv=mi.command||[];let selected=selectedPreset();let want=PRESET_OPTIONS[selected]||{};let live=liveOptionMap(argv);let html=argv.map((tok,i)=>{let c=commandTokenClass(argv,i,want,live);return c?`<span class="cmd-token ${c}">${esc(tok)}</span>`:esc(tok)}).join(' ');
 let additions=[];MANAGED_FLAGS.forEach(flag=>{if(!Object.prototype.hasOwnProperty.call(live,flag)&&Object.prototype.hasOwnProperty.call(want,flag))additions.push(`<span class="cmd-add">+ ${esc(optionText(flag,want[flag]))}</span>`)});

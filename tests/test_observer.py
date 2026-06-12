@@ -842,6 +842,12 @@ class PresetTests(unittest.TestCase):
         )
         self.assertEqual(argv, ["--metrics"])
 
+    def test_replaces_existing_alias_value(self):
+        argv = aipc_observer.apply_preset_to_command(
+            ["-lv", "4"], [("--log-verbosity", "5")]
+        )
+        self.assertEqual(argv, ["-lv", "5"])
+
     def test_original_command_is_not_mutated(self):
         cmd = ["--cache-ram", "0"]
         aipc_observer.apply_preset_to_command(cmd, [("--cache-ram", "8192")])
@@ -878,6 +884,17 @@ class PresetTests(unittest.TestCase):
             "--log-timestamps", "--cache-ram", "8192",
         ]
         self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-debug")
+
+    def test_infers_debug_from_live_alias_command(self):
+        cmd = [
+            "--host", "0.0.0.0", "--cache-ram", "8192", "--metrics",
+            "--props", "-lv", "5", "--log-timestamps",
+        ]
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-debug")
+
+    def test_infers_baseline_with_disabled_cache_ram(self):
+        cmd = ["--host", "0.0.0.0", "--cache-ram", "0", "--reasoning", "off"]
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "baseline")
 
     def test_infers_custom_for_partial_managed_flags(self):
         cmd = ["--metrics", "--log-verbosity", "2"]
