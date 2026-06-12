@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for integrated aipc observer request parsing."""
 
+import json
 import unittest
 
 import aipc_observer
@@ -205,6 +206,108 @@ class RequestTrackerTests(unittest.TestCase):
         )
         self.assertTrue(self.tracker.active[100]["cache_defeated"])
         self.assertEqual(self.state.cache_defeated_count, 1)
+
+    def test_debug_request_body_groups_next_launched_task(self):
+        payload = {
+            "model": "qwen",
+            "messages": [
+                {"role": "system", "content": "Hermes Agent Persona"},
+                {"role": "user", "content": "Find MacBook Air M5 deals"},
+                {"role": "assistant", "content": "I will check."},
+            ],
+            "tools": [{"type": "function"}],
+            "response_format": {"type": "json_object"},
+        }
+        self.tracker.process_line(
+            "D srv log_server_r: request: " + json.dumps(payload)
+        )
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+
+        req = self.tracker.active[100]
+        self.assertEqual(req["request_group_label"], "Find MacBook Air M5 deals")
+        self.assertEqual(req["request_message_count"], 3)
+        self.assertTrue(req["request_has_tools"])
+        self.assertTrue(req["request_has_response_format"])
+        self.assertIn("request_group_id", req)
+        self.assertEqual(
+            self.state.active_requests[100]["request_group_id"],
+            req["request_group_id"],
+        )
+
+    def test_debug_request_group_survives_completion(self):
+        payload = {
+            "messages": [
+                {"role": "system", "content": "Hermes Agent Persona"},
+                {"role": "user", "content": "Summarize this page"},
+            ],
+        }
+        self.tracker.process_line(
+            "D srv log_server_r: request: " + json.dumps(payload)
+        )
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 50, truncated = 0"
+        )
+
+        request = list(self.state.requests)[0]
+        self.assertEqual(request["request_group_label"], "Summarize this page")
+        self.assertEqual(request["request_message_count"], 2)
+        self.assertIn("request_group_id", request)
+
+
+class RequestGroupingTests(unittest.TestCase):
+    def test_same_initial_conversation_prefix_gets_same_group_id(self):
+        base = [
+            {"role": "system", "content": "Hermes Agent Persona"},
+            {"role": "user", "content": "Find MacBook Air M5 deals"},
+        ]
+        first = aipc_observer.request_group_metadata({
+            "model": "qwen",
+            "messages": base + [{"role": "assistant", "content": "Checking."}],
+        })
+        second = aipc_observer.request_group_metadata({
+            "model": "qwen",
+            "messages": base + [
+                {"role": "assistant", "content": "Checking."},
+                {"role": "user", "content": "Anything under 900?"},
+            ],
+        })
+
+        self.assertEqual(first["request_group_id"], second["request_group_id"])
+        self.assertEqual(
+            first["request_group_label"], "Find MacBook Air M5 deals"
+        )
+
+    def test_different_first_user_message_gets_different_group_id(self):
+        first = aipc_observer.request_group_metadata({
+            "messages": [
+                {"role": "system", "content": "Hermes Agent Persona"},
+                {"role": "user", "content": "Find MacBook Air M5 deals"},
+            ],
+        })
+        second = aipc_observer.request_group_metadata({
+            "messages": [
+                {"role": "system", "content": "Hermes Agent Persona"},
+                {"role": "user", "content": "Watch RTX 5090 prices"},
+            ],
+        })
+
+        self.assertNotEqual(first["request_group_id"], second["request_group_id"])
+
+    def test_message_content_parts_are_used_for_label(self):
+        meta = aipc_observer.request_group_metadata({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Evaluate deal"},
+                        {"type": "text", "text": "MacBook Air"},
+                    ],
+                }
+            ]
+        })
+
+        self.assertEqual(meta["request_group_label"], "Evaluate deal MacBook Air")
 
 
 class LogSignalTests(unittest.TestCase):
