@@ -36,6 +36,9 @@ CONTAINER_DETECT_INTERVAL = 5.0
 MODEL_INFO_POLL_INTERVAL = 30.0
 REPO_POLL_INTERVAL = 900.0
 REQUEST_LOG_MAX = 200
+DETAIL_TEXT_MAX = 12000
+DETAIL_JSON_MAX = 24000
+MESSAGE_TEXT_MAX = 4000
 # JSON is valid YAML, so the generated compose override is written as JSON.
 OVERRIDE_FILE = "/tmp/aipc-observer-compose-override.yml"
 AUDIT_LOG = "/var/log/aipc-observer-actions.log"
@@ -335,6 +338,78 @@ def _text_from_content(content):
 def _shorten(text, limit=96):
     text = " ".join((text or "").split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _bounded_text(text, limit):
+    text = "" if text is None else str(text)
+    return text if len(text) <= limit else text[:limit] + "\n… truncated …"
+
+
+def _bounded_json(value, limit=DETAIL_JSON_MAX):
+    try:
+        text = json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    return _bounded_text(text, limit)
+
+
+def request_detail_metadata(payload):
+    if not isinstance(payload, dict):
+        return {}
+    messages = payload.get("messages")
+    detail = {
+        "request_model": payload.get("model"),
+        "request_stream": bool(payload.get("stream")),
+        "request_temperature": payload.get("temperature"),
+        "request_tools_count": len(payload.get("tools") or []),
+        "request_has_response_format": bool(payload.get("response_format")),
+        "request_detail_json": _bounded_json(payload),
+    }
+    if isinstance(messages, list):
+        detail["request_messages"] = [
+            {
+                "role": msg.get("role") or "",
+                "name": msg.get("name") or "",
+                "content": _bounded_text(
+                    _text_from_content(msg.get("content")), MESSAGE_TEXT_MAX
+                ),
+            }
+            for msg in messages if isinstance(msg, dict)
+        ]
+    return detail
+
+
+def response_detail_metadata(payload):
+    if not isinstance(payload, dict):
+        return {}
+    outputs = []
+    finish_reason = None
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        finish_reason = finish_reason or choice.get("finish_reason")
+        msg = choice.get("message") or {}
+        if isinstance(msg, dict):
+            content = _text_from_content(msg.get("content"))
+            if content:
+                outputs.append(content)
+            if msg.get("tool_calls"):
+                outputs.append(_bounded_json(msg.get("tool_calls"), MESSAGE_TEXT_MAX))
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict):
+            content = _text_from_content(delta.get("content"))
+            if content:
+                outputs.append(content)
+    if not outputs and payload.get("content") is not None:
+        outputs.append(_text_from_content(payload.get("content")))
+    if not outputs and payload.get("text") is not None:
+        outputs.append(_text_from_content(payload.get("text")))
+    output = "\n\n".join(o for o in outputs if o)
+    return {
+        "response_output": _bounded_text(output, DETAIL_TEXT_MAX),
+        "response_finish_reason": finish_reason,
+        "response_detail_json": _bounded_json(payload),
+    }
 
 
 def request_group_metadata(payload):
@@ -1379,6 +1454,7 @@ RE_ROUTE_LRU = re.compile(r"selected slot by LRU")
 # Trace-level (-lv 4) lines from the insight presets:
 RE_ACCESS = re.compile(r"done request:\s+(\w+)\s+(\S+)\s+\S+\s+(\d{3})")
 RE_REQUEST_BODY = re.compile(r"\brequest:\s*(\{.*\})\s*$")
+RE_RESPONSE_BODY = re.compile(r"\bresponse:\s*(\{.*\})\s*$")
 RE_ADAPTIVE_DM = re.compile(r"adaptive dm:\s+(\w+)\s*=\s*([\d.-]+)\s+n_max\s*=\s*(\d+)")
 RE_GRAPHS_REUSED = re.compile(r"graphs reused\s*=\s*(\d+)")
 RE_NEW_PROMPT = re.compile(r"new prompt,.*task\.n_tokens\s*=\s*(\d+)")
@@ -1403,16 +1479,29 @@ class RequestTracker:
         # by slot and consumed by the next launch on that slot.
         self.pending_routes = {}
         self.pending_request_meta = deque(maxlen=128)
+        self.last_finalized = None
 
     def process_line(self, line):
         m = RE_REQUEST_BODY.search(line)
         if m:
             try:
-                meta = request_group_metadata(json.loads(m.group(1)))
+                payload = json.loads(m.group(1))
+                meta = request_group_metadata(payload)
+                meta.update(request_detail_metadata(payload))
             except json.JSONDecodeError:
                 meta = {}
             if meta:
                 self.pending_request_meta.append(meta)
+            return
+
+        m = RE_RESPONSE_BODY.search(line)
+        if m:
+            try:
+                detail = response_detail_metadata(json.loads(m.group(1)))
+            except json.JSONDecodeError:
+                detail = {}
+            if detail:
+                self._attach_response_detail(line, detail)
             return
 
         m = RE_ACCESS.search(line)
@@ -1638,6 +1727,18 @@ class RequestTracker:
             if not req.get("ttft_ms") and enriched.get("ttft_ms"):
                 req["ttft_ms"] = enriched["ttft_ms"]
         self.state.add_request(req)
+        self.last_finalized = req
+        self.state.notify_subscribers()
+
+    def _attach_response_detail(self, line, detail):
+        req = self._current_request_for_line(line)
+        if req is None:
+            req = self.last_finalized
+        if req is None:
+            return
+        req.update(detail)
+        if req.get("task_id") in self.active:
+            self.state.update_active_request(req["task_id"], detail)
         self.state.notify_subscribers()
 
     def _current_request_for_line(self, line):
@@ -1700,7 +1801,8 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px minmax(150px,1.4fr) 60px 56px 70px 74px 78px 74px 60px 78px minmax(80px,1fr);gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.group-label{color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
-.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+@media(max-width:900px){.detail-grid{grid-template-columns:1fr}.request-row{grid-template-columns:88px 120px minmax(140px,1fr) 52px 52px 64px 68px 72px 68px 52px 72px minmax(70px,1fr)}}
 </style>
 </head>
 <body>
@@ -1737,8 +1839,12 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="modal-head"><h2 id="flagModalTitle">Flag guide</h2><button class="btn" onclick="closeFlagGuide()">Close</button></div>
 <div id="flagModalBody" class="modal-body"></div>
 </div></div>
+<div id="requestModal" class="modal" onclick="if(event.target===this)closeRequestDetail()"><div class="modal-panel">
+<div class="modal-head"><h2 id="requestModalTitle">Request detail</h2><button class="btn" onclick="closeRequestDetail()">Close</button></div>
+<div id="requestModalBody" class="modal-body"></div>
+</div></div>
 <script>
-let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;
+let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};
 const PRESET_LABELS={'baseline':'baseline','insight':'insight','insight-cache':'insight+cache','insight-debug':'insight+debug','custom':'custom'};
 const PRESET_DESCRIPTIONS={
 baseline:'club-3090 compose command with no observer insight flags added',
@@ -1883,7 +1989,18 @@ function liveElapsed(r){return formatDuration(Date.now()-(r.start_time||0)*1000)
 function cacheCell(r){let t=r.slot_route?` title="slot route: ${r.slot_route}${r.route_similarity!=null?' (sim '+Number(r.route_similarity).toFixed(2)+')':''}"`:'';if(r.cache_hit_pct==null)return `<span${t}>-</span>`;let p=Number(r.cache_hit_pct);let c=p>=70?'good':p>=30?'hot':'critical';return `<span class="${c}"${t}>${p.toFixed(0)}%</span>`}
 function statusCell(r,label){let shifts=r.context_shifts||0;let t=shifts?` title="${shifts} context shift(s): oldest history was dropped to keep generating"`:'';return `<span class="status ${r.status||'processing'}"${t}>${label}${shifts?' ⇄':''}</span>`}
 function groupCell(r){let label=r.request_group_label||'-';let bits=[];if(r.request_group_id)bits.push('group '+r.request_group_id);if(r.request_message_count)bits.push(r.request_message_count+' messages');if(r.request_has_tools)bits.push('tools');if(r.request_has_response_format)bits.push('response_format');if(r.request_stream)bits.push('stream');let title=bits.length?` title="${esc(bits.join(' · '))}"`:'';let cls=r.request_group_id?'group-label':'label';return `<span class="${cls}"${title}>${esc(label)}</span>`}
-function renderRequests(reqs,active){let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live">${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row">${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
+function requestKey(r){return String((r.status||'processing')+'-'+(r.task_id??'x')+'-'+(r.start_time||r.end_time||r.id||0))}
+function rowAttrs(r){let k=requestKey(r);requestRowsByKey[k]=r;return ` role="button" tabindex="0" onclick="openRequestDetail('${esc(k)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openRequestDetail('${esc(k)}')}"`}
+function detailField(label,value){if(value===undefined||value===null||value==='')return '';return `<div class="row"><span class="label">${label}</span><span class="value">${esc(value)}</span></div>`}
+function renderMessages(messages){if(!messages||!messages.length)return '<div class="label">No request body captured. Restart with insight+debug to log messages.</div>';return messages.map(m=>`<div class="message-card"><div class="message-role">${esc(m.role||'message')}${m.name?' · '+esc(m.name):''}</div><div class="prewrap">${esc(m.content||'')}</div></div>`).join('')}
+function renderRequestDetail(r){let meta='';meta+=detailField('Status',r.status);meta+=detailField('Task',r.task_id);meta+=detailField('Group',r.request_group_label);meta+=detailField('Group id',r.request_group_id);meta+=detailField('Model',r.request_model||r.model);meta+=detailField('Messages',r.request_message_count);meta+=detailField('Tools',r.request_tools_count);meta+=detailField('Response format',r.request_has_response_format?'yes':'');meta+=detailField('Stream',r.request_stream?'yes':'');meta+=detailField('Finish reason',r.response_finish_reason||r.finish_reason);
+let out=r.response_output?`<div class="prewrap">${esc(r.response_output)}</div>`:'<div class="label">No response body captured yet. Non-streaming responses require insight+debug logs.</div>';
+let rawReq=r.request_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw request JSON</summary><div class="prewrap">${esc(r.request_detail_json)}</div></details>`:'';
+let rawResp=r.response_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw response JSON</summary><div class="prewrap">${esc(r.response_detail_json)}</div></details>`:'';
+return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${renderMessages(r.request_messages)}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
+function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
+function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
+function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
 connect();
 </script>
 </body></html>"""
