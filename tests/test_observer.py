@@ -226,6 +226,11 @@ class RequestTrackerTests(unittest.TestCase):
         req = self.tracker.active[100]
         self.assertEqual(req["request_group_label"], "Find MacBook Air M5 deals")
         self.assertEqual(req["request_message_count"], 3)
+        self.assertEqual(req["request_messages"][1]["role"], "user")
+        self.assertEqual(
+            req["request_messages"][1]["content"], "Find MacBook Air M5 deals"
+        )
+        self.assertIn("Hermes Agent Persona", req["request_detail_json"])
         self.assertTrue(req["request_has_tools"])
         self.assertTrue(req["request_has_response_format"])
         self.assertIn("request_group_id", req)
@@ -253,6 +258,39 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertEqual(request["request_group_label"], "Summarize this page")
         self.assertEqual(request["request_message_count"], 2)
         self.assertIn("request_group_id", request)
+
+    def test_debug_response_body_updates_active_request_output(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        payload = {
+            "choices": [{
+                "message": {"role": "assistant", "content": "The answer is 42."},
+                "finish_reason": "stop",
+            }]
+        }
+        self.tracker.process_line(
+            "D srv log_server_r: response: " + json.dumps(payload)
+        )
+
+        req = self.tracker.active[100]
+        self.assertEqual(req["response_output"], "The answer is 42.")
+        self.assertEqual(req["response_finish_reason"], "stop")
+        self.assertEqual(
+            self.state.active_requests[100]["response_output"],
+            "The answer is 42.",
+        )
+
+    def test_debug_response_body_updates_recent_completed_request(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 50, truncated = 0"
+        )
+        self.tracker.process_line(
+            "D srv log_server_r: response: "
+            + json.dumps({"choices": [{"message": {"content": "Done."}}]})
+        )
+
+        request = list(self.state.requests)[0]
+        self.assertEqual(request["response_output"], "Done.")
 
 
 class RequestGroupingTests(unittest.TestCase):
@@ -308,6 +346,20 @@ class RequestGroupingTests(unittest.TestCase):
         })
 
         self.assertEqual(meta["request_group_label"], "Evaluate deal MacBook Air")
+
+    def test_response_detail_extracts_tool_calls(self):
+        detail = aipc_observer.response_detail_metadata({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }]
+                }
+            }]
+        })
+
+        self.assertIn("search", detail["response_output"])
 
 
 class LogSignalTests(unittest.TestCase):
