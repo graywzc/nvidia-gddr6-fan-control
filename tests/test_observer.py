@@ -1637,6 +1637,19 @@ class SwitchModelTests(unittest.TestCase):
         self.assertEqual(lines, ["setup one", "setup two"])
         self.assertIn("setup two", output)
 
+    def test_run_with_progress_splits_on_cr(self):
+        """Download tools use \\r for progress bars; each update should be a separate line."""
+        lines = []
+        # Simulate curl/wget style progress: updates separated by \r, final \n
+        script = r"import sys; sys.stdout.write('10%\r50%\r100%\n'); sys.stdout.flush()"
+        output = aipc_observer._run_with_progress(
+            [sys.executable, "-c", script],
+            timeout=10,
+            on_line=lines.append,
+        )
+        self.assertEqual(lines, ["10%", "50%", "100%"])
+        self.assertIn("100%", output)
+
     def test_runs_switch_sh_with_port_env(self):
         runner = FakeRunner()
         aipc_observer.switch_model("/repo", "eng/prod", 8020, runner=runner)

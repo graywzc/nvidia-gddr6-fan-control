@@ -1199,8 +1199,19 @@ def _run_with_progress(cmd, env=None, cwd=None, timeout=600, on_line=None):
 
     def read_stdout():
         try:
-            for line in proc.stdout or []:
-                lines.put(line)
+            buf = []
+            while True:
+                ch = proc.stdout.read(1)
+                if not ch:
+                    if buf:
+                        lines.put("".join(buf))
+                    break
+                if ch in ("\n", "\r"):
+                    if buf:
+                        lines.put("".join(buf))
+                        buf = []
+                else:
+                    buf.append(ch)
         finally:
             lines.put(None)
 
