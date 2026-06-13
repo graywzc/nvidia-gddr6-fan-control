@@ -1372,6 +1372,40 @@ def update_repo(repo):
 # switch.sh waits for readiness itself (READY_TIMEOUT defaults to 600 s),
 # plus image pull and model load on top.
 SWITCH_TIMEOUT = 1200.0
+INSTALL_TIMEOUT = 7200.0
+
+
+def infer_variant_setup(entry):
+    """Best-effort setup.sh model/weight key from a registry entry."""
+    model = (entry or {}).get("model")
+    compose_path = (entry or {}).get("compose_path") or ""
+    if not model:
+        return {}
+    parts = compose_path.split("/")
+    profile = None
+    if "compose" in parts:
+        idx = parts.index("compose")
+        # models/<model>/<engine>/compose/<topology>/<profile>/<file>.yml
+        if idx + 2 < len(parts):
+            profile = parts[idx + 2]
+    hint = {"model": model}
+    if profile:
+        hint["weight_key"] = f"{model}:{profile}"
+    return hint
+
+
+def parse_setup_hint(text):
+    """Extract setup.sh instructions from club-3090 preflight output."""
+    msg = re.sub(r"\s+", " ", str(text or ""))
+    m = re.search(
+        r"(?:MODEL_DIR=(?P<model_dir>\S+)\s+)?"
+        r"WEIGHT_KEY=(?P<weight_key>\S+)\s+"
+        r"bash\s+scripts/setup\.sh\s+(?P<model>\S+)",
+        msg,
+    )
+    if not m:
+        return {}
+    return {k: v for k, v in m.groupdict().items() if v}
 
 
 def validate_switch(variant, catalog, force=False):
@@ -1418,14 +1452,43 @@ def switch_model(repo, variant, monitor_port, force=False, runner=_run):
     runner(_repo_owner_cmd(repo, cmd), env=env, cwd=repo, timeout=SWITCH_TIMEOUT)
 
 
-def _set_control_status(action, detail, done=False, ok=None):
-    state.set_control_status({
+def install_variant_assets(repo, variant, catalog, setup=None, runner=_run):
+    """Run club-3090 setup.sh for a variant's missing model assets."""
+    variants = (catalog or {}).get("variants") or {}
+    entry = variants.get(variant) or {}
+    hint = dict(infer_variant_setup(entry))
+    hint.update({k: v for k, v in (setup or {}).items() if v})
+    model = hint.get("model") or entry.get("model")
+    if not model:
+        raise ValueError("install needs a model name")
+    env = dict(os.environ)
+    if hint.get("model_dir"):
+        env["MODEL_DIR"] = hint["model_dir"]
+    if hint.get("weight_key"):
+        env["WEIGHT_KEY"] = hint["weight_key"]
+    detail = f"variant={variant} model={model}"
+    if hint.get("weight_key"):
+        detail += f" weight_key={hint['weight_key']}"
+    audit("install", detail)
+    runner(
+        _repo_owner_cmd(repo, ["bash", "scripts/setup.sh", model]),
+        env=env,
+        cwd=repo,
+        timeout=INSTALL_TIMEOUT,
+    )
+    return {"installed": True, "variant": variant, **hint}
+
+
+def _set_control_status(action, detail, done=False, ok=None, **extra):
+    payload = {
         "action": action,
         "detail": detail,
         "done": done,
         "ok": ok,
         "updated_at": time.time(),
-    })
+    }
+    payload.update(extra)
+    state.set_control_status(payload)
     state.notify_subscribers()
 
 
@@ -1474,8 +1537,54 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
         audit("switch-done", f"variant={variant} preset={preset}")
     except Exception as e:
         audit("switch-failed", f"variant={variant}: {e}")
+        setup = parse_setup_hint(str(e))
+        if setup:
+            setup.update({"variant": variant, "preset": preset, "force": force})
         _set_control_status(
-            "switch", f"switch to {variant} failed: {e}", done=True, ok=False
+            "switch", f"switch to {variant} failed: {e}", done=True, ok=False,
+            install_hint=setup or None,
+        )
+    finally:
+        _control_lock.release()
+
+
+def _install_worker(repo, variant, preset, monitor_port, force, retry,
+                    setup, runner=_run, info_getter=None,
+                    override_path=OVERRIDE_FILE):
+    try:
+        _set_control_status(
+            "install", f"installing assets for {variant} (can take a while)…"
+        )
+        result = install_variant_assets(
+            repo, variant, state.catalog, setup=setup, runner=runner)
+        if not retry:
+            _set_control_status(
+                "install", f"installed assets for {variant}",
+                done=True, ok=True,
+            )
+            audit("install-done", f"variant={variant}")
+            return
+        _set_control_status(
+            "install", f"installed assets for {variant}; retrying switch…"
+        )
+        switch_model(repo, variant, monitor_port, force=force, runner=runner)
+        _set_control_status(
+            "switch", f"{variant} is up; applying preset {preset} + log "
+                      "rotation (one more model reload)…"
+        )
+        info = (info_getter or _wait_for_model_info)(monitor_port)
+        restart_model(preset, model_info=info, runner=runner,
+                      override_path=override_path)
+        _set_control_status(
+            "switch", f"switched to {variant} (preset {preset})",
+            done=True, ok=True
+        )
+        audit("install-switch-done", f"variant={variant} preset={preset}")
+    except Exception as e:
+        audit("install-failed", f"variant={variant}: {e}")
+        _set_control_status(
+            "install", f"install for {variant} failed: {e}",
+            done=True, ok=False,
         )
     finally:
         _control_lock.release()
@@ -2267,7 +2376,7 @@ let lastActive=0;
 let lastBusy=false;
 function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
-if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120))st.textContent=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+(cs.detail||'');
+if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doInstallVariant('${esc(h.variant)}','${esc(h.preset||selectedPreset())}',${h.force?'true':'false'},true,'${esc(h.model||'')}','${esc(h.weight_key||'')}','${esc(h.model_dir||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
 // Restart/Stop act on a running container; when nothing is up they 409 or
 // no-op, so disable them and point at the catalog's Start buttons instead.
@@ -2280,6 +2389,7 @@ ctlPost('/observer/api/switch',{variant:v,preset:p,force:lastActive>0||(status!=
 function doStart(v,status){let p=document.getElementById('presetSel').value;let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
 if(!confirm(`Start model '${v}' with preset '${p}'?\nNo model is running — this boots the variant and waits for it to load, which takes a few minutes.${exp}`))return;
 ctlPost('/observer/api/switch',{variant:v,preset:p,force:(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doInstallVariant(v,preset,force,retry,model,weightKey,modelDir){let msg=retry?`Install missing assets for '${v}' and retry switch?`:`Install assets for '${v}'?`;if(!confirm(msg))return;let body={variant:v,preset:preset||selectedPreset(),force:!!force,retry:!!retry};if(model)body.model=model;if(weightKey)body.weight_key=weightKey;if(modelDir)body.model_dir=modelDir;ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent=retry?'⏳ installing, then retrying switch…':'⏳ installing…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
 if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">/metrics disabled — restart with an insight preset to enable</span></div>';return}
@@ -2307,8 +2417,8 @@ function variantWhy(v){return variantDoc(v).why||v.status_note||''}
 function renderVariantListModal(d,fits,runKey,running){let c=d.catalog||{};let vars=c.variants||{};let defSet=new Set(Object.values(c.defaults||{}));let order={production:0,caveats:1};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let rows='<div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;
-return `<div class="variant-row"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${action}</span></div>`}).join('');
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let install=`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`;
+return `<div class="variant-row"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${install}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`Variants for this machine (${fits.length})`;
 document.getElementById('variantModalBody').innerHTML=rows;
@@ -2492,7 +2602,8 @@ def handle_observer_post(handler):
     """
     path = handler.path.split("?", 1)[0]
     if path not in ("/observer/api/update", "/observer/api/restart",
-                    "/observer/api/stop", "/observer/api/switch"):
+                    "/observer/api/stop", "/observer/api/switch",
+                    "/observer/api/install"):
         return False
     body = {}
     length = int(handler.headers.get("Content-Length") or 0)
@@ -2544,10 +2655,46 @@ def handle_observer_post(handler):
             ).start()
             release = False
             result = {"started": True, "variant": variant, "preset": preset}
+        elif path == "/observer/api/install":
+            repo = _config.get("model_repo")
+            if not repo:
+                _send_json(handler, 503, {"error": "no model repo configured"})
+                return True
+            variant = str(body.get("variant", ""))
+            preset = str(body.get("preset", "baseline"))
+            force = bool(body.get("force"))
+            retry = bool(body.get("retry"))
+            if preset not in INSIGHT_PRESETS:
+                raise ValueError(f"unknown preset {preset!r}")
+            variant = normalize_switch_variant(variant, state.catalog)
+            validate_switch(variant, state.catalog, force=True)
+            if retry:
+                check_restart_allowed(state, force=force)
+            setup = {
+                k: body.get(k)
+                for k in ("model", "weight_key", "model_dir")
+                if body.get(k)
+            }
+            audit("install", f"variant={variant} retry={retry}")
+            threading.Thread(
+                target=_install_worker,
+                args=(
+                    repo, variant, preset, _config["monitor_port"], force,
+                    retry, setup,
+                ),
+                name="observer-install",
+                daemon=True,
+            ).start()
+            release = False
+            result = {"started": True, "variant": variant, "retry": retry}
         else:
             check_restart_allowed(state, force=bool(body.get("force")))
             result = restart_model(str(body.get("preset", "insight")))
-        _send_json(handler, 202 if path.endswith("/switch") else 200, result)
+        _send_json(
+            handler,
+            202 if path.endswith(("/switch", "/install")) else 200,
+            result,
+        )
     except ValueError as e:
         _send_json(handler, 400, {"error": str(e)})
     except Exception as e:
