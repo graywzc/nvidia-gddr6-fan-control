@@ -1161,8 +1161,8 @@ class RestartModelTests(unittest.TestCase):
         self.assertNotIn("command", svc)
 
 
-class PresetFilterTests(unittest.TestCase):
-    """Preset flags a build doesn't advertise are dropped, not crash-looped."""
+class PresetResolveTests(unittest.TestCase):
+    """Preset capabilities resolve to the flags each build advertises."""
 
     def setUp(self):
         import tempfile
@@ -1198,39 +1198,64 @@ class PresetFilterTests(unittest.TestCase):
         with open(self.override_path) as f:
             return json.load(f)["services"]["svc"]["command"]
 
-    def test_drops_flags_missing_from_help(self):
-        # ik-llama supports metrics/props/cache-ram but not the log flags.
+    def test_translates_to_the_flag_the_build_advertises(self):
+        # ik-llama: --verbosity (not --log-verbosity), no --props/--log-* flags.
+        result = self._restart(
+            "insight-debug",
+            help_flags={"--metrics", "--cache-ram", "--verbosity", "--host"},
+        )
+        argv = self._override_argv()
+        self.assertIn("--metrics", argv)
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "8192")
+        # trace_logging resolves to --verbosity 5, not --log-verbosity.
+        self.assertEqual(argv[argv.index("--verbosity") + 1], "5")
+        self.assertNotIn("--log-verbosity", argv)
+        # props and timestamps have no supported flag on this build.
+        self.assertEqual(sorted(result["dropped_capabilities"]),
+                         ["props", "timestamps"])
+
+    def test_drops_capabilities_with_no_supported_flag(self):
         result = self._restart(
             "insight-cache",
-            help_flags={"--metrics", "--props", "--cache-ram",
-                        "--host", "--ctx-size"},
+            help_flags={"--metrics", "--props", "--cache-ram", "--host"},
         )
         argv = self._override_argv()
         self.assertIn("--metrics", argv)
         self.assertIn("--props", argv)
         self.assertEqual(argv[argv.index("--cache-ram") + 1], "8192")
         self.assertNotIn("--log-verbosity", argv)
-        self.assertNotIn("--log-timestamps", argv)
-        self.assertEqual(
-            sorted(result["dropped_flags"]),
-            ["--log-timestamps", "--log-verbosity"],
-        )
+        self.assertNotIn("--verbosity", argv)
+        self.assertEqual(sorted(result["dropped_capabilities"]),
+                         ["timestamps", "verbose_logging"])
 
-    def test_unknown_help_keeps_all_flags(self):
+    def test_unknown_help_falls_back_to_default_flags(self):
         result = self._restart("insight-cache", help_flags=None)
         argv = self._override_argv()
         self.assertIn("--log-verbosity", argv)
         self.assertIn("--log-timestamps", argv)
-        self.assertEqual(result["dropped_flags"], [])
+        self.assertEqual(result["dropped_capabilities"], [])
 
-    def test_supported_build_keeps_all_flags(self):
+    def test_supported_build_keeps_default_flags(self):
         result = self._restart(
             "insight",
             help_flags={"--metrics", "--props", "--log-verbosity",
-                        "--log-timestamps", "--host", "--ctx-size"},
+                        "--log-timestamps", "--host"},
         )
-        self.assertEqual(result["dropped_flags"], [])
+        self.assertEqual(result["dropped_capabilities"], [])
         self.assertIn("--log-verbosity", self._override_argv())
+
+    def test_resolve_preset_is_capability_aware(self):
+        # Unit-level: ik-llama-style support set.
+        supported = {"--metrics", "--cache-ram", "--verbosity"}
+        tweaks, dropped = aipc_observer.resolve_preset("insight-debug", supported)
+        self.assertIn(("--verbosity", "5"), tweaks)
+        self.assertIn(("--metrics", None), tweaks)
+        self.assertNotIn(("--log-verbosity", "5"), tweaks)
+        self.assertEqual(sorted(dropped), ["props", "timestamps"])
+        # Unknown support -> default (mainline) flags, nothing dropped.
+        tweaks, dropped = aipc_observer.resolve_preset("insight-debug", None)
+        self.assertIn(("--log-verbosity", "5"), tweaks)
+        self.assertEqual(dropped, [])
 
 
 class StopModelTests(unittest.TestCase):

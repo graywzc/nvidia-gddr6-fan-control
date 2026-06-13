@@ -912,30 +912,38 @@ def catalog_has_changes(diff):
 # args take precedence over LLAMA_ARG_* env, and flags like --cache-ram are
 # already present in the compose command, so env could never override them.
 # (flag, None) appends a switch if absent; (flag, value) replaces or appends.
-INSIGHT_PRESETS = {
+# Presets are defined by *capability* (what we want on), not by hard flags,
+# because llama.cpp forks spell the same capability differently (ik-llama uses
+# --verbosity where mainline/beellama use --log-verbosity, etc.). Each
+# capability lists candidate (flag, value) pairs in preference order; at
+# restart time the first candidate the running build advertises in --help wins
+# (see resolve_preset). The trace/verbose distinction is the log level.
+CAPABILITY_FLAGS = {
+    "metrics": [("--metrics", None)],
+    "props": [("--props", None)],
+    "ram_cache": [("--cache-ram", "8192")],
+    "verbose_logging": [("--log-verbosity", "4"), ("--verbosity", "4")],
+    "trace_logging": [("--log-verbosity", "5"), ("--verbosity", "5")],
+    "timestamps": [("--log-timestamps", None), ("--log-format", "json")],
+}
+
+PRESET_CAPABILITIES = {
     "baseline": [],
-    "insight": [
-        ("--metrics", None),
-        ("--props", None),
-        ("--log-verbosity", "4"),
-        ("--log-timestamps", None),
-    ],
-    "insight-cache": [
-        ("--metrics", None),
-        ("--props", None),
-        ("--log-verbosity", "4"),
-        ("--log-timestamps", None),
-        ("--cache-ram", "8192"),
-    ],
+    "insight": ["metrics", "props", "verbose_logging", "timestamps"],
+    "insight-cache": ["metrics", "props", "verbose_logging", "timestamps",
+                      "ram_cache"],
     # Debug verbosity logs full request/response bodies — the passive path to
     # grouping agent requests by session. Very chatty; use for experiments.
-    "insight-debug": [
-        ("--metrics", None),
-        ("--props", None),
-        ("--log-verbosity", "5"),
-        ("--log-timestamps", None),
-        ("--cache-ram", "8192"),
-    ],
+    "insight-debug": ["metrics", "props", "trace_logging", "timestamps",
+                      "ram_cache"],
+}
+
+# Legacy flag view of each preset (the first/default candidate per capability).
+# Kept for the dashboard's preset diff and mode inference, which reason about
+# the mainline/beellama spelling.
+INSIGHT_PRESETS = {
+    name: [CAPABILITY_FLAGS[cap][0] for cap in caps]
+    for name, caps in PRESET_CAPABILITIES.items()
 }
 
 _control_lock = threading.Lock()
@@ -1002,21 +1010,41 @@ def preset_option_map(tweaks):
     return options
 
 
+def command_capabilities(cmd):
+    """Map a live server argv to the set of insight capabilities it enables.
+
+    Capability-based (not flag-based) so a translated build — ik-llama running
+    --verbosity 5 instead of --log-verbosity 5 — still reads as trace_logging.
+    """
+    options = _command_option_map(cmd)
+    caps = set()
+    if "--metrics" in options:
+        caps.add("metrics")
+    if "--props" in options:
+        caps.add("props")
+    if options.get("--cache-ram") not in (None, "0"):
+        caps.add("ram_cache")
+    if "--log-timestamps" in options or options.get("--log-format") == "json":
+        caps.add("timestamps")
+    level = options.get("--log-verbosity", options.get("--verbosity"))
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        level = None
+    if level is not None and level >= 5:
+        caps.add("trace_logging")
+    elif level is not None and level >= 1:
+        caps.add("verbose_logging")
+    return caps
+
+
 def infer_insight_preset(cmd):
     """Infer which observer-managed insight preset the live argv matches."""
-    options = _command_option_map(cmd)
-    managed_flags = {
-        flag for tweaks in INSIGHT_PRESETS.values() for flag, _ in tweaks
-    }
-    live_managed = {
-        flag: value for flag, value in options.items() if flag in managed_flags
-    }
-    if live_managed.get("--cache-ram") == "0":
-        live_managed.pop("--cache-ram")
+    caps = command_capabilities(cmd)
     for name in ("insight-debug", "insight-cache", "insight"):
-        if live_managed == preset_option_map(INSIGHT_PRESETS[name]):
+        if caps == set(PRESET_CAPABILITIES[name]):
             return name
-    if not live_managed:
+    if not caps:
         return "baseline"
     return "custom"
 
@@ -1113,24 +1141,31 @@ def _supported_flags(model_info, help_getter=inspect_container_help):
     return set(flags)
 
 
-def filter_preset_tweaks(tweaks, supported):
-    """Drop preset flags the build doesn't list in --help; keep all if unknown.
+def resolve_preset(preset_name, supported):
+    """Resolve a preset's capabilities to flags this build supports.
 
-    Insight presets are tuned for the beellama/llama.cpp build; other forks
-    (e.g. ik-llama) reject flags like --log-verbosity and exit non-zero, which
-    docker's restart policy turns into a crash loop. Filtering against the
-    build's own --help keeps the flags it does support (--metrics, --props,
-    --cache-ram on ik-llama) and silently drops the rest.
+    For each capability, pick the first candidate flag the build advertises in
+    --help (`supported`); other forks spell the same capability differently
+    (ik-llama: --verbosity, mainline: --log-verbosity). When help is unknown
+    (supported is None) fall back to the first/default candidate so behaviour
+    matches the legacy hardcoded preset. Returns (tweaks, dropped) where dropped
+    names capabilities no candidate flag could satisfy on this build.
     """
-    if supported is None:
-        return list(tweaks), []
-    kept, dropped = [], []
-    for flag, value in tweaks:
-        if flag in supported or normalize_preset_flag(flag) in supported:
-            kept.append((flag, value))
+    caps = PRESET_CAPABILITIES.get(preset_name)
+    if caps is None:
+        return None, []
+    tweaks, dropped = [], []
+    for cap in caps:
+        chosen = next(
+            ((flag, value) for flag, value in CAPABILITY_FLAGS[cap]
+             if supported is None or flag in supported),
+            None,
+        )
+        if chosen is not None:
+            tweaks.append(chosen)
         else:
-            dropped.append(flag)
-    return kept, dropped
+            dropped.append(cap)
+    return tweaks, dropped
 
 
 def restart_model(preset_name, model_info=None, runner=_run,
@@ -1139,14 +1174,14 @@ def restart_model(preset_name, model_info=None, runner=_run,
 
     Presets always build on the compose file's own command (resolved via
     `docker compose config`), never the running container's — so switching
-    insight -> baseline sheds flags instead of accumulating them. Preset flags
-    the running build doesn't advertise in --help are dropped rather than
-    crash-looping the server (see filter_preset_tweaks).
+    insight -> baseline sheds flags instead of accumulating them. Each preset
+    capability is resolved to a flag the running build advertises in --help, so
+    a fork that spells (or lacks) a flag differently boots cleanly instead of
+    crash-looping (see resolve_preset).
     """
-    tweaks = INSIGHT_PRESETS.get(preset_name)
-    if tweaks is None:
+    if preset_name not in PRESET_CAPABILITIES:
         raise ValueError(f"unknown preset {preset_name!r}; "
-                         f"known: {', '.join(INSIGHT_PRESETS)}")
+                         f"known: {', '.join(PRESET_CAPABILITIES)}")
     mi = model_info if model_info is not None else state.model_info
     missing = [k for k in ("compose_file", "service", "working_dir", "command")
                if not mi.get(k)]
@@ -1161,9 +1196,9 @@ def restart_model(preset_name, model_info=None, runner=_run,
     if preset_name != "baseline":
         baseline = compose_baseline_command(compose_file, mi["service"], env,
                                             cwd, runner=runner)
-        kept, dropped = filter_preset_tweaks(
-            tweaks, _supported_flags(mi, help_getter))
-        argv = apply_preset_to_command(baseline, kept)
+        tweaks, dropped = resolve_preset(
+            preset_name, _supported_flags(mi, help_getter))
+        argv = apply_preset_to_command(baseline, tweaks)
     # Always pin the running image: launchers may have injected a different
     # image (e.g. BEELLAMA_IMAGE) than the compose file's fallback, and a
     # restart must never silently switch images.
@@ -1183,7 +1218,7 @@ def restart_model(preset_name, model_info=None, runner=_run,
         env=env, cwd=cwd,
     )
     return {"restarted": True, "preset": preset_name,
-            "variant": mi.get("variant"), "dropped_flags": dropped}
+            "variant": mi.get("variant"), "dropped_capabilities": dropped}
 
 
 def _compose_file_args(compose_file):
@@ -1344,8 +1379,8 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
         info = (info_getter or _wait_for_model_info)(monitor_port)
         result = restart_model(preset, model_info=info, runner=runner,
                                override_path=override_path)
-        dropped = result.get("dropped_flags") or []
-        note = (f" — dropped unsupported {', '.join(dropped)}"
+        dropped = result.get("dropped_capabilities") or []
+        note = (f" — this build can't do {', '.join(dropped)}"
                 if dropped else "")
         _set_control_status(
             "switch", f"switched to {variant} (preset {preset}){note}",
@@ -2173,7 +2208,7 @@ el.innerHTML=rows}
 async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
-function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});let dr=(r.dropped_flags||[]).length?` (dropped ${r.dropped_flags.join(', ')} — unsupported by this build)`:'';return `restarted with ${r.preset}${dr} (model reloading…)`})}
+function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});let dr=(r.dropped_capabilities||[]).length?` (this build can't do ${r.dropped_capabilities.join(', ')})`:'';return `restarted with ${r.preset}${dr} (model reloading…)`})}
 function doStop(){let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Stop model serving on this host?${warn}`,async()=>{let r=await ctlPost('/observer/api/stop',{force:lastActive>0});return r.stopped?`stopped ${r.container||'model'}`:(r.detail||'already stopped')})}
 function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
