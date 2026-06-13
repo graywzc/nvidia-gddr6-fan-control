@@ -78,7 +78,7 @@ final class StatusPoller: ObservableObject {
     }
 
     /// Send a new fan curve to the host. Throws on validation/network failure.
-    func putCurve(host: Host, curve: [[Int]]) async throws {
+    func putCurve(host: Host, curve: [[Int]], gpuIndex: Int? = nil) async throws {
         guard let url = URL(string: "http://\(host.hostname):\(host.port)/curve") else {
             throw NSError(
                 domain: "MenubarApp", code: 1,
@@ -92,7 +92,14 @@ final class StatusPoller: ObservableObject {
         if !host.token.isEmpty {
             req.setValue("Bearer \(host.token)", forHTTPHeaderField: "Authorization")
         }
-        req.httpBody = try JSONSerialization.data(withJSONObject: curve)
+        if let gpuIndex {
+            req.httpBody = try JSONSerialization.data(withJSONObject: [
+                "gpu_index": gpuIndex,
+                "curve": curve,
+            ])
+        } else {
+            req.httpBody = try JSONSerialization.data(withJSONObject: curve)
+        }
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
             throw NSError(
@@ -117,7 +124,7 @@ final class StatusPoller: ObservableObject {
     }
 
     /// Send a new board power limit to the host. nil restores the default limit.
-    func putPowerLimit(host: Host, watts: Double?) async throws {
+    func putPowerLimit(host: Host, watts: Double?, gpuIndex: Int? = nil) async throws {
         guard let url = URL(string: "http://\(host.hostname):\(host.port)/power-limit") else {
             throw NSError(
                 domain: "MenubarApp", code: 1,
@@ -131,7 +138,10 @@ final class StatusPoller: ObservableObject {
         if !host.token.isEmpty {
             req.setValue("Bearer \(host.token)", forHTTPHeaderField: "Authorization")
         }
-        let body: [String: Any] = ["power_limit_w": watts ?? NSNull()]
+        var body: [String: Any] = ["power_limit_w": watts ?? NSNull()]
+        if let gpuIndex {
+            body["gpu_index"] = gpuIndex
+        }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
