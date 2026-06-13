@@ -1532,7 +1532,11 @@ class TraceLogTests(unittest.TestCase):
 
 SWITCH_CATALOG = {
     "variants": {
-        "eng/prod": {"status": "production", "model": "m1"},
+        "eng/prod": {
+            "status": "production",
+            "model": "m1",
+            "compose_path": "models/m1/eng/compose/dual/autoround-int4/fp8.yml",
+        },
         "eng/cav": {"status": "caveats", "model": "m1"},
         "eng/exp": {"status": "experimental", "model": "m1"},
     },
@@ -1587,6 +1591,32 @@ class ValidateSwitchTests(unittest.TestCase):
 
 
 class SwitchModelTests(unittest.TestCase):
+    def test_parses_setup_hint_from_preflight(self):
+        hint = aipc_observer.parse_setup_hint(
+            "preflight: MODEL_DIR=/models WEIGHT_KEY=m1:autoround-int4 "
+            "bash scripts/setup.sh m1"
+        )
+        self.assertEqual(hint["model"], "m1")
+        self.assertEqual(hint["weight_key"], "m1:autoround-int4")
+        self.assertEqual(hint["model_dir"], "/models")
+
+    def test_infers_setup_from_variant_compose_path(self):
+        hint = aipc_observer.infer_variant_setup(
+            SWITCH_CATALOG["variants"]["eng/prod"]
+        )
+        self.assertEqual(hint["model"], "m1")
+        self.assertEqual(hint["weight_key"], "m1:autoround-int4")
+
+    def test_install_variant_assets_runs_setup_with_weight_key(self):
+        runner = FakeRunner()
+        result = aipc_observer.install_variant_assets(
+            "/repo", "eng/prod", SWITCH_CATALOG, runner=runner)
+        call = runner.calls[0]
+        self.assertTrue(result["installed"])
+        self.assertEqual(call["cmd"][-3:], ["bash", "scripts/setup.sh", "m1"])
+        self.assertEqual(call["cwd"], "/repo")
+        self.assertEqual(call["env"]["WEIGHT_KEY"], "m1:autoround-int4")
+
     def test_runs_switch_sh_with_port_env(self):
         runner = FakeRunner()
         aipc_observer.switch_model("/repo", "eng/prod", 8020, runner=runner)
@@ -1660,14 +1690,20 @@ class SwitchWorkerTests(unittest.TestCase):
 
     def test_failed_switch_reports_error_and_releases_lock(self):
         def failing_runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
-            raise RuntimeError("preflight: not enough free VRAM")
+            raise RuntimeError(
+                "preflight: MODEL_DIR=/models WEIGHT_KEY=m1:autoround-int4 "
+                "bash scripts/setup.sh m1"
+            )
 
         aipc_observer._switch_worker("/repo", "eng/prod", "baseline", 8020,
                                      False, runner=failing_runner)
         status = aipc_observer.state.control_status
         self.assertTrue(status["done"])
         self.assertFalse(status["ok"])
-        self.assertIn("not enough free VRAM", status["detail"])
+        self.assertIn("setup.sh m1", status["detail"])
+        self.assertEqual(status["install_hint"]["model"], "m1")
+        self.assertEqual(status["install_hint"]["weight_key"], "m1:autoround-int4")
+        self.assertEqual(status["install_hint"]["variant"], "eng/prod")
         self.assertFalse(aipc_observer._control_lock.locked())
 
     def test_snapshot_reports_control_fields(self):
