@@ -678,6 +678,7 @@ def inspect_container(name):
         "flags": summarize_command(cmd),
         "help": help_info,
         "command_guide": command_guide(cmd, help_index),
+        "project": labels.get("com.docker.compose.project"),
         "service": labels.get("com.docker.compose.service"),
         "working_dir": labels.get("com.docker.compose.project.working_dir"),
     }
@@ -1073,6 +1074,47 @@ def restart_model(preset_name, model_info=None, runner=_run,
     )
     return {"restarted": True, "preset": preset_name,
             "variant": mi.get("variant")}
+
+
+def _compose_file_args(compose_file):
+    files = [p.strip() for p in (compose_file or "").split(",") if p.strip()]
+    args = []
+    for path in files:
+        args.extend(["-f", path])
+    return args
+
+
+def stop_model(model_info=None, repo=None, runner=_run):
+    """Stop the running model compose project without starting a replacement."""
+    repo = repo if repo is not None else _config.get("model_repo")
+    if repo:
+        switch_script = os.path.join(repo, "scripts", "switch.sh")
+        if os.path.exists(switch_script):
+            audit("stop", f"repo={repo} via switch.sh --down")
+            runner(
+                _repo_owner_cmd(repo, ["bash", "scripts/switch.sh", "--down"]),
+                env=dict(os.environ),
+                cwd=repo,
+                timeout=300,
+            )
+            return {"stopped": True, "detail": "club-3090 switch.sh --down ran"}
+
+    mi = model_info if model_info is not None else state.model_info
+    if not mi or not mi.get("container"):
+        return {"stopped": False, "detail": "model container is not running"}
+    missing = [k for k in ("compose_file", "working_dir") if not mi.get(k)]
+    if missing:
+        raise RuntimeError(f"model info incomplete ({', '.join(missing)}); "
+                           "cannot identify compose project to stop")
+    cmd = ["docker", "compose"]
+    if mi.get("project"):
+        cmd.extend(["--project-name", mi["project"]])
+    cmd.extend(_compose_file_args(mi["compose_file"]))
+    cmd.append("down")
+    audit("stop", f"variant={mi.get('variant')} container={mi.get('container')}")
+    runner(cmd, env=_compose_env(mi), cwd=mi["working_dir"], timeout=300)
+    return {"stopped": True, "variant": mi.get("variant"),
+            "container": mi.get("container")}
 
 
 def update_repo(repo):
@@ -1928,7 +1970,7 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
 <div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · insight: +metrics/props/trace logs · insight-cache: insight + cache-ram 8192">
 <option value="baseline">baseline</option><option value="insight">insight</option><option value="insight-cache" selected>insight+cache</option><option value="insight-debug">insight+debug</option>
-</select><button class="btn" onclick="doRestart()">Restart model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
+</select><button class="btn" onclick="doRestart()">Restart model</button><button class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
@@ -1999,6 +2041,7 @@ async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
 function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});return `restarted with ${r.preset} (model reloading…)`})}
+function doStop(){let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Stop model serving on this host?${warn}`,async()=>{let r=await ctlPost('/observer/api/stop',{force:lastActive>0});return r.stopped?`stopped ${r.container||'model'}`:(r.detail||'already stopped')})}
 function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
 if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
@@ -2178,7 +2221,7 @@ def handle_observer_post(handler):
     """
     path = handler.path.split("?", 1)[0]
     if path not in ("/observer/api/update", "/observer/api/restart",
-                    "/observer/api/switch"):
+                    "/observer/api/stop", "/observer/api/switch"):
         return False
     body = {}
     length = int(handler.headers.get("Content-Length") or 0)
@@ -2203,6 +2246,9 @@ def handle_observer_post(handler):
                 return True
             result = update_repo(repo)
             _repo_wake.set()
+        elif path == "/observer/api/stop":
+            check_restart_allowed(state, force=bool(body.get("force")))
+            result = stop_model(repo=_config.get("model_repo"))
         elif path == "/observer/api/switch":
             repo = _config.get("model_repo")
             if not repo:

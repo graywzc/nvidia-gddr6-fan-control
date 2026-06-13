@@ -1016,6 +1016,7 @@ MODEL_INFO = {
     "working_dir": "/repo/models/m/eng/compose/single/q",
     "command": ["--ctx-size", "102400"],
     "variant": "m/eng/single/q/dflash",
+    "project": "q",
     "host_port": "8020",
     "model_dir": "/home/u/models",
     "gpu_ids": "0",
@@ -1136,6 +1137,47 @@ class RestartModelTests(unittest.TestCase):
         svc = ov["services"]["svc"]
         self.assertEqual(svc["image"], "img:1")
         self.assertNotIn("command", svc)
+
+
+class StopModelTests(unittest.TestCase):
+    def test_stop_prefers_club3090_switch_down_when_available(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as repo:
+            scripts = os.path.join(repo, "scripts")
+            os.mkdir(scripts)
+            open(os.path.join(scripts, "switch.sh"), "w").close()
+            runner = FakeRunner()
+            result = aipc_observer.stop_model(repo=repo, runner=runner)
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["detail"], "club-3090 switch.sh --down ran")
+        self.assertEqual(runner.calls[0]["cmd"][-3:], ["bash", "scripts/switch.sh", "--down"])
+
+    def test_stop_uses_compose_project_and_all_config_files(self):
+        runner = FakeRunner()
+        mi = dict(MODEL_INFO)
+        mi["compose_file"] = "/repo/base.yml,/tmp/override.yml"
+        result = aipc_observer.stop_model(model_info=mi, repo="", runner=runner)
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["container"], MODEL_INFO["container"])
+        self.assertEqual(
+            runner.calls[0]["cmd"],
+            [
+                "docker", "compose", "--project-name", "q",
+                "-f", "/repo/base.yml", "-f", "/tmp/override.yml", "down",
+            ],
+        )
+        self.assertEqual(runner.calls[0]["cwd"], MODEL_INFO["working_dir"])
+        env = runner.calls[0]["env"]
+        self.assertEqual(env["PORT"], "8020")
+        self.assertEqual(env["ESTATE_CONTAINER"], MODEL_INFO["container"])
+
+    def test_stop_is_noop_without_running_container(self):
+        runner = FakeRunner()
+        result = aipc_observer.stop_model(model_info={}, repo="", runner=runner)
+        self.assertFalse(result["stopped"])
+        self.assertEqual(runner.calls, [])
 
 
 class UpdateRepoTests(unittest.TestCase):
