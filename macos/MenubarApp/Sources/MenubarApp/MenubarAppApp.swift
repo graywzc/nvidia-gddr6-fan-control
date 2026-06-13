@@ -92,8 +92,14 @@ private final class StatusItemController: NSObject {
 
     private func updateStatusTitle(hosts: [Host], states: [UUID: HostState]) {
         let parts = hosts.map { host in
-            if let temp = states[host.id]?.lastPayload?.vramTempC {
-                return "\(temp)°"
+            if let payload = states[host.id]?.lastPayload {
+                let temps = payload.displayGPUs.compactMap { gpu -> String? in
+                    guard let temp = gpu.vramTempC else { return nil }
+                    return "\(temp)°"
+                }
+                if !temps.isEmpty {
+                    return temps.joined(separator: "/")
+                }
             }
             return "-"
         }

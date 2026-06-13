@@ -102,33 +102,11 @@ private struct HostRow: View {
                     .buttonStyle(.borderless)
                     .help("Remove host")
                 }
-                if let p = state?.lastPayload, let t = p.vramTempC {
-                    HStack(spacing: 12) {
-                        Text("\(t)°")
-                            .font(.system(size: 22, weight: .semibold, design: .rounded))
-                            .foregroundColor(colorFor(temp: t))
-                            .frame(width: 72, alignment: .leading)
-                            .lineLimit(1)
-                        if let fp = p.fanPct {
-                            MetricText("fan \(fp)%", width: 76)
+                if let p = state?.lastPayload, !p.displayGPUs.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(p.displayGPUs) { gpu in
+                            GPUStatusRow(gpu: gpu, isStale: state?.isStale == true)
                         }
-                        if let pw = p.powerW {
-                            MetricText("\(Int(pw.rounded()))W", width: 58)
-                        }
-                        if let limit = p.powerLimitW {
-                            MetricText("cap \(Int(limit.rounded()))W", width: 92)
-                        }
-                        if let util = p.gpuUtilPct {
-                            MetricText("gpu \(util)%", width: 76)
-                        }
-                        if state?.isStale == true {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .foregroundColor(.yellow)
-                                .help("Stale data")
-                        }
-                    }
-                    if let gpu = p.gpuName {
-                        Text(gpu).font(.caption).foregroundColor(.secondary)
                     }
                 } else if let err = state?.lastError {
                     Text("Unreachable").foregroundColor(.red).font(.caption)
@@ -152,6 +130,59 @@ private struct HostRow: View {
             openHostDashboard(host)
         }
         .help("Open observer dashboard")
+    }
+}
+
+private struct GPUStatusRow: View {
+    let gpu: GPUStatusPayload
+    let isStale: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 12) {
+                Text(tempText)
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .foregroundColor(tempColor)
+                    .frame(width: 72, alignment: .leading)
+                    .lineLimit(1)
+                if let fp = gpu.fanPct {
+                    MetricText("fan \(fp)%", width: 76)
+                }
+                if let pw = gpu.powerW {
+                    MetricText("\(Int(pw.rounded()))W", width: 58)
+                }
+                if let limit = gpu.powerLimitW {
+                    MetricText("cap \(Int(limit.rounded()))W", width: 92)
+                }
+                if let util = gpu.gpuUtilPct {
+                    MetricText("gpu \(util)%", width: 76)
+                }
+                if isStale {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.yellow)
+                        .help("Stale data")
+                }
+            }
+            Text(nameText)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+        }
+    }
+
+    private var tempText: String {
+        guard let t = gpu.vramTempC else { return "--°" }
+        return "\(t)°"
+    }
+
+    private var tempColor: Color {
+        guard let t = gpu.vramTempC else { return .secondary }
+        return colorFor(temp: t)
+    }
+
+    private var nameText: String {
+        let gpuName = gpu.name ?? "GPU"
+        return "GPU \(gpu.index): \(gpuName)"
     }
 }
 
