@@ -59,9 +59,40 @@ class GetUtilizationTests(unittest.TestCase):
             nvml.get_utilization_pct(ctypes.c_void_p())
 
 
+class ResolveGpuTargetsTests(unittest.TestCase):
+    def test_all_expands_to_every_device(self):
+        self.assertEqual(
+            fan_control.resolve_gpu_targets("all", 2), [(0, 0), (1, 1)]
+        )
+
+    def test_all_on_single_gpu_host_is_unchanged(self):
+        self.assertEqual(fan_control.resolve_gpu_targets("all", 1), [(0, 0)])
+
+    def test_explicit_comma_list(self):
+        self.assertEqual(
+            fan_control.resolve_gpu_targets("0,1", 4), [(0, 0), (1, 1)]
+        )
+
+    def test_single_gpu_back_compat(self):
+        # --gpu N controls only N; vram index defaults to N.
+        self.assertEqual(
+            fan_control.resolve_gpu_targets("all", 2, single_gpu=1), [(1, 1)]
+        )
+
+    def test_single_gpu_honours_explicit_vram_index(self):
+        self.assertEqual(
+            fan_control.resolve_gpu_targets(
+                "all", 2, single_gpu=1, single_vram_index=0),
+            [(1, 0)],
+        )
+
+
 class StateTests(unittest.TestCase):
     def test_gpu_util_pct_defaults_to_none(self):
         self.assertIsNone(fan_control.State().snapshot()["gpu_util_pct"])
+
+    def test_gpus_list_defaults_empty(self):
+        self.assertEqual(fan_control.State().snapshot()["gpus"], [])
 
     def test_gpu_util_pct_round_trips_through_update(self):
         state = fan_control.State()
