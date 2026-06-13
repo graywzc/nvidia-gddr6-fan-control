@@ -1096,13 +1096,52 @@ def compose_baseline_command(compose_file, service, env, cwd, runner=_run):
     return [str(tok) for tok in command]
 
 
+def _supported_flags(model_info, help_getter=inspect_container_help):
+    """Flags the running build's --help advertises, or None when unknown.
+
+    Returns None — so callers fail open and apply the preset unchanged — when
+    the container can't be inspected. Dropping a flag only happens on a
+    positively parsed help screen, never on missing information.
+    """
+    name = (model_info or {}).get("container")
+    if not name:
+        return None
+    help_info = help_getter(name, (model_info or {}).get("entrypoint"))
+    flags = (help_info or {}).get("flags") or {}
+    if not flags or (help_info or {}).get("error"):
+        return None
+    return set(flags)
+
+
+def filter_preset_tweaks(tweaks, supported):
+    """Drop preset flags the build doesn't list in --help; keep all if unknown.
+
+    Insight presets are tuned for the beellama/llama.cpp build; other forks
+    (e.g. ik-llama) reject flags like --log-verbosity and exit non-zero, which
+    docker's restart policy turns into a crash loop. Filtering against the
+    build's own --help keeps the flags it does support (--metrics, --props,
+    --cache-ram on ik-llama) and silently drops the rest.
+    """
+    if supported is None:
+        return list(tweaks), []
+    kept, dropped = [], []
+    for flag, value in tweaks:
+        if flag in supported or normalize_preset_flag(flag) in supported:
+            kept.append((flag, value))
+        else:
+            dropped.append(flag)
+    return kept, dropped
+
+
 def restart_model(preset_name, model_info=None, runner=_run,
-                  override_path=OVERRIDE_FILE):
+                  override_path=OVERRIDE_FILE, help_getter=inspect_container_help):
     """Recreate the model container with an insight preset applied.
 
     Presets always build on the compose file's own command (resolved via
     `docker compose config`), never the running container's — so switching
-    insight -> baseline sheds flags instead of accumulating them.
+    insight -> baseline sheds flags instead of accumulating them. Preset flags
+    the running build doesn't advertise in --help are dropped rather than
+    crash-looping the server (see filter_preset_tweaks).
     """
     tweaks = INSIGHT_PRESETS.get(preset_name)
     if tweaks is None:
@@ -1118,10 +1157,13 @@ def restart_model(preset_name, model_info=None, runner=_run,
     env = _compose_env(mi)
     cwd = mi["working_dir"]
     argv = None
+    dropped = []
     if preset_name != "baseline":
         baseline = compose_baseline_command(compose_file, mi["service"], env,
                                             cwd, runner=runner)
-        argv = apply_preset_to_command(baseline, tweaks)
+        kept, dropped = filter_preset_tweaks(
+            tweaks, _supported_flags(mi, help_getter))
+        argv = apply_preset_to_command(baseline, kept)
     # Always pin the running image: launchers may have injected a different
     # image (e.g. BEELLAMA_IMAGE) than the compose file's fallback, and a
     # restart must never silently switch images.
@@ -1131,14 +1173,17 @@ def restart_model(preset_name, model_info=None, runner=_run,
             f, indent=1,
         )
     os.chmod(override_path, 0o644)
-    audit("restart", f"preset={preset_name} variant={mi.get('variant')}")
+    detail = f"preset={preset_name} variant={mi.get('variant')}"
+    if dropped:
+        detail += f" dropped={','.join(dropped)}"
+    audit("restart", detail)
     runner(
         ["docker", "compose", "-f", compose_file, "-f", override_path,
          "up", "-d", "--remove-orphans"],
         env=env, cwd=cwd,
     )
     return {"restarted": True, "preset": preset_name,
-            "variant": mi.get("variant")}
+            "variant": mi.get("variant"), "dropped_flags": dropped}
 
 
 def _compose_file_args(compose_file):
@@ -1297,10 +1342,14 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                       "rotation (one more model reload)…"
         )
         info = (info_getter or _wait_for_model_info)(monitor_port)
-        restart_model(preset, model_info=info, runner=runner,
-                      override_path=override_path)
+        result = restart_model(preset, model_info=info, runner=runner,
+                               override_path=override_path)
+        dropped = result.get("dropped_flags") or []
+        note = (f" — dropped unsupported {', '.join(dropped)}"
+                if dropped else "")
         _set_control_status(
-            "switch", f"switched to {variant} (preset {preset})", done=True, ok=True
+            "switch", f"switched to {variant} (preset {preset}){note}",
+            done=True, ok=True
         )
         audit("switch-done", f"variant={variant} preset={preset}")
     except Exception as e:
@@ -2124,7 +2173,7 @@ el.innerHTML=rows}
 async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
-function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});return `restarted with ${r.preset} (model reloading…)`})}
+function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});let dr=(r.dropped_flags||[]).length?` (dropped ${r.dropped_flags.join(', ')} — unsupported by this build)`:'';return `restarted with ${r.preset}${dr} (model reloading…)`})}
 function doStop(){let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Stop model serving on this host?${warn}`,async()=>{let r=await ctlPost('/observer/api/stop',{force:lastActive>0});return r.stopped?`stopped ${r.container||'model'}`:(r.detail||'already stopped')})}
 function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
