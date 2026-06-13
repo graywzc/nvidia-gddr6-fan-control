@@ -10,14 +10,27 @@ struct CurveEditor: View {
     @State private var statusMessage: String? = nil
     @State private var statusIsError: Bool = false
     @State private var isApplying: Bool = false
+    @State private var selectedGPUIndex: Int? = nil
 
     private var host: Host? { poller.hosts.first { $0.id == hostID } }
-    private var currentTemp: Int? { poller.states[hostID]?.lastPayload?.vramTempC }
-    private var currentFanPct: Int? { poller.states[hostID]?.lastPayload?.fanPct }
+    private var payload: HostStatusPayload? { poller.states[hostID]?.lastPayload }
+    private var availableGPUs: [GPUStatusPayload] { payload?.displayGPUs ?? [] }
+    private var selectedGPU: GPUStatusPayload? {
+        if let selectedGPUIndex,
+           let gpu = availableGPUs.first(where: { $0.index == selectedGPUIndex }) {
+            return gpu
+        }
+        return availableGPUs.first
+    }
+    private var currentTemp: Int? { selectedGPU?.vramTempC ?? payload?.vramTempC }
+    private var currentFanPct: Int? { selectedGPU?.fanPct ?? payload?.fanPct }
+    private var currentCurve: [[Double]]? { selectedGPU?.curve ?? payload?.curve }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
+
+            gpuPicker
 
             CurveChart(points: localCurve, currentTemp: currentTemp)
                 .frame(height: 140)
@@ -77,7 +90,15 @@ struct CurveEditor: View {
         }
         .padding(16)
         .frame(minWidth: 460, minHeight: 460)
-        .onAppear(perform: loadFromHost)
+        .onAppear {
+            syncSelectedGPU()
+            loadFromHost()
+        }
+        .onChange(of: selectedGPUIndex) { _ in
+            if !isApplying {
+                loadFromHost()
+            }
+        }
     }
 
     // MARK: - Subviews
@@ -86,7 +107,7 @@ struct CurveEditor: View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(host?.name ?? "—").font(.headline)
-                if let gpu = poller.states[hostID]?.lastPayload?.gpuName {
+                if let gpu = selectedGPU?.name ?? payload?.gpuName {
                     Text(gpu).font(.caption).foregroundColor(.secondary)
                 }
             }
@@ -104,10 +125,35 @@ struct CurveEditor: View {
         }
     }
 
+    private var gpuPicker: some View {
+        Group {
+            if availableGPUs.count > 1 {
+                Picker("GPU", selection: selectedGPUBinding) {
+                    ForEach(availableGPUs) { gpu in
+                        Text("GPU \(gpu.index)").tag(gpu.index)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+        }
+    }
+
+    private var selectedGPUBinding: Binding<Int> {
+        Binding(
+            get: { selectedGPU?.index ?? availableGPUs.first?.index ?? 0 },
+            set: { selectedGPUIndex = $0 }
+        )
+    }
+
     // MARK: - Logic
 
+    private func syncSelectedGPU() {
+        guard selectedGPUIndex == nil else { return }
+        selectedGPUIndex = availableGPUs.first?.index
+    }
+
     private func loadFromHost() {
-        guard let live = poller.states[hostID]?.lastPayload?.curve else { return }
+        guard let live = currentCurve else { return }
         localCurve = live.map { p in
             [Int(p[0].rounded()), Int(p[1].rounded())]
         }
@@ -146,13 +192,15 @@ struct CurveEditor: View {
         localCurve = sorted
 
         guard let host = host else { return }
+        let gpuIndex = payload?.gpus?.isEmpty == false ? selectedGPU?.index : nil
         isApplying = true
         statusMessage = nil
         let curveCopy = sorted
         Task {
             do {
-                try await poller.putCurve(host: host, curve: curveCopy)
-                statusMessage = "Applied at \(timeString())"
+                try await poller.putCurve(host: host, curve: curveCopy, gpuIndex: gpuIndex)
+                let target = selectedGPU.map { "GPU \($0.index)" } ?? "GPU"
+                statusMessage = "Applied to \(target) at \(timeString())"
                 statusIsError = false
             } catch {
                 statusMessage = "Error: \(error.localizedDescription)"
