@@ -93,6 +93,23 @@ class PowerLimitValidationTests(unittest.TestCase):
             240.5,
         )
 
+    def test_accepts_object_with_gpu_index(self):
+        state = {
+            "gpus": [
+                {"index": 0, "power_limit_min_w": 100, "power_limit_max_w": 450},
+                {"index": 1, "power_limit_min_w": 150, "power_limit_max_w": 320},
+            ]
+        }
+        self.assertEqual(
+            fan_control.request_gpu_index({"gpu_index": 1, "power_limit_w": 240}),
+            1,
+        )
+        self.assertEqual(
+            fan_control.validate_power_limit_request(
+                {"gpu_index": 1, "power_limit_w": 240}, state, gpu_index=1),
+            240.0,
+        )
+
     def test_accepts_null_for_default(self):
         self.assertIsNone(fan_control.validate_power_limit_request(None, {}))
 
@@ -103,6 +120,23 @@ class PowerLimitValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fan_control.validate_power_limit_request(500, state)
 
+    def test_rejects_gpu_specific_out_of_range(self):
+        state = {
+            "gpus": [
+                {"index": 0, "power_limit_min_w": 100, "power_limit_max_w": 450},
+                {"index": 1, "power_limit_min_w": 150, "power_limit_max_w": 320},
+            ]
+        }
+        with self.assertRaises(ValueError):
+            fan_control.validate_power_limit_request(
+                {"gpu_index": 1, "power_limit_w": 340}, state, gpu_index=1)
+
+    def test_rejects_unknown_gpu_index(self):
+        state = {"gpus": [{"index": 0}]}
+        with self.assertRaises(ValueError):
+            fan_control.validate_power_limit_request(
+                {"gpu_index": 2, "power_limit_w": 240}, state, gpu_index=2)
+
     def test_state_defaults_include_power_limit_fields(self):
         snap = fan_control.State().snapshot()
         self.assertIsNone(snap["power_limit_w"])
@@ -110,6 +144,7 @@ class PowerLimitValidationTests(unittest.TestCase):
         self.assertIsNone(snap["power_limit_max_w"])
         self.assertIsNone(snap["power_limit_default_w"])
         self.assertIsNone(snap["tdp_w"])
+        self.assertEqual(snap["power_limits"], {})
 
 
 class PowerLimitHTTPTests(unittest.TestCase):
