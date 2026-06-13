@@ -86,6 +86,7 @@ class ObserverState:
         # recommendation diff between local HEAD and the fetched upstream.
         self.catalog = {}
         self.catalog_diff = {}
+        self.installed_assets = {}
         # Latest scrape of the llama.cpp Prometheus /metrics endpoint.
         self.metrics = {}
         # Progress of the current/last async control action (model switch).
@@ -215,6 +216,13 @@ class ObserverState:
         with self.lock:
             self.catalog_diff = dict(diff)
 
+    def mark_assets_installed(self, variant, detail=None):
+        with self.lock:
+            self.installed_assets[str(variant)] = {
+                "installed_at": time.time(),
+                **(detail or {}),
+            }
+
     def set_metrics(self, metrics):
         with self.lock:
             self.metrics = dict(metrics)
@@ -283,6 +291,7 @@ class ObserverState:
                 "repo_info": dict(self.repo_info),
                 "catalog": dict(self.catalog),
                 "catalog_diff": dict(self.catalog_diff),
+                "installed_assets": dict(self.installed_assets),
                 "metrics": dict(self.metrics),
                 "control_status": dict(self.control_status),
                 "control_busy": _control_lock.locked(),
@@ -1647,15 +1656,21 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
         result = install_variant_assets(
             repo, variant, state.catalog, setup=setup, runner=runner,
             progress=progress)
+        state.mark_assets_installed(variant, {
+            k: v for k, v in result.items()
+            if k in ("model", "model_dir", "weight_key")
+        })
+        state.notify_subscribers()
         if not retry:
             _set_control_status(
                 "install", f"installed assets for {variant}",
-                done=True, ok=True,
+                done=True, ok=True, installed_variant=variant,
             )
             audit("install-done", f"variant={variant}")
             return
         _set_control_status(
-            "install", f"installed assets for {variant}; retrying switch…"
+            "install", f"installed assets for {variant}; retrying switch…",
+            installed_variant=variant,
         )
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
         _set_control_status(
@@ -2464,7 +2479,7 @@ function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
 let lastBusy=false;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doInstallVariant('${esc(h.variant)}','${esc(h.preset||selectedPreset())}',${h.force?'true':'false'},true,'${esc(h.model||'')}','${esc(h.weight_key||'')}','${esc(h.model_dir||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
@@ -2504,16 +2519,17 @@ function variantDoc(v){return v.doc||{}}
 function variantCtx(v){let doc=variantDoc(v);return doc.max_ctx_doc||`${v.max_ctx?Number(v.max_ctx).toLocaleString():'-'}`}
 function variantTps(v){return variantDoc(v).tps||'-'}
 function variantWhy(v){return variantDoc(v).why||v.status_note||''}
-function renderVariantListModal(d,fits,runKey,running){let c=d.catalog||{};let vars=c.variants||{};let defSet=new Set(Object.values(c.defaults||{}));let order={production:0,caveats:1};
+function renderVariantListModal(d,fits,runKey,running){let c=d.catalog||{};let vars=c.variants||{};let installed=d.installed_assets||{};let defSet=new Set(Object.values(c.defaults||{}));let order={production:0,caveats:1};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let rows='<div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let install=`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`;
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let install=installed[k]?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`;
 return `<div class="variant-row"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${install}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`Variants for this machine (${fits.length})`;
 document.getElementById('variantModalBody').innerHTML=rows;
 }
 function openVariantList(){if(!lastRenderData)return;let d=lastRenderData;let c=d.catalog||{};let vars=c.variants||{};let keys=Object.keys(vars);let mi=d.model_info||{};let running=!!d.container;let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;let ngpu=(d.gpu_stats||[]).length||1;let reqGpus=p=>p.indexOf('/multi4/')>=0?4:(p.indexOf('/dual/')>=0?2:1);let fits=keys.filter(k=>reqGpus(vars[k].compose_path||'')<=ngpu&&(vars[k].tp||1)<=ngpu);renderVariantListModal(d,fits,runKey,running);document.getElementById('variantModal').classList.add('open')}
+function refreshVariantListIfOpen(){let m=document.getElementById('variantModal');if(m&&m.classList.contains('open'))openVariantList()}
 function closeVariantList(){document.getElementById('variantModal').classList.remove('open')}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
 if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
