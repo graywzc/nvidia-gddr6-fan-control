@@ -1247,6 +1247,32 @@ class UpdateRepoTests(unittest.TestCase):
             aipc_observer.update_repo(self.clone)
 
 
+class RepoGitHardeningTests(unittest.TestCase):
+    """A stalled git must fail fast, not wedge the control lock forever."""
+
+    def test_timeout_raises_quickly_despite_surviving_child(self):
+        import time
+
+        # Stand in for the runuser -> git -> ssh tree: a shell that backgrounds
+        # a grandchild inheriting the stdout pipe, then blocks. Killing only the
+        # direct child would leave the grandchild holding the pipe so
+        # communicate() hangs past the timeout; the process-group kill must reap
+        # the whole tree.
+        hang = ["sh", "-c", "sleep 30 & sleep 30"]
+        orig = aipc_observer._repo_owner_cmd
+        aipc_observer._repo_owner_cmd = lambda repo, cmd: hang
+        try:
+            start = time.monotonic()
+            with self.assertRaises(RuntimeError) as ctx:
+                aipc_observer.repo_git("/tmp", "fetch", timeout=1)
+            elapsed = time.monotonic() - start
+        finally:
+            aipc_observer._repo_owner_cmd = orig
+        self.assertIn("timed out", str(ctx.exception))
+        # Must not block anywhere near the 30s the command would otherwise run.
+        self.assertLess(elapsed, 8.0)
+
+
 PROMETHEUS_SAMPLE = """\
 # HELP llamacpp:prompt_tokens_total Number of prompt tokens processed.
 # TYPE llamacpp:prompt_tokens_total counter

@@ -12,6 +12,7 @@ import os
 import pwd
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -732,13 +733,58 @@ def _repo_owner_cmd(repo, cmd):
     return cmd
 
 
+# Make git non-interactive so a control action can never block on a prompt,
+# and make the network give up quickly instead of stalling: a hung fetch used
+# to wedge the single _control_lock forever (the daemon captured git's pipes
+# through a runuser wrapper, so subprocess.run's timeout could not reap the
+# surviving ssh child and communicate() blocked past the timeout).
+_GIT_NONINTERACTIVE_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_SSH_COMMAND": (
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "
+        "-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+    ),
+}
+
+
+def _kill_process_group(proc):
+    """SIGKILL the child's whole process group, reaping orphaned ssh/git."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def repo_git(repo, *args, timeout=60):
-    """Run git in the model repo, dropping to the repo owner when root."""
+    """Run git in the model repo, dropping to the repo owner when root.
+
+    Hardened so a stalled remote can never wedge a control action: git runs
+    non-interactively with stdin closed (no credential/host-key prompt can
+    block), and in its own process group so a timeout SIGKILLs the whole tree
+    -- including any orphaned ssh -- instead of blocking forever on a surviving
+    grandchild that still holds the output pipe.
+    """
     cmd = _repo_owner_cmd(repo, ["git", "-C", repo, *args])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or f"git {args[0]} failed")
-    return result.stdout.strip()
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env={**os.environ, **_GIT_NONINTERACTIVE_ENV}, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        raise RuntimeError(f"git {args[0]} timed out after {timeout}s (killed)")
+    if proc.returncode != 0:
+        raise RuntimeError((err or "").strip() or f"git {args[0]} failed")
+    return (out or "").strip()
 
 
 def collect_repo_info(repo, fetch=True):
