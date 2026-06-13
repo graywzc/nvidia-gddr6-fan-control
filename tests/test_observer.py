@@ -2,6 +2,7 @@
 """Tests for integrated aipc observer request parsing."""
 
 import json
+import sys
 import time
 import unittest
 
@@ -682,6 +683,15 @@ usage: llama-server [options]
         snap = state.snapshot()
         self.assertEqual(snap["catalog"]["variants"]["e/v"]["status"], "production")
         self.assertEqual(snap["catalog_diff"]["added"], ["e/w"])
+
+    def test_snapshot_includes_installed_assets(self):
+        state = aipc_observer.ObserverState()
+        state.mark_assets_installed("eng/prod", {"weight_key": "m1:aq4"})
+        snap = state.snapshot()
+        self.assertEqual(
+            snap["installed_assets"]["eng/prod"]["weight_key"],
+            "m1:aq4",
+        )
 
 
 class CatalogDiffTests(unittest.TestCase):
@@ -1617,6 +1627,16 @@ class SwitchModelTests(unittest.TestCase):
         self.assertEqual(call["cwd"], "/repo")
         self.assertEqual(call["env"]["WEIGHT_KEY"], "m1:autoround-int4")
 
+    def test_run_with_progress_reports_output_lines(self):
+        lines = []
+        output = aipc_observer._run_with_progress(
+            [sys.executable, "-c", "print('setup one'); print('setup two')"],
+            timeout=10,
+            on_line=lines.append,
+        )
+        self.assertEqual(lines, ["setup one", "setup two"])
+        self.assertIn("setup two", output)
+
     def test_runs_switch_sh_with_port_env(self):
         runner = FakeRunner()
         aipc_observer.switch_model("/repo", "eng/prod", 8020, runner=runner)
@@ -1642,6 +1662,7 @@ class SwitchWorkerTests(unittest.TestCase):
         # endpoint does before handing off.
         self.assertTrue(aipc_observer._control_lock.acquire(blocking=False))
         self.saved_status = aipc_observer.state.control_status
+        self.saved_installed_assets = dict(aipc_observer.state.installed_assets)
         # Never touch the real OVERRIDE_FILE: on the deploy host it exists
         # root-owned (written by the daemon), so tests must use their own.
         tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
@@ -1654,6 +1675,7 @@ class SwitchWorkerTests(unittest.TestCase):
         if aipc_observer._control_lock.locked():
             aipc_observer._control_lock.release()
         aipc_observer.state.set_control_status(self.saved_status)
+        aipc_observer.state.installed_assets = self.saved_installed_assets
         os.unlink(self.override_path)
 
     def test_baseline_switch_still_reups_for_log_rotation(self):
@@ -1704,6 +1726,23 @@ class SwitchWorkerTests(unittest.TestCase):
         self.assertEqual(status["install_hint"]["model"], "m1")
         self.assertEqual(status["install_hint"]["weight_key"], "m1:autoround-int4")
         self.assertEqual(status["install_hint"]["variant"], "eng/prod")
+        self.assertFalse(aipc_observer._control_lock.locked())
+
+    def test_install_worker_marks_variant_installed(self):
+        runner = FakeRunner()
+        aipc_observer.state.set_catalog(SWITCH_CATALOG)
+        aipc_observer._install_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, False,
+            {}, runner=runner,
+        )
+        status = aipc_observer.state.control_status
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["installed_variant"], "eng/prod")
+        self.assertIn("eng/prod", aipc_observer.state.installed_assets)
+        self.assertEqual(
+            aipc_observer.state.installed_assets["eng/prod"]["weight_key"],
+            "m1:autoround-int4",
+        )
         self.assertFalse(aipc_observer._control_lock.locked())
 
     def test_snapshot_reports_control_fields(self):
