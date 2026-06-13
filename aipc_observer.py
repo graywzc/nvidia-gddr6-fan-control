@@ -175,6 +175,24 @@ class ObserverState:
                 elif now - req.get("start_time", now) > SLOTS_POLL_INTERVAL * 2:
                     del self.active_requests[task_id]
 
+    def prune_inactive_requests(self):
+        """Drop stale active rows when no matching slot is processing.
+
+        This is the control-plane guard companion to enrich_active_from_slots().
+        If a stop/restart request arrives between slot polls, the guard should
+        not be held hostage by a missed release log line when /slots already
+        shows the task is idle.
+        """
+        now = time.time()
+        processing = {s.get("id_task") for s in self.slots if s.get("is_processing")}
+        with self.lock:
+            for task_id in list(self.active_requests):
+                req = self.active_requests[task_id]
+                if task_id not in processing and (
+                    now - req.get("start_time", now)
+                ) > SLOTS_POLL_INTERVAL * 2:
+                    del self.active_requests[task_id]
+
     def set_vram_temps(self, mapping):
         with self.lock:
             self.vram_temps = dict(mapping)
@@ -976,6 +994,7 @@ def build_compose_override(service, argv=None, image=None):
 
 
 def check_restart_allowed(observer_state, force=False):
+    observer_state.prune_inactive_requests()
     active = len(observer_state.active_requests)
     if active and not force:
         raise RuntimeError(
