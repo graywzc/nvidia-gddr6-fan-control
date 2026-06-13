@@ -643,9 +643,13 @@ def inspect_container_help(name, entrypoint):
     except Exception as e:
         return {"error": str(e)}
     output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-    if result.returncode != 0:
-        return {"error": output.strip()[-400:] or "server --help failed"}
     index = parse_help_flags(output)
+    # Some builds (e.g. ik-llama) print a full, valid --help screen but still
+    # exit non-zero. Only treat it as a failure when nothing parseable came
+    # back -- otherwise the flag set is real and usable (it drives the flag
+    # guide and the build-aware preset filter in restart_model).
+    if not index:
+        return {"error": output.strip()[-400:] or "server --help failed"}
     return {
         "source": " ".join([*argv, "--help"]),
         "flag_count": len(index),
