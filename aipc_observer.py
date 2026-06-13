@@ -1179,6 +1179,17 @@ def validate_switch(variant, catalog, force=False):
     return entry
 
 
+def normalize_switch_variant(variant, catalog):
+    """Accept either a registry slug or a compose-derived variant path."""
+    variants = (catalog or {}).get("variants") or {}
+    if variant in variants:
+        return variant
+    for key, entry in variants.items():
+        if variant == variant_from_compose_path(entry.get("compose_path") or ""):
+            return key
+    return variant
+
+
 def switch_model(repo, variant, monitor_port, force=False, runner=_run):
     """Boot a different club-3090 variant via scripts/switch.sh.
 
@@ -2278,6 +2289,7 @@ def handle_observer_post(handler):
             force = bool(body.get("force"))
             if preset not in INSIGHT_PRESETS:
                 raise ValueError(f"unknown preset {preset!r}")
+            variant = normalize_switch_variant(variant, state.catalog)
             validate_switch(variant, state.catalog, force=force)
             check_restart_allowed(state, force=force)
             audit("switch", f"variant={variant} preset={preset} force={force}")

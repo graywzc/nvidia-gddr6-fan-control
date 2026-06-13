@@ -1416,6 +1416,32 @@ class ValidateSwitchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             aipc_observer.validate_switch("eng/prod", {})
 
+    def test_normalizes_compose_derived_variant_to_slug(self):
+        catalog = {
+            "variants": {
+                "beellama/dflash": {
+                    "status": "caveats",
+                    "compose_path": (
+                        "models/qwen3.6-27b/beellama/compose/single/"
+                        "beellama-q5ks-dflash/dflash.yml"
+                    ),
+                }
+            }
+        }
+        self.assertEqual(
+            aipc_observer.normalize_switch_variant(
+                "qwen3.6-27b/beellama/single/beellama-q5ks-dflash/dflash",
+                catalog,
+            ),
+            "beellama/dflash",
+        )
+
+    def test_normalize_leaves_unknown_variant_for_validator_error(self):
+        self.assertEqual(
+            aipc_observer.normalize_switch_variant("eng/nope", SWITCH_CATALOG),
+            "eng/nope",
+        )
+
 
 class SwitchModelTests(unittest.TestCase):
     def test_runs_switch_sh_with_port_env(self):
