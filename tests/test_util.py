@@ -94,12 +94,51 @@ class StateTests(unittest.TestCase):
     def test_gpus_list_defaults_empty(self):
         self.assertEqual(fan_control.State().snapshot()["gpus"], [])
 
+    def test_curves_default_empty(self):
+        snap = fan_control.State().snapshot()
+        self.assertEqual(snap["curves"], {})
+
+    def test_set_all_curves_updates_legacy_and_per_gpu_views(self):
+        state = fan_control.State()
+        curve = [[60, 40], [90, 80]]
+        state.set_all_curves([0, 1], curve)
+        snap = state.snapshot()
+        self.assertEqual(snap["curve"], curve)
+        self.assertEqual(snap["curves"], {"0": curve, "1": curve})
+
+    def test_set_gpu_curve_can_mirror_primary(self):
+        state = fan_control.State()
+        curve = [[60, 40], [90, 80]]
+        state.set_gpu_curve(1, curve)
+        self.assertIsNone(state.snapshot()["curve"])
+        state.set_gpu_curve(0, curve, mirror_primary=True)
+        snap = state.snapshot()
+        self.assertEqual(snap["curve"], curve)
+        self.assertEqual(snap["curves"], {"0": curve, "1": curve})
+
     def test_gpu_util_pct_round_trips_through_update(self):
         state = fan_control.State()
         state.update(vram_temp_c=88, gpu_util_pct=73)
         snap = state.snapshot()
         self.assertEqual(snap["vram_temp_c"], 88)
         self.assertEqual(snap["gpu_util_pct"], 73)
+
+
+class CurveRequestTests(unittest.TestCase):
+    def test_raw_curve_targets_all_gpus(self):
+        curve = [[60, 40], [90, 80]]
+        self.assertEqual(fan_control.validate_curve_request(curve), (None, curve))
+
+    def test_object_curve_can_target_one_gpu(self):
+        curve = [[60, 40], [90, 80]]
+        self.assertEqual(
+            fan_control.validate_curve_request({"gpu_index": 1, "curve": curve}),
+            (1, curve),
+        )
+
+    def test_rejects_missing_curve_in_object(self):
+        with self.assertRaises(ValueError):
+            fan_control.validate_curve_request({"gpu_index": 1})
 
 
 if __name__ == "__main__":

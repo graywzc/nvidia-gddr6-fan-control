@@ -130,8 +130,10 @@ PUT  http://<host>:8765/curve
        body: JSON list of [temp, fan_pct] pairs,
              temps strictly ascending, e.g.
              [[60,40],[80,55],[90,75],[95,90],[100,100]]
+             Or {"gpu_index": 1, "curve": [[60,40],...]} for one GPU.
 PUT  http://<host>:8765/power-limit
        body: {"power_limit_w": 250}
+             Or {"gpu_index": 1, "power_limit_w": 250} for one GPU.
              Use null to restore the GPU default power limit.
 ```
 
@@ -154,6 +156,9 @@ curl -X PUT -H 'Content-Type: application/json' \
  "power_limit_min_w": 100.0, "power_limit_max_w": 450.0,
  "power_limit_default_w": 350.0, "tdp_w": 350.0,
  "power_limit_supported": true,
+ "gpus": [{"index": 0, "vram_temp_c": 88, "fan_pct": 62,
+           "power_limit_w": 250.0, "curve": [[60,40],...]}],
+ "curves": {"0": [[60,40],...]}, "power_limits": {"0": 250.0},
  "fan_pct": 62, "gpu_name": "...", "num_fans": 2, "curve": [[60,40],...],
  "updated_at": 1234.5,
  "wall_time": 1700000000.0, "dry_run": false}
@@ -161,8 +166,10 @@ curl -X PUT -H 'Content-Type: application/json' \
 
 `power_w` is the current board power draw in watts (NVML `nvmlDeviceGetPowerUsage`);
 it is `null` on cards/drivers that don't expose it.
-`power_limit_w` is the current NVML board power cap in watts. PUT `/power-limit`
-persists the cap to the controller state file and applies it on startup.
+`power_limit_w` is the primary GPU's current NVML board power cap in watts.
+`gpus` contains the per-GPU telemetry, curve, and power-limit view. PUT
+`/power-limit` persists the cap to the controller state file and applies it on
+startup.
 `tdp_w` is NVML's default power-management limit, which comes from the card's
 firmware/driver power target and is the value the macOS app labels as TDP.
 
@@ -177,9 +184,11 @@ Most options have sensible defaults; override via CLI flags or by editing the sy
 | `--listen-port` | `8765` | HTTP port |
 | `--token-file` | none | File containing a bearer token; if unset, no auth |
 | `--state-file` | `/var/lib/nvidia-gddr6-fan-control/curve.json` | Persisted settings; use `off` to disable persistence |
-| `--gpu` | `0` | NVML GPU index to control |
+| `--gpus` | `all` | GPUs to control: `all` or a comma list like `0,1` |
+| `--gpu` | none | Deprecated single-GPU mode; honours `--vram-source-index` |
+| `--vram-source-index` | GPU index | With `--gpu`, which gddr6 VRAM temp index to drive it from |
 | `--gddr6-bin` | `/usr/local/bin/gddr6` | Path to the gddr6 binary |
-| `--power-limit-w` | none | Set GPU board power limit in watts at startup |
+| `--power-limit-w` | none | Set board power limit in watts at startup for every controlled GPU |
 | `--observer` / `--no-observer` | on | Enable or disable the integrated observer dashboard |
 | `--observer-monitor-port` | `8020` | llama.cpp frontend port whose TCP connections are monitored |
 | `--observer-container` | `beellama-qwen36-27b` | Docker container whose llama.cpp logs are tailed |
