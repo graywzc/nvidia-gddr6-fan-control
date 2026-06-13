@@ -9,21 +9,34 @@ struct PowerLimitEditor: View {
     @State private var statusMessage: String? = nil
     @State private var statusIsError: Bool = false
     @State private var isApplying: Bool = false
+    @State private var selectedGPUIndex: Int? = nil
 
     private var host: Host? { poller.hosts.first { $0.id == hostID } }
     private var payload: HostStatusPayload? { poller.states[hostID]?.lastPayload }
-    private var minW: Double { payload?.powerLimitMinW ?? 0 }
-    private var maxW: Double { payload?.powerLimitMaxW ?? max(minW, localLimitW) }
-    private var tdpW: Double? { payload?.tdpW ?? payload?.powerLimitDefaultW }
-    private var currentLimitW: Double? { payload?.powerLimitW }
-    private var currentPowerW: Double? { payload?.powerW }
+    private var availableGPUs: [GPUStatusPayload] { payload?.displayGPUs ?? [] }
+    private var selectedGPU: GPUStatusPayload? {
+        if let selectedGPUIndex,
+           let gpu = availableGPUs.first(where: { $0.index == selectedGPUIndex }) {
+            return gpu
+        }
+        return availableGPUs.first
+    }
+    private var minW: Double { selectedGPU?.powerLimitMinW ?? payload?.powerLimitMinW ?? 0 }
+    private var maxW: Double { selectedGPU?.powerLimitMaxW ?? payload?.powerLimitMaxW ?? max(minW, localLimitW) }
+    private var tdpW: Double? { selectedGPU?.powerLimitDefaultW ?? payload?.tdpW ?? payload?.powerLimitDefaultW }
+    private var currentLimitW: Double? { selectedGPU?.powerLimitW ?? payload?.powerLimitW }
+    private var currentPowerW: Double? { selectedGPU?.powerW ?? payload?.powerW }
     private var canEdit: Bool {
-        payload?.powerLimitSupported == true && minW > 0 && maxW > minW
+        (selectedGPU?.powerLimitSupported ?? payload?.powerLimitSupported) == true &&
+        minW > 0 &&
+        maxW > minW
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             header
+
+            gpuPicker
 
             if canEdit {
                 VStack(alignment: .leading, spacing: 10) {
@@ -81,8 +94,16 @@ struct PowerLimitEditor: View {
         }
         .padding(16)
         .frame(width: 420)
-        .onAppear(perform: loadFromHost)
+        .onAppear {
+            syncSelectedGPU()
+            loadFromHost()
+        }
         .onChange(of: currentLimitW) { _ in
+            if !isApplying {
+                loadFromHost()
+            }
+        }
+        .onChange(of: selectedGPUIndex) { _ in
             if !isApplying {
                 loadFromHost()
             }
@@ -93,8 +114,10 @@ struct PowerLimitEditor: View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(host?.name ?? "—").font(.headline)
-                if let gpu = payload?.gpuName {
-                    Text(gpu).font(.caption).foregroundColor(.secondary)
+                if let gpu = selectedGPU?.name ?? payload?.gpuName {
+                    Text(gpu)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
             Spacer()
@@ -112,8 +135,33 @@ struct PowerLimitEditor: View {
         }
     }
 
+    private var gpuPicker: some View {
+        Group {
+            if availableGPUs.count > 1 {
+                Picker("GPU", selection: selectedGPUBinding) {
+                    ForEach(availableGPUs) { gpu in
+                        Text("GPU \(gpu.index)").tag(gpu.index)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+        }
+    }
+
+    private var selectedGPUBinding: Binding<Int> {
+        Binding(
+            get: { selectedGPU?.index ?? availableGPUs.first?.index ?? 0 },
+            set: { selectedGPUIndex = $0 }
+        )
+    }
+
     private var clampedLimit: Double {
         min(max(localLimitW.rounded(), minW), maxW)
+    }
+
+    private func syncSelectedGPU() {
+        guard selectedGPUIndex == nil else { return }
+        selectedGPUIndex = availableGPUs.first?.index
     }
 
     private func loadFromHost() {
@@ -128,12 +176,14 @@ struct PowerLimitEditor: View {
 
     private func apply(_ watts: Double?) {
         guard let host = host else { return }
+        let gpuIndex = payload?.gpus?.isEmpty == false ? selectedGPU?.index : nil
         isApplying = true
         statusMessage = nil
         Task {
             do {
-                try await poller.putPowerLimit(host: host, watts: watts)
-                statusMessage = "Applied at \(timeString())"
+                try await poller.putPowerLimit(host: host, watts: watts, gpuIndex: gpuIndex)
+                let target = selectedGPU.map { "GPU \($0.index)" } ?? "GPU"
+                statusMessage = "Applied to \(target) at \(timeString())"
                 statusIsError = false
             } catch {
                 statusMessage = "Error: \(error.localizedDescription)"
