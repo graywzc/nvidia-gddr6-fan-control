@@ -70,6 +70,11 @@ class NVML:
             msg = self.lib.nvmlErrorString(rc).decode()
             raise RuntimeError(f"{name} failed (rc={rc}): {msg}")
 
+    def get_device_count(self):
+        n = ctypes.c_uint()
+        self._call("nvmlDeviceGetCount_v2", ctypes.byref(n))
+        return n.value
+
     def get_handle(self, index):
         h = ctypes.c_void_p()
         self._call("nvmlDeviceGetHandleByIndex_v2", index, ctypes.byref(h))
@@ -161,6 +166,7 @@ class State:
             "fan_pct": None,        # last applied fan target
             "gpu_name": None,
             "num_fans": None,
+            "gpus": [],             # per-GPU view when controlling several cards
             "curve": None,
             "power_limit_supported": None,
             "updated_at": 0.0,      # monotonic ts of last successful update
@@ -398,6 +404,28 @@ def parse_vram_temps(chunk):
     return [int(m) for m in VRAM_RE.findall(chunk)]
 
 
+def resolve_gpu_targets(gpus_spec, device_count, single_gpu=None,
+                        single_vram_index=None):
+    """Resolve which GPUs to control into (gpu_index, vram_index) pairs.
+
+    Each controlled GPU is matched to a gddr6 VRAM-temp slot. gddr6 lists VRAM
+    temps in PCI/GPU order, so vram_index == gpu_index by default.
+
+    - --gpu N (single_gpu) is the back-compat single-GPU path; it honours an
+      explicit --vram-source-index.
+    - --gpus accepts "all" (every device) or a comma list like "0,1".
+    """
+    if single_gpu is not None:
+        vidx = single_gpu if single_vram_index is None else single_vram_index
+        return [(single_gpu, vidx)]
+    spec = (gpus_spec or "all").strip().lower()
+    if spec == "all":
+        indices = list(range(device_count))
+    else:
+        indices = [int(tok) for tok in spec.split(",") if tok.strip() != ""]
+    return [(i, i) for i in indices]
+
+
 def _get_tailscale_ipv4():
     """Return the host's first Tailscale IPv4, or None if unavailable."""
     try:
@@ -496,7 +524,19 @@ def save_persisted_curve(path, curve):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--gpu", type=int, default=0, help="GPU index (default: 0)")
+    parser.add_argument(
+        "--gpus",
+        default="all",
+        help="GPUs to control: 'all' (default) or a comma list like '0,1'. "
+        "Each GPU's fans follow its own VRAM temp.",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        help="Deprecated single-GPU mode: control only this index "
+        "(equivalent to --gpus <N>; honours --vram-source-index).",
+    )
     parser.add_argument(
         "--gddr6-bin",
         default="/usr/local/bin/gddr6",
@@ -505,8 +545,9 @@ def main():
     parser.add_argument(
         "--vram-source-index",
         type=int,
-        default=0,
-        help="Which VRAM temp from gddr6 output to use, if multiple GPUs (default: 0)",
+        default=None,
+        help="With --gpu, which gddr6 VRAM temp index to drive it from "
+        "(default: the GPU index).",
     )
     parser.add_argument(
         "--dry-run",
@@ -637,9 +678,28 @@ def main():
 
     nvml = NVML()
     try:
-        handle = nvml.get_handle(args.gpu)
-        gpu_name = nvml.get_name(handle)
-        num_fans = nvml.get_num_fans(handle)
+        targets = resolve_gpu_targets(
+            args.gpus, nvml.get_device_count(),
+            single_gpu=args.gpu, single_vram_index=args.vram_source_index,
+        )
+        if not targets:
+            raise RuntimeError("no GPUs selected to control")
+        gpus = []
+        for gidx, vidx in targets:
+            h = nvml.get_handle(gidx)
+            gpus.append({
+                "index": gidx,
+                "vram_index": vidx,
+                "handle": h,
+                "name": nvml.get_name(h),
+                "num_fans": nvml.get_num_fans(h),
+                "last_applied_pct": None,
+                "last_apply_ts": 0.0,
+            })
+        # Power-limit control (optional) stays on the primary GPU only; fan
+        # control covers every selected GPU.
+        primary = gpus[0]
+        handle = primary["handle"]
         power_limit_supported = True
         try:
             min_w, max_w = nvml.get_power_limit_constraints_w(handle)
@@ -657,12 +717,12 @@ def main():
             power_limit_supported = False
             print(f"WARN: power-limit control unavailable: {e}", file=sys.stderr)
             state.update(power_limit_supported=False)
-        print(
-            f"Controlling GPU {args.gpu}: {gpu_name} ({num_fans} fan(s)), "
-            f"dry_run={args.dry_run}",
-            flush=True,
+        summary = ", ".join(
+            f"GPU {g['index']} ({g['name']}, {g['num_fans']} fan(s), "
+            f"VRAM temp #{g['vram_index']})" for g in gpus
         )
-        state.update(gpu_name=gpu_name, num_fans=num_fans)
+        print(f"Controlling {summary}; dry_run={args.dry_run}", flush=True)
+        state.update(gpu_name=primary["name"], num_fans=primary["num_fans"])
     except RuntimeError as e:
         print(f"NVML init failed: {e}", file=sys.stderr)
         nvml.shutdown()
@@ -724,17 +784,17 @@ def main():
     else:
         print("HTTP API disabled (--listen-host=off)", flush=True)
 
-    last_applied_pct = None
-    last_apply_ts = 0.0
     gddr6_proc = None
     shutting_down = False
 
     def restore_auto():
-        for i in range(num_fans):
-            try:
-                nvml.set_default_fan_speed(handle, i)
-            except RuntimeError as e:
-                print(f"WARN: restore fan {i} failed: {e}", file=sys.stderr)
+        for g in gpus:
+            for i in range(g["num_fans"]):
+                try:
+                    nvml.set_default_fan_speed(g["handle"], i)
+                except RuntimeError as e:
+                    print(f"WARN: restore GPU {g['index']} fan {i} failed: {e}",
+                          file=sys.stderr)
 
     def cleanup(*_):
         nonlocal shutting_down
@@ -788,86 +848,98 @@ def main():
         temps = parse_vram_temps(latest.decode("utf-8", errors="ignore"))
         if not temps:
             continue
-        if args.vram_source_index >= len(temps):
-            print(
-                f"vram-source-index {args.vram_source_index} out of range "
-                f"({len(temps)} temps available)",
-                file=sys.stderr,
-                flush=True,
-            )
-            continue
-        temp = temps[args.vram_source_index]
-        # Read the live curve so remote PUT /curve updates take effect immediately.
-        current_curve = state.snapshot()["curve"]
-        target_pct = interp_curve(current_curve, temp)
-        # Board power draw, if the GPU/driver exposes it. Not fatal if it
-        # doesn't (some cards return NotSupported) — just publish None.
-        try:
-            power_w = round(nvml.get_power_usage_w(handle), 1)
-        except RuntimeError:
-            power_w = None
-        try:
-            current_power_limit_w = round(nvml.get_power_limit_w(handle), 1)
-        except RuntimeError:
-            current_power_limit_w = None
-        # GPU core utilization, same NotSupported tolerance as power above.
-        try:
-            gpu_util = nvml.get_utilization_pct(handle)
-        except RuntimeError:
-            gpu_util = None
-        # Publish to HTTP API readers — temp/power/util every tick, fan_pct after apply.
-        state.update(
-            vram_temp_c=temp,
-            power_w=power_w,
-            power_limit_w=current_power_limit_w,
-            gpu_util_pct=gpu_util,
-        )
         # Hand the real VRAM temps to the observer; nvidia-smi reports
         # temperature.memory as N/A on consumer cards. Indices line up with
         # nvidia-smi's GPU order (both enumerate in PCI order).
         if args.observer:
             aipc_observer.state.set_vram_temps(dict(enumerate(temps)))
+        # Read the live curve so remote PUT /curve updates take effect
+        # immediately; one curve drives every controlled GPU.
+        current_curve = state.snapshot()["curve"]
         now = time.monotonic()
-        needs_update = (
-            last_applied_pct is None
-            or abs(target_pct - last_applied_pct) >= HYSTERESIS_PCT
-            or (now - last_apply_ts) >= REAPPLY_INTERVAL_S
-        )
-        if needs_update:
-            if args.dry_run:
+        per_gpu = []
+        for g in gpus:
+            vidx = g["vram_index"]
+            if vidx >= len(temps):
                 print(
-                    f"[dry-run] VRAM={temp}°C -> would set fan={target_pct}% "
-                    f"on {num_fans} fan(s)",
+                    f"GPU {g['index']}: VRAM temp #{vidx} out of range "
+                    f"({len(temps)} available)",
+                    file=sys.stderr, flush=True,
+                )
+                continue
+            temp = temps[vidx]
+            target_pct = interp_curve(current_curve, temp)
+            # Power/util are best-effort; some cards return NotSupported.
+            try:
+                power_w = round(nvml.get_power_usage_w(g["handle"]), 1)
+            except RuntimeError:
+                power_w = None
+            try:
+                gpu_util = nvml.get_utilization_pct(g["handle"])
+            except RuntimeError:
+                gpu_util = None
+            needs_update = (
+                g["last_applied_pct"] is None
+                or abs(target_pct - g["last_applied_pct"]) >= HYSTERESIS_PCT
+                or (now - g["last_apply_ts"]) >= REAPPLY_INTERVAL_S
+            )
+            if needs_update and args.dry_run:
+                print(
+                    f"[dry-run] GPU {g['index']} VRAM={temp}°C -> would set "
+                    f"fan={target_pct}% on {g['num_fans']} fan(s)",
                     flush=True,
                 )
-                last_applied_pct = target_pct
-                last_apply_ts = now
-                state.update(fan_pct=target_pct)
-            else:
-                ok = True
-                err = ""
-                for i in range(num_fans):
+                g["last_applied_pct"] = target_pct
+                g["last_apply_ts"] = now
+            elif needs_update:
+                ok, err = True, ""
+                for i in range(g["num_fans"]):
                     try:
-                        nvml.set_fan_speed(handle, i, target_pct)
+                        nvml.set_fan_speed(g["handle"], i, target_pct)
                     except RuntimeError as e:
-                        ok = False
-                        err = str(e)
+                        ok, err = False, str(e)
                         break
                 status = "OK" if ok else f"FAIL ({err})"
                 print(
-                    f"VRAM={temp}°C  ->  fan={target_pct}%  [{status}]",
+                    f"GPU {g['index']} VRAM={temp}°C  ->  fan={target_pct}%  "
+                    f"[{status}]",
                     flush=True,
                 )
                 if ok:
-                    last_applied_pct = target_pct
-                    last_apply_ts = now
-                    state.update(fan_pct=target_pct)
-        else:
-            print(
-                f"VRAM={temp}°C  (target {target_pct}%, holding "
-                f"{last_applied_pct}%)",
-                flush=True,
-            )
+                    g["last_applied_pct"] = target_pct
+                    g["last_apply_ts"] = now
+            else:
+                print(
+                    f"GPU {g['index']} VRAM={temp}°C  (target {target_pct}%, "
+                    f"holding {g['last_applied_pct']}%)",
+                    flush=True,
+                )
+            per_gpu.append({
+                "index": g["index"],
+                "name": g["name"],
+                "vram_temp_c": temp,
+                "fan_pct": g["last_applied_pct"],
+                "num_fans": g["num_fans"],
+                "power_w": power_w,
+                "gpu_util_pct": gpu_util,
+            })
+        if not per_gpu:
+            continue
+        # `gpus` carries every controlled card; the legacy top-level fields
+        # mirror the primary GPU so existing /status readers keep working.
+        head = per_gpu[0]
+        try:
+            primary_limit_w = round(nvml.get_power_limit_w(handle), 1)
+        except RuntimeError:
+            primary_limit_w = None
+        state.update(
+            gpus=per_gpu,
+            vram_temp_c=head["vram_temp_c"],
+            fan_pct=head["fan_pct"],
+            power_w=head["power_w"],
+            gpu_util_pct=head["gpu_util_pct"],
+            power_limit_w=primary_limit_w,
+        )
 
 
 if __name__ == "__main__":
