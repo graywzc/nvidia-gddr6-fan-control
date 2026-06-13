@@ -802,6 +802,12 @@ COMPOSE_REGISTRY = {
 DEFAULTS = {("m1", "eng", "single"): "eng/var-b"}
 '''
 
+DUAL_CARD_DOC = '''
+| What you're doing | Compose | Max ctx | Narr / Code TPS | VRAM per card | Why |
+|---|---|---|---|---|---|
+| General default | [`a.yml`](../models/m1/eng/compose/single/q/a.yml) (`eng/var-a`) | **1K** | **10 / 20** | ~1 / 2 GB | Good default for tests. |
+'''
+
 
 class CatalogExtractTests(unittest.TestCase):
     """extract_catalog/refresh_catalog against real temporary git repos."""
@@ -815,9 +821,11 @@ class CatalogExtractTests(unittest.TestCase):
         self.clone = f"{self.tmp.name}/clone"
         self._git_in(self.tmp.name, "init", "-q", "-b", "main", self.origin)
         self._write_registry(self.origin, REGISTRY_V1)
+        self._write_dual_card_doc(self.origin)
         self._commit(self.origin, "registry v1")
         self._git_in(self.tmp.name, "clone", "-q", self.origin, self.clone)
         self._write_registry(self.origin, REGISTRY_V2)
+        self._write_dual_card_doc(self.origin)
         self._commit(self.origin, "registry v2")
 
     def tearDown(self):
@@ -843,12 +851,24 @@ class CatalogExtractTests(unittest.TestCase):
         with open(path, "w") as f:
             f.write(content)
 
+    def _write_dual_card_doc(self, repo):
+        import os
+
+        path = os.path.join(repo, aipc_observer.DUAL_CARD_DOC_PATH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(DUAL_CARD_DOC)
+
     def test_extracts_variants_and_tuple_defaults_at_head(self):
         cat = aipc_observer.extract_catalog(self.clone, "HEAD")
         self.assertNotIn("error", cat)
         self.assertEqual(cat["variants"]["eng/var-a"]["status"], "caveats")
         self.assertEqual(cat["variants"]["eng/var-a"]["max_ctx"], 1000)
         self.assertEqual(cat["defaults"]["m1/eng/single"], "eng/var-a")
+        doc = cat["variants"]["eng/var-a"]["doc"]
+        self.assertEqual(doc["max_ctx_doc"], "1K")
+        self.assertEqual(doc["tps"], "10 / 20")
+        self.assertIn("Good default", doc["why"])
 
     def test_extracts_upstream_ref_after_fetch(self):
         self._git_in(self.clone, "fetch", "-q")

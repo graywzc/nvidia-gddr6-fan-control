@@ -818,6 +818,7 @@ def collect_repo_info(repo, fetch=True):
 # club-3090's machine-readable variant catalog: a pure-data module (no
 # imports), which is what makes ref-based extraction via `git show` possible.
 REGISTRY_MODULE_PATH = "scripts/lib/profiles/compose_registry.py"
+DUAL_CARD_DOC_PATH = "docs/DUAL_CARD.md"
 
 # Runs in an isolated subprocess with the registry module source on stdin.
 # exec'ing repo code is confined to that process, never the daemon, and
@@ -861,10 +862,94 @@ def extract_catalog(repo, ref="HEAD"):
                 result.stderr.strip()[-300:] or "registry extraction failed"
             )
         catalog = json.loads(result.stdout)
+        attach_dual_card_docs(repo, ref, catalog)
         catalog["ref"] = ref
         return catalog
     except Exception as e:
         return {"error": str(e), "ref": ref}
+
+
+def _clean_md_cell(value):
+    value = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", str(value or ""))
+    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
+    value = value.replace("**", "").replace("~~", "")
+    value = value.replace("`", "")
+    value = re.sub(r"<[^>]+>", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _dual_card_rows(markdown):
+    """Extract pipe-table data rows from docs/DUAL_CARD.md."""
+    rows = []
+    current = None
+    for raw in markdown.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("|"):
+            if current:
+                rows.append(current)
+            current = line
+        elif current and "|" in line:
+            # Some long cells wrap in markdown. Keep wrapped notes attached to
+            # the row before parsing cells.
+            current += " " + line
+    if current:
+        rows.append(current)
+
+    parsed = []
+    for row in rows:
+        cells = [c.strip() for c in row.strip().strip("|").split("|")]
+        if len(cells) < 6:
+            continue
+        first = _clean_md_cell(cells[0]).lower()
+        if first in ("what you're doing", "---") or set(first) <= {"-", " "}:
+            continue
+        parsed.append({
+            "workload_label": _clean_md_cell(cells[0]),
+            "compose": _clean_md_cell(cells[1]),
+            "max_ctx_doc": _clean_md_cell(cells[2]),
+            "tps": _clean_md_cell(cells[3]),
+            "vram": _clean_md_cell(cells[4]),
+            "why": _clean_md_cell(" | ".join(cells[5:])),
+            "_raw": row,
+        })
+    return parsed
+
+
+def _doc_row_matches_variant(row, key, entry):
+    raw = row.get("_raw") or ""
+    compose_path = entry.get("compose_path") or ""
+    if key and re.search(rf"(?<![\w/-]){re.escape(key)}(?![\w/-])", raw):
+        return True
+    if compose_path and compose_path in raw:
+        return True
+    base = os.path.basename(compose_path)
+    if base and base in raw:
+        return True
+    return False
+
+
+def attach_dual_card_docs(repo, ref, catalog):
+    """Attach curated DUAL_CARD table metadata to matching variants."""
+    variants = catalog.get("variants") or {}
+    if not variants:
+        return
+    try:
+        src = repo_git(repo, "show", f"{ref}:{DUAL_CARD_DOC_PATH}")
+    except Exception:
+        return
+    rows = _dual_card_rows(src)
+    for key, entry in variants.items():
+        for row in rows:
+            if _doc_row_matches_variant(row, key, entry):
+                entry["doc"] = {
+                    k: row[k] for k in (
+                        "workload_label", "compose", "max_ctx_doc",
+                        "tps", "vram", "why"
+                    )
+                }
+                break
 
 
 # Registry fields whose upstream change amounts to a changed recommendation.
@@ -2110,7 +2195,7 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px minmax(150px,1.4fr) 60px 56px 70px 74px 78px 74px 60px 78px minmax(80px,1fr);gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.group-label{color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
-.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.variant-table{min-width:1050px}.variant-row{display:grid;grid-template-columns:minmax(230px,1.1fr) 86px 86px minmax(140px,.8fr) minmax(260px,1.5fr) 120px;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}.variant-row.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.variant-name{font-weight:650;color:var(--accent);overflow-wrap:anywhere}.variant-note{color:var(--dim);line-height:1.35;margin-top:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 @media(max-width:900px){.detail-grid{grid-template-columns:1fr}.request-row{grid-template-columns:88px 120px minmax(140px,1fr) 52px 52px 64px 68px 72px 68px 52px 72px minmax(70px,1fr)}}
 </style>
 </head>
@@ -2147,6 +2232,10 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="flagModal" class="modal" onclick="if(event.target===this)closeFlagGuide()"><div class="modal-panel">
 <div class="modal-head"><h2 id="flagModalTitle">Flag guide</h2><button class="btn" onclick="closeFlagGuide()">Close</button></div>
 <div id="flagModalBody" class="modal-body"></div>
+</div></div>
+<div id="variantModal" class="modal" onclick="if(event.target===this)closeVariantList()"><div class="modal-panel">
+<div class="modal-head"><h2 id="variantModalTitle">Variants</h2><button class="btn" onclick="closeVariantList()">Close</button></div>
+<div id="variantModalBody" class="modal-body"></div>
 </div></div>
 <div id="requestModal" class="modal" onclick="if(event.target===this)closeRequestDetail()"><div class="modal-panel">
 <div class="modal-head"><h2 id="requestModalTitle">Request detail</h2><button class="btn" onclick="closeRequestDetail()">Close</button></div>
@@ -2211,6 +2300,21 @@ function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async(
 function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});let dr=(r.dropped_capabilities||[]).length?` (this build can't do ${r.dropped_capabilities.join(', ')})`:'';return `restarted with ${r.preset}${dr} (model reloading…)`})}
 function doStop(){let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Stop model serving on this host?${warn}`,async()=>{let r=await ctlPost('/observer/api/stop',{force:lastActive>0});return r.stopped?`stopped ${r.container||'model'}`:(r.detail||'already stopped')})}
 function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
+function variantDoc(v){return v.doc||{}}
+function variantCtx(v){let doc=variantDoc(v);return doc.max_ctx_doc||`${v.max_ctx?Number(v.max_ctx).toLocaleString():'-'}`}
+function variantTps(v){return variantDoc(v).tps||'-'}
+function variantWhy(v){return variantDoc(v).why||v.status_note||''}
+function renderVariantListModal(d,fits,runKey,running){let c=d.catalog||{};let vars=c.variants||{};let defSet=new Set(Object.values(c.defaults||{}));let order={production:0,caveats:1};
+fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
+let rows='<div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;
+return `<div class="variant-row"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${action}</span></div>`}).join('');
+rows+='</div>';
+document.getElementById('variantModalTitle').textContent=`Variants for this machine (${fits.length})`;
+document.getElementById('variantModalBody').innerHTML=rows;
+}
+function openVariantList(){if(!lastRenderData)return;let d=lastRenderData;let c=d.catalog||{};let vars=c.variants||{};let keys=Object.keys(vars);let mi=d.model_info||{};let running=!!d.container;let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;let ngpu=(d.gpu_stats||[]).length||1;let reqGpus=p=>p.indexOf('/multi4/')>=0?4:(p.indexOf('/dual/')>=0?2:1);let fits=keys.filter(k=>reqGpus(vars[k].compose_path||'')<=ngpu&&(vars[k].tp||1)<=ngpu);renderVariantListModal(d,fits,runKey,running);document.getElementById('variantModal').classList.add('open')}
+function closeVariantList(){document.getElementById('variantModal').classList.remove('open')}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
 if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
 let vars=c.variants||{};let keys=Object.keys(vars);
@@ -2235,11 +2339,7 @@ let reqGpus=p=>p.indexOf('/multi4/')>=0?4:(p.indexOf('/dual/')>=0?2:1);
 let fits=keys.filter(k=>reqGpus(vars[k].compose_path||'')<=ngpu&&(vars[k].tp||1)<=ngpu);
 let order={production:0,caveats:1};
 fits.sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
-let defSet=new Set(Object.values(c.defaults||{}));
-let items=fits.map(k=>{let v=vars[k];let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let ctx=v.max_ctx?` · ${Math.round(v.max_ctx/1024)}K`:'';
-let sw=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;
-return `<div class="row" style="font-size:12px"><span class="label" title="${esc(v.status_note||'')}">${mark}${esc(v.model)} · ${esc(k)}${ctx}${v.workload?' · '+esc(v.workload):''}</span><span style="display:flex;gap:8px;align-items:center">${statusSpan(v.status)}${sw}</span></div>`}).join('');
-rows+=det('detVariants',false,`variants for this machine (${fits.length} of ${keys.length}, ${ngpu} GPU)`,items);
+rows+=infoRow('Variants for this machine',`${fits.length} of ${keys.length} <button class="btn" onclick="openVariantList()">View variants</button>`,`${ngpu} GPU detected`);
 let dl=[];(diff.added||[]).forEach(k=>dl.push('new: '+k));
 (diff.removed||[]).forEach(k=>dl.push('removed: '+k));
 (diff.changed||[]).forEach(ch=>dl.push(ch.key+': '+Object.entries(ch.fields).map(([f,v])=>`${f} ${v[0]??'-'} → ${v[1]??'-'}`).join(', ')));
