@@ -2,6 +2,7 @@
 """Tests for integrated aipc observer request parsing."""
 
 import json
+import sys
 import time
 import unittest
 
@@ -1616,6 +1617,16 @@ class SwitchModelTests(unittest.TestCase):
         self.assertEqual(call["cmd"][-3:], ["bash", "scripts/setup.sh", "m1"])
         self.assertEqual(call["cwd"], "/repo")
         self.assertEqual(call["env"]["WEIGHT_KEY"], "m1:autoround-int4")
+
+    def test_run_with_progress_reports_output_lines(self):
+        lines = []
+        output = aipc_observer._run_with_progress(
+            [sys.executable, "-c", "print('setup one'); print('setup two')"],
+            timeout=10,
+            on_line=lines.append,
+        )
+        self.assertEqual(lines, ["setup one", "setup two"])
+        self.assertIn("setup two", output)
 
     def test_runs_switch_sh_with_port_env(self):
         runner = FakeRunner()

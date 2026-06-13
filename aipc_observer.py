@@ -10,6 +10,7 @@ import json
 import hashlib
 import os
 import pwd
+import queue
 import re
 import shlex
 import signal
@@ -1173,6 +1174,71 @@ def _run(cmd, env=None, cwd=None, timeout=600, input_text=None):
     return result.stdout
 
 
+def _run_with_progress(cmd, env=None, cwd=None, timeout=600, on_line=None):
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    lines = queue.Queue()
+
+    def read_stdout():
+        try:
+            for line in proc.stdout or []:
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+    tail = deque(maxlen=20)
+    deadline = time.monotonic() + timeout if timeout else None
+    saw_eof = False
+
+    while not saw_eof:
+        if deadline and time.monotonic() > deadline:
+            _kill_process_group(proc)
+            if proc.stdout:
+                proc.stdout.close()
+            raise RuntimeError(
+                f"command timed out after {timeout}s (killed)"
+                + (": " + " | ".join(tail) if tail else "")
+            )
+        try:
+            line = lines.get(timeout=0.2)
+        except queue.Empty:
+            if proc.poll() is not None and not reader.is_alive():
+                break
+            continue
+        if line is None:
+            saw_eof = True
+            continue
+        line = line.rstrip()
+        if not line:
+            continue
+        tail.append(line)
+        if on_line:
+            on_line(line)
+
+    if proc.stdout:
+        proc.stdout.close()
+    try:
+        rc = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        raise RuntimeError("command did not exit after output closed (killed)")
+    output = "\n".join(tail)
+    if rc != 0:
+        raise RuntimeError(output[-800:] or "command failed")
+    return output
+
+
 def _compose_env(model_info):
     """Reproduce the compose substitution env the container was booted with.
 
@@ -1452,7 +1518,15 @@ def switch_model(repo, variant, monitor_port, force=False, runner=_run):
     runner(_repo_owner_cmd(repo, cmd), env=env, cwd=repo, timeout=SWITCH_TIMEOUT)
 
 
-def install_variant_assets(repo, variant, catalog, setup=None, runner=_run):
+def _install_progress_detail(variant, line):
+    line = re.sub(r"\s+", " ", str(line or "")).strip()
+    if len(line) > 220:
+        line = line[-220:]
+    return f"installing assets for {variant}: {line}"
+
+
+def install_variant_assets(repo, variant, catalog, setup=None, runner=_run,
+                           progress=None):
     """Run club-3090 setup.sh for a variant's missing model assets."""
     variants = (catalog or {}).get("variants") or {}
     entry = variants.get(variant) or {}
@@ -1470,12 +1544,14 @@ def install_variant_assets(repo, variant, catalog, setup=None, runner=_run):
     if hint.get("weight_key"):
         detail += f" weight_key={hint['weight_key']}"
     audit("install", detail)
-    runner(
-        _repo_owner_cmd(repo, ["bash", "scripts/setup.sh", model]),
-        env=env,
-        cwd=repo,
-        timeout=INSTALL_TIMEOUT,
-    )
+    cmd = _repo_owner_cmd(repo, ["bash", "scripts/setup.sh", model])
+    if runner is _run:
+        _run_with_progress(
+            cmd, env=env, cwd=repo, timeout=INSTALL_TIMEOUT,
+            on_line=progress,
+        )
+    else:
+        runner(cmd, env=env, cwd=repo, timeout=INSTALL_TIMEOUT)
     return {"installed": True, "variant": variant, **hint}
 
 
@@ -1555,8 +1631,22 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
         _set_control_status(
             "install", f"installing assets for {variant} (can take a while)…"
         )
+        last_progress_at = [0.0]
+
+        def progress(line):
+            now = time.monotonic()
+            if now - last_progress_at[0] < 0.75:
+                return
+            last_progress_at[0] = now
+            clean = re.sub(r"\s+", " ", str(line or "")).strip()
+            _set_control_status(
+                "install", _install_progress_detail(variant, clean),
+                progress_line=clean[-500:],
+            )
+
         result = install_variant_assets(
-            repo, variant, state.catalog, setup=setup, runner=runner)
+            repo, variant, state.catalog, setup=setup, runner=runner,
+            progress=progress)
         if not retry:
             _set_control_status(
                 "install", f"installed assets for {variant}",
