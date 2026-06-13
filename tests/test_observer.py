@@ -1161,6 +1161,78 @@ class RestartModelTests(unittest.TestCase):
         self.assertNotIn("command", svc)
 
 
+class PresetFilterTests(unittest.TestCase):
+    """Preset flags a build doesn't advertise are dropped, not crash-looped."""
+
+    def setUp(self):
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
+        tmp.close()
+        self.override_path = tmp.name
+        self.runner = FakeRunner(CONFIG_JSON)
+
+    def tearDown(self):
+        import os
+
+        os.unlink(self.override_path)
+
+    def _restart(self, preset, help_flags):
+        # Stand in for inspect_container_help: a build advertising exactly the
+        # given flags, or an error (unknown -> fail open) when help_flags is None.
+        def fake_help(name, entrypoint):
+            if help_flags is None:
+                return {"error": "help unavailable"}
+            return {"flags": {f: {} for f in help_flags}}
+
+        mi = dict(MODEL_INFO)
+        mi["entrypoint"] = ["/app/llama-server"]
+        return aipc_observer.restart_model(
+            preset, model_info=mi, runner=self.runner,
+            override_path=self.override_path, help_getter=fake_help,
+        )
+
+    def _override_argv(self):
+        import json
+
+        with open(self.override_path) as f:
+            return json.load(f)["services"]["svc"]["command"]
+
+    def test_drops_flags_missing_from_help(self):
+        # ik-llama supports metrics/props/cache-ram but not the log flags.
+        result = self._restart(
+            "insight-cache",
+            help_flags={"--metrics", "--props", "--cache-ram",
+                        "--host", "--ctx-size"},
+        )
+        argv = self._override_argv()
+        self.assertIn("--metrics", argv)
+        self.assertIn("--props", argv)
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "8192")
+        self.assertNotIn("--log-verbosity", argv)
+        self.assertNotIn("--log-timestamps", argv)
+        self.assertEqual(
+            sorted(result["dropped_flags"]),
+            ["--log-timestamps", "--log-verbosity"],
+        )
+
+    def test_unknown_help_keeps_all_flags(self):
+        result = self._restart("insight-cache", help_flags=None)
+        argv = self._override_argv()
+        self.assertIn("--log-verbosity", argv)
+        self.assertIn("--log-timestamps", argv)
+        self.assertEqual(result["dropped_flags"], [])
+
+    def test_supported_build_keeps_all_flags(self):
+        result = self._restart(
+            "insight",
+            help_flags={"--metrics", "--props", "--log-verbosity",
+                        "--log-timestamps", "--host", "--ctx-size"},
+        )
+        self.assertEqual(result["dropped_flags"], [])
+        self.assertIn("--log-verbosity", self._override_argv())
+
+
 class StopModelTests(unittest.TestCase):
     def test_stop_prefers_club3090_switch_down_when_available(self):
         import os
