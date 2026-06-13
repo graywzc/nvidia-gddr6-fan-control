@@ -629,6 +629,39 @@ usage: llama-server [options]
         self.assertEqual(flags["--metrics"]["description"],
                          "enable prometheus endpoint")
 
+    def test_help_accepted_when_build_exits_nonzero(self):
+        # ik-llama prints a valid --help screen but exits 1; the flags it lists
+        # must still be usable (drives the build-aware preset filter).
+        import subprocess as sp
+
+        help_text = ("  --metrics       enable prometheus endpoint\n"
+                     "  --props         expose server props\n"
+                     "  --cache-ram N   ram cache size\n")
+        orig = aipc_observer.subprocess.run
+        aipc_observer.subprocess.run = (
+            lambda cmd, **kw: sp.CompletedProcess(cmd, 1, help_text, "")
+        )
+        try:
+            out = aipc_observer.inspect_container_help("c", ["/app/llama-server"])
+        finally:
+            aipc_observer.subprocess.run = orig
+        self.assertNotIn("error", out)
+        self.assertIn("--metrics", out["flags"])
+        self.assertNotIn("--log-verbosity", out["flags"])
+
+    def test_help_error_when_nonzero_and_unparseable(self):
+        import subprocess as sp
+
+        orig = aipc_observer.subprocess.run
+        aipc_observer.subprocess.run = (
+            lambda cmd, **kw: sp.CompletedProcess(cmd, 127, "", "no such file")
+        )
+        try:
+            out = aipc_observer.inspect_container_help("c", ["/app/llama-server"])
+        finally:
+            aipc_observer.subprocess.run = orig
+        self.assertIn("error", out)
+
     def test_command_guide_uses_help_and_marks_unknown_flags(self):
         help_index = aipc_observer.parse_help_flags(
             "  --ctx-size N    size of the prompt context\n"
