@@ -2000,7 +2000,7 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
 <div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · insight: +metrics/props/trace logs · insight-cache: insight + cache-ram 8192">
 <option value="baseline">baseline</option><option value="insight">insight</option><option value="insight-cache" selected>insight+cache</option><option value="insight-debug">insight+debug</option>
-</select><button class="btn" onclick="doRestart()">Restart model</button><button class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
+</select><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
@@ -2049,10 +2049,18 @@ let lastBusy=false;
 function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120))st.textContent=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+(cs.detail||'');
-document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy)}
+document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
+// Restart/Stop act on a running container; when nothing is up they 409 or
+// no-op, so disable them and point at the catalog's Start buttons instead.
+let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
+if(rb){rb.disabled=lastBusy||!running;rb.title=running?'':'no model running — use Start in the Catalog below'}
+if(sb){sb.disabled=lastBusy||!running;sb.title=running?'':'no model running'}}
 function doSwitch(v,status){let p=document.getElementById('presetSel').value;let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
 if(!confirm(`Switch model to '${v}' with preset '${p}'?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`))return;
 ctlPost('/observer/api/switch',{variant:v,preset:p,force:lastActive>0||(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doStart(v,status){let p=document.getElementById('presetSel').value;let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
+if(!confirm(`Start model '${v}' with preset '${p}'?\nNo model is running — this boots the variant and waits for it to load, which takes a few minutes.${exp}`))return;
+ctlPost('/observer/api/switch',{variant:v,preset:p,force:(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
 if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">/metrics disabled — restart with an insight preset to enable</span></div>';return}
@@ -2078,7 +2086,10 @@ if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error
 let vars=c.variants||{};let keys=Object.keys(vars);
 if(!keys.length){el.innerHTML='<div class="row"><span class="label">No catalog yet</span></div>';return}
 let rows='';
-let runKey=keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0);
+// model_info persists stale after a stop; d.container is the live signal,
+// so only treat a variant as "running" when a container is actually up.
+let running=!!d.container;
+let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;
 if(runKey){let v=vars[runKey];
 rows+=infoRow('Running variant',esc(runKey)+' '+statusSpan(v.status),v.status_note);
 if(v.workload)rows+=infoRow('Workload',esc(v.workload));
@@ -2096,7 +2107,7 @@ let order={production:0,caveats:1};
 fits.sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let defSet=new Set(Object.values(c.defaults||{}));
 let items=fits.map(k=>{let v=vars[k];let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let ctx=v.max_ctx?` · ${Math.round(v.max_ctx/1024)}K`:'';
-let sw=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doSwitch('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>switch</button>`;
+let sw=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;
 return `<div class="row" style="font-size:12px"><span class="label" title="${esc(v.status_note||'')}">${mark}${esc(v.model)} · ${esc(k)}${ctx}${v.workload?' · '+esc(v.workload):''}</span><span style="display:flex;gap:8px;align-items:center">${statusSpan(v.status)}${sw}</span></div>`}).join('');
 rows+=det('detVariants',false,`variants for this machine (${fits.length} of ${keys.length}, ${ngpu} GPU)`,items);
 let dl=[];(diff.added||[]).forEach(k=>dl.push('new: '+k));
