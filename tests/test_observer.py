@@ -2,6 +2,7 @@
 """Tests for integrated aipc observer request parsing."""
 
 import json
+import time
 import unittest
 
 import aipc_observer
@@ -524,6 +525,20 @@ class InFlightRequestTests(unittest.TestCase):
         self.state.enrich_active_from_slots([])
         self.assertIn(100, self.state.active_requests)
 
+    def test_prune_inactive_requests_drops_idle_slot_ghost(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.state.active_requests[100]["start_time"] -= 100
+        self.state.set_slots([{"id_task": 100, "is_processing": False}])
+        self.state.prune_inactive_requests()
+        self.assertNotIn(100, self.state.active_requests)
+
+    def test_prune_inactive_requests_keeps_processing_slot(self):
+        self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
+        self.state.active_requests[100]["start_time"] -= 100
+        self.state.set_slots([{"id_task": 100, "is_processing": True}])
+        self.state.prune_inactive_requests()
+        self.assertIn(100, self.state.active_requests)
+
 
 class VramOverlayTests(unittest.TestCase):
     def test_overlay_replaces_na_with_gddr6_temp(self):
@@ -994,6 +1009,13 @@ class RestartGuardTests(unittest.TestCase):
 
     def test_allows_when_idle(self):
         aipc_observer.check_restart_allowed(aipc_observer.ObserverState())
+
+    def test_prunes_idle_ghost_before_blocking(self):
+        st = aipc_observer.ObserverState()
+        st.active_requests[1] = {"task_id": 1, "start_time": time.time() - 100}
+        st.set_slots([{"id_task": 1, "is_processing": False}])
+        aipc_observer.check_restart_allowed(st)
+        self.assertEqual(st.active_requests, {})
 
 
 class FakeRunner:
