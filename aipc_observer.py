@@ -2067,7 +2067,7 @@ if(m.decode_calls_total!=null)rows+=infoRow('Decode calls',Number(m.decode_calls
 if(m.busy_slots_per_decode!=null)rows+=infoRow('Busy slots / decode',Number(m.busy_slots_per_decode).toFixed(2));
 if(m.kv_cache_usage_ratio!=null)rows+=infoRow('KV cache usage',(100*m.kv_cache_usage_ratio).toFixed(1)+'%');
 el.innerHTML=rows}
-async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+async function ctlPost(path,body){let ctrl=new AbortController();let timer=setTimeout(()=>ctrl.abort(),15000);try{let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{}),signal:ctrl.signal});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}catch(e){if(e.name==='AbortError')throw new Error('request timed out — check service logs');throw e}finally{clearTimeout(timer)}}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
 function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});return `restarted with ${r.preset} (model reloading…)`})}
@@ -2253,6 +2253,7 @@ def handle_observer_post(handler):
     if path not in ("/observer/api/update", "/observer/api/restart",
                     "/observer/api/stop", "/observer/api/switch"):
         return False
+    print(f"Observer control POST: {path}", flush=True)
     body = {}
     length = int(handler.headers.get("Content-Length") or 0)
     if length > 4096:
