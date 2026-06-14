@@ -653,13 +653,14 @@ def inspect_container_help(name, entrypoint):
     except Exception as e:
         return {"error": str(e)}
     output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-    if result.returncode != 0:
-        return {"error": output.strip()[-400:] or "server --help failed"}
     index = parse_help_flags(output)
+    if result.returncode != 0 and not index:
+        return {"error": output.strip()[-400:] or "server --help failed"}
     return {
         "source": " ".join([*argv, "--help"]),
         "flag_count": len(index),
         "flags": index,
+        **({"warning": f"--help exited {result.returncode}"} if result.returncode != 0 else {}),
     }
 
 
@@ -1776,24 +1777,147 @@ def summarize_metrics(values):
     return out
 
 
-def poll_metrics(monitor_port):
-    """Scrape the llama.cpp /metrics endpoint (enabled by the insight presets).
+def infer_engine(info):
+    """Identify the serving engine (vllm vs the llama.cpp family) from a
+    model_info dict's compose path / variant / image.
 
-    When the server runs without --metrics the endpoint 404s; report
-    available=False so the dashboard can hint at the preset instead of
-    showing stale numbers.
+    vLLM speaks a different metrics+logging dialect than llama.cpp/ik-llama, so
+    the observer scrapes and renders it differently. ik-llama and llama.cpp both
+    expose llama.cpp-style /metrics and trace logs, so they collapse to one
+    "llamacpp" engine here. Returns None when the engine can't be determined yet
+    (model_info not populated), which the callers treat as the llama.cpp default.
+    """
+    blob = " ".join(
+        str((info or {}).get(k) or "")
+        for k in ("compose_file", "variant", "image")
+    ).lower()
+    if "vllm" in blob:
+        return "vllm"
+    if any(s in blob for s in ("llamacpp", "llama.cpp", "ik-llama", "ik_llama")):
+        return "llamacpp"
+    return None
+
+
+# request_success_total carries a finished_reason label, so parse_prometheus
+# (which strips labels) can't break it down — scan the raw text for the split.
+RE_VLLM_SUCCESS = re.compile(
+    r'vllm:request_success_total\{[^}]*finished_reason="([^"]+)"[^}]*\}\s+([\d.eE+]+)'
+)
+
+
+def summarize_vllm_metrics(text, prev=None):
+    """Map vLLM's Prometheus /metrics into the dashboard's metric snapshot.
+
+    vLLM exposes no live tokens/s gauge, so throughput is derived from the delta
+    of the cumulative token counters against the previous scrape (`prev`). Keys
+    reuse the llama.cpp snapshot names (processing/queued/*_tokens_total/...) so
+    the existing Summary + Server Metrics cards light up unchanged; vLLM-only
+    extras (prefix-cache hit, spec-decode acceptance, latency averages, success
+    breakdown) carry their own keys and are gated on engine=='vllm' in the UI.
+    """
+    values = parse_prometheus(text or "")
+    out = {"available": True, "engine": "vllm", "scraped_at": time.time()}
+
+    def num(name):
+        return values.get(name)
+
+    if num("vllm:num_requests_running") is not None:
+        out["processing"] = int(num("vllm:num_requests_running"))
+    if num("vllm:num_requests_waiting") is not None:
+        out["queued"] = int(num("vllm:num_requests_waiting"))
+    if num("vllm:kv_cache_usage_perc") is not None:
+        out["kv_cache_usage_ratio"] = num("vllm:kv_cache_usage_perc")
+    pt = num("vllm:prompt_tokens_total")
+    gt = num("vllm:generation_tokens_total")
+    if pt is not None:
+        out["prompt_tokens_total"] = int(pt)
+    if gt is not None:
+        out["gen_tokens_total"] = int(gt)
+    pq = num("vllm:prefix_cache_queries_total")
+    ph = num("vllm:prefix_cache_hits_total")
+    if pq:
+        out["prefix_cache_hit_pct"] = round(100.0 * (ph or 0) / pq, 1)
+    drafted = num("vllm:spec_decode_num_draft_tokens_total")
+    accepted = num("vllm:spec_decode_num_accepted_tokens_total")
+    if drafted:
+        out["spec_accept_pct"] = round(100.0 * (accepted or 0) / drafted, 1)
+    if num("vllm:num_preemptions_total") is not None:
+        out["preemptions_total"] = int(num("vllm:num_preemptions_total"))
+    # Histogram averages: sum / count (seconds -> ms).
+    for key, base in (
+        ("avg_ttft_ms", "vllm:time_to_first_token_seconds"),
+        ("avg_tpot_ms", "vllm:request_time_per_output_token_seconds"),
+        ("avg_e2e_ms", "vllm:e2e_request_latency_seconds"),
+    ):
+        s = values.get(base + "_sum")
+        c = values.get(base + "_count")
+        if s is not None and c:
+            out[key] = round(1000.0 * s / c, 1)
+    # Successful-request count, broken down by finish reason.
+    total = 0.0
+    by_reason = {}
+    for reason, raw in RE_VLLM_SUCCESS.findall(text or ""):
+        v = safe_float(raw) or 0.0
+        by_reason[reason] = int(v)
+        total += v
+    if by_reason:
+        out["requests_total"] = int(total)
+        out["success_by_reason"] = by_reason
+    # Throughput from cumulative-counter deltas vs the previous scrape.
+    if prev and prev.get("scraped_at"):
+        dt = out["scraped_at"] - prev["scraped_at"]
+        if dt > 0:
+            if pt is not None and prev.get("prompt_tokens_total") is not None:
+                out["prompt_tps_avg"] = max(
+                    0.0, (out["prompt_tokens_total"] - prev["prompt_tokens_total"]) / dt)
+            if gt is not None and prev.get("gen_tokens_total") is not None:
+                out["gen_tps_avg"] = max(
+                    0.0, (out["gen_tokens_total"] - prev["gen_tokens_total"]) / dt)
+    return out
+
+
+def poll_metrics(monitor_port):
+    """Scrape the model server's /metrics endpoint.
+
+    llama.cpp only serves /metrics under an insight preset (else it 404s →
+    available=False, so the dashboard hints at the preset). vLLM serves a richer
+    /metrics unconditionally but in its own dialect, so the engine (derived from
+    the live model_info) selects the summarizer.
     """
     url = f"http://127.0.0.1:{monitor_port}/metrics"
-    last_queue_state = None
+    last_sig = None
+    prev_vllm = None
     while True:
+        engine = infer_engine(state.model_info)
         text = fetch_text(url)
+        if engine == "vllm":
+            if text:
+                metrics = summarize_vllm_metrics(text, prev_vllm)
+                prev_vllm = metrics
+                state.set_metrics(metrics)
+                # Push while there's activity so throughput updates live, not
+                # only when the running/queued counts flip.
+                sig = (metrics.get("queued"), metrics.get("processing"),
+                       round(metrics.get("gen_tps_avg") or 0))
+                if sig != last_sig:
+                    last_sig = sig
+                    state.notify_subscribers()
+            else:
+                prev_vllm = None
+                if state.metrics.get("available"):
+                    state.set_metrics({"available": False, "engine": "vllm"})
+                    state.notify_subscribers()
+                elif not state.metrics:
+                    state.set_metrics({"available": False, "engine": "vllm"})
+            time.sleep(METRICS_POLL_INTERVAL)
+            continue
         values = parse_prometheus(text) if text else {}
         if values:
             metrics = summarize_metrics(values)
             state.set_metrics(metrics)
             queue_state = (metrics.get("queued"), metrics.get("processing"))
-            if queue_state != last_queue_state:
-                last_queue_state = queue_state
+            if queue_state != last_sig:
+                last_sig = queue_state
                 state.notify_subscribers()
         else:
             if state.metrics.get("available"):
@@ -2509,17 +2633,28 @@ ctlPost('/observer/api/switch',{variant:v,preset:p,force:(status!=='production'&
 function doInstallVariant(v,preset,force,retry,model,weightKey,modelDir){let msg=retry?`Install missing assets for '${v}' and retry switch?`:`Install assets for '${v}'?`;if(!confirm(msg))return;let body={variant:v,preset:preset||selectedPreset(),force:!!force,retry:!!retry};if(model)body.model=model;if(weightKey)body.weight_key=weightKey;if(modelDir)body.model_dir=modelDir;ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent=retry?'⏳ installing, then retrying switch…':'⏳ installing…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
-if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">/metrics disabled — restart with an insight preset to enable</span></div>';return}
+let vllm=m.engine==='vllm';
+if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">'+(vllm?'vLLM /metrics not reachable yet — model may still be loading':'/metrics disabled — restart with an insight preset to enable')+'</span></div>';return}
 q.textContent=m.queued??'-';q.className='summary-value '+((m.queued||0)>0?'hot':'');
 let rows='';
-rows+=infoRow('Processing / queued',`${m.processing??'-'} / ${(m.queued||0)>0?`<span class="hot">${m.queued}</span>`:m.queued??'-'}`,'requests_processing / requests_deferred — queued means all slots are busy');
-if(m.prompt_tps_avg!=null)rows+=infoRow('Avg prompt t/s',Number(m.prompt_tps_avg).toFixed(1),'server-lifetime average prompt processing throughput');
-if(m.gen_tps_avg!=null)rows+=infoRow('Avg gen t/s',Number(m.gen_tps_avg).toFixed(1),'server-lifetime average generation throughput');
+rows+=infoRow('Running / waiting',`${m.processing??'-'} / ${(m.queued||0)>0?`<span class="hot">${m.queued}</span>`:m.queued??'-'}`,vllm?'num_requests_running / num_requests_waiting':'requests_processing / requests_deferred — queued means all slots are busy');
+let tpsNote=vllm?'throughput over the last scrape interval (derived from token counters)':'server-lifetime average';
+if(m.prompt_tps_avg!=null)rows+=infoRow('Prompt t/s',Number(m.prompt_tps_avg).toFixed(1),tpsNote+' prompt processing throughput');
+if(m.gen_tps_avg!=null)rows+=infoRow('Gen t/s',Number(m.gen_tps_avg).toFixed(1),tpsNote+' generation throughput');
 if(m.prompt_tokens_total!=null)rows+=infoRow('Prompt tokens',Number(m.prompt_tokens_total).toLocaleString()+(m.prompt_seconds_total!=null?` <span class="label">(${Number(m.prompt_seconds_total).toFixed(0)}s)</span>`:''));
 if(m.gen_tokens_total!=null)rows+=infoRow('Generated tokens',Number(m.gen_tokens_total).toLocaleString()+(m.gen_seconds_total!=null?` <span class="label">(${Number(m.gen_seconds_total).toFixed(0)}s)</span>`:''));
 if(m.decode_calls_total!=null)rows+=infoRow('Decode calls',Number(m.decode_calls_total).toLocaleString());
 if(m.busy_slots_per_decode!=null)rows+=infoRow('Busy slots / decode',Number(m.busy_slots_per_decode).toFixed(2));
 if(m.kv_cache_usage_ratio!=null)rows+=infoRow('KV cache usage',(100*m.kv_cache_usage_ratio).toFixed(1)+'%');
+if(vllm){
+if(m.prefix_cache_hit_pct!=null)rows+=infoRow('Prefix cache hit',Number(m.prefix_cache_hit_pct).toFixed(1)+'%','prefix_cache_hits_total / prefix_cache_queries_total');
+if(m.spec_accept_pct!=null)rows+=infoRow('Spec-decode acceptance',Number(m.spec_accept_pct).toFixed(1)+'%','accepted / drafted speculative tokens');
+if(m.avg_ttft_ms!=null)rows+=infoRow('Avg TTFT',Number(m.avg_ttft_ms).toFixed(0)+' ms','time_to_first_token histogram mean');
+if(m.avg_tpot_ms!=null)rows+=infoRow('Avg time / output tok',Number(m.avg_tpot_ms).toFixed(1)+' ms','request_time_per_output_token histogram mean');
+if(m.avg_e2e_ms!=null)rows+=infoRow('Avg e2e latency',(m.avg_e2e_ms/1000).toFixed(2)+' s','e2e_request_latency histogram mean');
+if(m.requests_total!=null){let br=m.success_by_reason||{};let parts=Object.keys(br).filter(k=>br[k]>0).map(k=>`${esc(k)}: ${br[k]}`).join(', ');rows+=infoRow('Completed',Number(m.requests_total).toLocaleString()+(parts?` <span class="label">(${parts})</span>`:''),'request_success_total by finish reason')}
+if(m.preemptions_total)rows+=infoRow('Preemptions',Number(m.preemptions_total).toLocaleString(),'num_preemptions_total — requests evicted under KV pressure');
+}
 el.innerHTML=rows}
 async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
@@ -2637,7 +2772,7 @@ function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g
 <div class="row"><span class="label">VRAM</span><span class="value">${(g.mem_used_mib/1024).toFixed(1)} / ${(g.mem_total_mib/1024).toFixed(1)} GB</span></div><div class="bar"><div class="fill mem" style="width:${g.mem_util_pct}%"></div></div>
 <div class="row"><span class="label">Fan</span><span class="value">${g.fan_pct}%</span></div><div class="bar"><div class="fill fan" style="width:${g.fan_pct}%"></div></div>
 <div class="row"><span class="label">Power</span><span class="value">${g.power_w} / ${g.power_limit_w} W</span></div><div class="bar"><div class="fill power" style="width:${pct(g.power_w,g.power_limit_w)}%"></div></div></div>`}).join('')}
-function renderSummary(d){document.getElementById('active').textContent=d.active_count;document.getElementById('requests').textContent=d.requests.length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTemp.textContent=`${g.temp_c}°C`;gpuTemp.className='summary-value '+cls(g.temp_c);memTemp.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTemp.className='summary-value '+cls(g.mem_temp_c)}let done=d.requests.filter(r=>r.status==='completed'&&r.gen_tps>0);avgTps.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):'0'}
+function renderSummary(d){let m=d.metrics||{};let vllm=m.engine==='vllm';document.getElementById('active').textContent=vllm?(m.processing??0):d.active_count;document.getElementById('requests').textContent=vllm?Number(m.requests_total||0).toLocaleString():d.requests.length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTemp.textContent=`${g.temp_c}°C`;gpuTemp.className='summary-value '+cls(g.temp_c);memTemp.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTemp.className='summary-value '+cls(g.mem_temp_c)}let done=d.requests.filter(r=>r.status==='completed'&&r.gen_tps>0);avgTps.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):(vllm&&m.gen_tps_avg!=null?Number(m.gen_tps_avg).toFixed(1):'0')}
 function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getElementById('slotInfo').innerHTML=slots.length?slots.map(s=>{let hit=(s.cache_hit_pct==null)?'-':s.cache_hit_pct+'%';let badge=s.is_processing?'<span class="status processing">busy</span>':'<span class="status completed">idle</span>';return `<div class="gpu-card"><div class="gpu-name">Slot ${s.id} ${badge}</div>
 <div class="row"><span class="label">Context</span><span class="value ${cls(s.kv_pct)}">${(s.kv_used||0).toLocaleString()} / ${(s.n_ctx||nctx).toLocaleString()} (${s.kv_pct}%)</span></div><div class="bar"><div class="fill mem" style="width:${pct(s.kv_pct,100)}%"></div></div>
 <div class="row"><span class="label">Prompt cache hit</span><span class="value">${hit}</span></div><div class="bar"><div class="fill fan" style="width:${s.cache_hit_pct||0}%"></div></div>
@@ -2659,7 +2794,7 @@ let rawResp=r.response_detail_json?`<details><summary class="label" style="curso
 return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${renderMessages(r.request_messages)}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
 function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
 function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
-function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;document.getElementById('requestList').innerHTML=head+(body||'<div class="request-row"><span class="label">No requests yet</span></div>')}
+function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">vLLM doesn\'t emit per-request rows — see live throughput, latency, and KV/prefix-cache stats in the Server Metrics card above.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}
 connect();
 </script>
 </body></html>"""

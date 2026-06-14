@@ -1456,6 +1456,104 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(state.snapshot()["metrics"]["queued"], 2)
 
 
+VLLM_METRICS_SAMPLE = """\
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+vllm:num_requests_running{engine="0",model_name="qwen3.6-27b"} 2.0
+vllm:num_requests_waiting{engine="0",model_name="qwen3.6-27b"} 1.0
+vllm:kv_cache_usage_perc{engine="0",model_name="qwen3.6-27b"} 0.031
+vllm:prompt_tokens_total{engine="0",model_name="qwen3.6-27b"} 12947409.0
+vllm:generation_tokens_total{engine="0",model_name="qwen3.6-27b"} 81664.0
+vllm:prompt_tokens_cached_total{engine="0",model_name="qwen3.6-27b"} 900000.0
+vllm:prefix_cache_queries_total{engine="0",model_name="qwen3.6-27b"} 1000.0
+vllm:prefix_cache_hits_total{engine="0",model_name="qwen3.6-27b"} 826.0
+vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="qwen3.6-27b"} 3000.0
+vllm:spec_decode_num_accepted_tokens_total{engine="0",model_name="qwen3.6-27b"} 2400.0
+vllm:num_preemptions_total{engine="0",model_name="qwen3.6-27b"} 4.0
+vllm:request_success_total{engine="0",finished_reason="stop",model_name="qwen3.6-27b"} 600.0
+vllm:request_success_total{engine="0",finished_reason="length",model_name="qwen3.6-27b"} 58.0
+vllm:request_success_total{engine="0",finished_reason="abort",model_name="qwen3.6-27b"} 0.0
+vllm:time_to_first_token_seconds_sum{engine="0",model_name="qwen3.6-27b"} 12.0
+vllm:time_to_first_token_seconds_count{engine="0",model_name="qwen3.6-27b"} 100.0
+vllm:request_time_per_output_token_seconds_sum{engine="0",model_name="qwen3.6-27b"} 5.0
+vllm:request_time_per_output_token_seconds_count{engine="0",model_name="qwen3.6-27b"} 100.0
+vllm:e2e_request_latency_seconds_sum{engine="0",model_name="qwen3.6-27b"} 300.0
+vllm:e2e_request_latency_seconds_count{engine="0",model_name="qwen3.6-27b"} 100.0
+"""
+
+
+class EngineDetectTests(unittest.TestCase):
+    def test_detects_vllm_from_compose_path(self):
+        info = {"compose_file": "models/qwen3.6-27b/vllm/compose/dual/fp8.yml"}
+        self.assertEqual(aipc_observer.infer_engine(info), "vllm")
+
+    def test_detects_vllm_from_image(self):
+        self.assertEqual(
+            aipc_observer.infer_engine({"image": "vllm/vllm-openai:v0.22.0"}),
+            "vllm",
+        )
+
+    def test_detects_llamacpp_family(self):
+        self.assertEqual(
+            aipc_observer.infer_engine({"variant": "ik-llama/prism-pro-dq-dual"}),
+            "llamacpp",
+        )
+        self.assertEqual(
+            aipc_observer.infer_engine(
+                {"compose_file": "models/m/llamacpp/compose/dual.yml"}),
+            "llamacpp",
+        )
+
+    def test_unknown_when_unpopulated(self):
+        self.assertIsNone(aipc_observer.infer_engine({}))
+        self.assertIsNone(aipc_observer.infer_engine(None))
+
+
+class VllmMetricsTests(unittest.TestCase):
+    def test_maps_core_gauges_and_engine_marker(self):
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        self.assertEqual(m["engine"], "vllm")
+        self.assertTrue(m["available"])
+        self.assertEqual(m["processing"], 2)
+        self.assertEqual(m["queued"], 1)
+        self.assertIsInstance(m["queued"], int)
+        self.assertAlmostEqual(m["kv_cache_usage_ratio"], 0.031)
+        self.assertEqual(m["prompt_tokens_total"], 12947409)
+        self.assertEqual(m["gen_tokens_total"], 81664)
+        self.assertEqual(m["preemptions_total"], 4)
+
+    def test_derives_rates_and_latency_averages(self):
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        self.assertAlmostEqual(m["prefix_cache_hit_pct"], 82.6)
+        self.assertAlmostEqual(m["spec_accept_pct"], 80.0)
+        self.assertAlmostEqual(m["avg_ttft_ms"], 120.0)
+        self.assertAlmostEqual(m["avg_tpot_ms"], 50.0)
+        self.assertAlmostEqual(m["avg_e2e_ms"], 3000.0)
+
+    def test_success_total_breaks_down_by_reason(self):
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        self.assertEqual(m["requests_total"], 658)
+        self.assertEqual(m["success_by_reason"]["stop"], 600)
+        self.assertEqual(m["success_by_reason"]["length"], 58)
+
+    def test_throughput_from_counter_deltas(self):
+        prev = {
+            "scraped_at": aipc_observer.time.time() - 10,
+            "prompt_tokens_total": 12947409 - 1000,
+            "gen_tokens_total": 81664 - 200,
+        }
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
+        self.assertGreater(m["prompt_tps_avg"], 0)
+        self.assertGreater(m["gen_tps_avg"], 0)
+        # No prior scrape → no throughput (avoids a bogus first-poll spike).
+        first = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        self.assertNotIn("gen_tps_avg", first)
+
+    def test_unavailable_when_empty(self):
+        m = aipc_observer.summarize_vllm_metrics("")
+        self.assertEqual(m["engine"], "vllm")
+        self.assertNotIn("processing", m)
+
+
 class TraceLogTests(unittest.TestCase):
     """Lines that only appear at -lv 4 (the insight presets)."""
 
