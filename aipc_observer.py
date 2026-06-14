@@ -2460,6 +2460,7 @@ DASHBOARD_HTML = """<!doctype html>
 </div></div>
 <div id="variantModal" class="modal" onclick="if(event.target===this)closeVariantList()"><div class="modal-panel">
 <div class="modal-head"><h2 id="variantModalTitle">Variants</h2><button class="btn" onclick="closeVariantList()">Close</button></div>
+<div id="variantModalStatus" style="display:none;padding:8px 16px;font-size:12px;border-bottom:1px solid var(--border);color:var(--accent);background:rgba(88,166,255,.06);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
 <div id="variantModalBody" class="modal-body"></div>
 </div></div>
 <div id="requestModal" class="modal" onclick="if(event.target===this)closeRequestDetail()"><div class="modal-panel">
@@ -2538,6 +2539,8 @@ return `<div class="variant-row"><span><div class="variant-name">${mark}${esc(k)
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`Variants for this machine (${fits.length})`;
 document.getElementById('variantModalBody').innerHTML=rows;
+let cs=d.control_status||{};let vms=document.getElementById('variantModalStatus');
+if(cs.action&&!cs.done){let icon=cs.action==='install'?'📦 ':'⏳ ';vms.textContent=icon+esc(cs.detail||cs.action+'…');vms.style.display=''}else{vms.style.display='none'}
 }
 function openVariantList(){if(!lastRenderData)return;let d=lastRenderData;let c=d.catalog||{};let vars=c.variants||{};let keys=Object.keys(vars);let mi=d.model_info||{};let running=!!d.container;let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;let ngpu=(d.gpu_stats||[]).length||1;let reqGpus=p=>p.indexOf('/multi4/')>=0?4:(p.indexOf('/dual/')>=0?2:1);let fits=keys.filter(k=>reqGpus(vars[k].compose_path||'')<=ngpu&&(vars[k].tp||1)<=ngpu);renderVariantListModal(d,fits,runKey,running);document.getElementById('variantModal').classList.add('open')}
 function refreshVariantListIfOpen(){let m=document.getElementById('variantModal');if(m&&m.classList.contains('open'))openVariantList()}
