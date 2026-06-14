@@ -1654,6 +1654,17 @@ class VllmLogTrackerTests(unittest.TestCase):
         self.assertEqual(
             aipc_observer._vllm_extract_output(self.NONSTREAM), "ok")
 
+    def test_log_tracker_routes_by_engine(self):
+        # Unknown engine (model_info not populated yet) -> llama.cpp default;
+        # a vLLM model_info routes to the vLLM tracker. Evaluating per line means
+        # routing self-corrects once model_info lands mid-stream.
+        self.assertIs(aipc_observer.log_tracker_for({}),
+                      aipc_observer.request_tracker)
+        self.assertIs(
+            aipc_observer.log_tracker_for(
+                {"compose_file": "models/m/vllm/compose/dual.yml"}),
+            aipc_observer.vllm_log_tracker)
+
 
 class TraceLogTests(unittest.TestCase):
     """Lines that only appear at -lv 4 (the insight presets)."""
