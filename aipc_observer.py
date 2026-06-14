@@ -89,12 +89,18 @@ class ObserverState:
         self.installed_assets = {}
         # Latest scrape of the llama.cpp Prometheus /metrics endpoint.
         self.metrics = {}
+        # Rolling history of vLLM metric samples for the live activity timeline.
+        self.vllm_history = deque(maxlen=180)
         # Progress of the current/last async control action (model switch).
         self.control_status = {}
 
     def add_request(self, req):
         with self.lock:
             self.requests.append(req)
+
+    def add_vllm_sample(self, sample):
+        with self.lock:
+            self.vllm_history.append(sample)
 
     def add_gpu_stats(self, stats):
         with self.lock:
@@ -293,6 +299,7 @@ class ObserverState:
                 "catalog_diff": dict(self.catalog_diff),
                 "installed_assets": dict(self.installed_assets),
                 "metrics": dict(self.metrics),
+                "vllm_history": list(self.vllm_history),
                 "control_status": dict(self.control_status),
                 "control_busy": _control_lock.locked(),
                 "uptime_seconds": uptime,
@@ -1042,6 +1049,20 @@ INSIGHT_PRESETS = {
     for name, caps in PRESET_CAPABILITIES.items()
 }
 
+# vLLM speaks its own flags, and the llama.cpp capability/--help machinery
+# doesn't apply (vLLM's `serve --help` can't even run in a busy container — it
+# re-infers the GPU device and errors). So non-baseline presets just turn on
+# vLLM's per-request logging, which feeds the dashboard's request rows. Output
+# logging is what carries the finish reason + output token ids per request.
+VLLM_REQUEST_LOG_FLAGS = [("--enable-log-requests", None),
+                          ("--enable-log-outputs", None)]
+VLLM_PRESET_FLAGS = {
+    "baseline": [],
+    "insight": VLLM_REQUEST_LOG_FLAGS,
+    "insight-cache": VLLM_REQUEST_LOG_FLAGS,
+    "insight-debug": VLLM_REQUEST_LOG_FLAGS,
+}
+
 _control_lock = threading.Lock()
 
 
@@ -1368,8 +1389,13 @@ def restart_model(preset_name, model_info=None, runner=_run,
     if preset_name != "baseline":
         baseline = compose_baseline_command(compose_file, mi["service"], env,
                                             cwd, runner=runner)
-        tweaks, dropped = resolve_preset(
-            preset_name, _supported_flags(mi, help_getter))
+        if infer_engine(mi) == "vllm":
+            # vLLM: inject its own request-logging flags directly; the llama.cpp
+            # --help capability probe doesn't apply (and can't run here).
+            tweaks = VLLM_PRESET_FLAGS.get(preset_name, VLLM_REQUEST_LOG_FLAGS)
+        else:
+            tweaks, dropped = resolve_preset(
+                preset_name, _supported_flags(mi, help_getter))
         argv = apply_preset_to_command(baseline, tweaks)
     # Always pin the running image: launchers may have injected a different
     # image (e.g. BEELLAMA_IMAGE) than the compose file's fallback, and a
@@ -1876,6 +1902,19 @@ def summarize_vllm_metrics(text, prev=None):
     return out
 
 
+def vllm_timeline_sample(metrics):
+    """Compact a vLLM metric snapshot into one point on the activity timeline."""
+    return {
+        "t": metrics.get("scraped_at") or time.time(),
+        "running": metrics.get("processing") or 0,
+        "waiting": metrics.get("queued") or 0,
+        "gen_tps": round(metrics.get("gen_tps_avg") or 0, 1),
+        "prompt_tps": round(metrics.get("prompt_tps_avg") or 0, 1),
+        "kv": round(100 * (metrics.get("kv_cache_usage_ratio") or 0), 1),
+        "spec": metrics.get("spec_accept_pct"),
+    }
+
+
 def poll_metrics(monitor_port):
     """Scrape the model server's /metrics endpoint.
 
@@ -1895,6 +1934,7 @@ def poll_metrics(monitor_port):
                 metrics = summarize_vllm_metrics(text, prev_vllm)
                 prev_vllm = metrics
                 state.set_metrics(metrics)
+                state.add_vllm_sample(vllm_timeline_sample(metrics))
                 # Push while there's activity so throughput updates live, not
                 # only when the running/queued counts flip.
                 sig = (metrics.get("queued"), metrics.get("processing"),
@@ -2498,11 +2538,103 @@ class RequestTracker:
 request_tracker = RequestTracker()
 
 
-def tail_docker_logs(container, monitor_port):
-    """Tail llama.cpp logs, auto-detecting the container when not pinned.
+# vLLM's --enable-log-requests / --enable-log-outputs lines (see RequestLogger
+# in vllm/entrypoints/logger.py). Arrival logs params (not the prompt, at INFO);
+# the response log carries output_token_ids + finish_reason, and the two log
+# timestamps bracket the request so latency is the wall time between them.
+RE_VLLM_RECV = re.compile(r"Received request (\S+?): params: (.*), lora_request:")
+RE_VLLM_RESP_ID = re.compile(
+    r"Generated response (\S+?)(?: \(streaming[^)]*\))?: output:")
+RE_VLLM_RESP_TAIL = re.compile(
+    r"output_token_ids: (\[[\d,\s]*\]|None), finish_reason: (\S+)")
+RE_VLLM_MAXTOK = re.compile(r"max_tokens=(\d+)")
+RE_VLLM_TEMP = re.compile(r"temperature=([\d.]+)")
 
-    Re-detects after the stream ends (container restart) so the observer keeps
-    working across redeploys without a hardcoded container name.
+
+class VllmLogTracker:
+    """Turn vLLM request/response log lines into the dashboard's request rows.
+
+    Only active when the model runs with the insight preset (which injects
+    --enable-log-requests/--enable-log-outputs). Streaming responses emit a
+    final non-delta "Generated response" line we finalize on; per-delta lines
+    are skipped. Prompt token counts aren't logged at INFO, so PT stays blank.
+    """
+
+    def __init__(self, observer_state=None):
+        self.state = observer_state or state
+        self.active = {}
+        self.counter = 0
+
+    def process_line(self, line):
+        m = RE_VLLM_RECV.search(line)
+        if m:
+            rid, params = m.group(1), m.group(2)
+            now = time.time()
+            self.counter += 1
+            mt = RE_VLLM_MAXTOK.search(params)
+            tp = RE_VLLM_TEMP.search(params)
+            req = {
+                "id": self.counter, "task_id": rid, "request_id": rid,
+                "start_time": now, "start_time_str": local_time_str(now),
+                "status": "processing", "path": "/v1/chat/completions",
+                "model": self.state.model_name or "vllm",
+                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "ttft_ms": 0, "prompt_tps": 0, "gen_tps": 0,
+                "prompt_eval_ms": 0, "eval_ms": 0, "total_ms": 0,
+                "cache_hit_pct": None, "finish_reason": None,
+                "max_tokens": int(mt.group(1)) if mt else None,
+                "temperature": float(tp.group(1)) if tp else None,
+            }
+            self.active[rid] = req
+            self.state.add_active_request(req)
+            self.state.notify_subscribers()
+            return
+        if "(streaming delta)" in line:
+            return
+        m = RE_VLLM_RESP_ID.search(line)
+        if m:
+            rid = m.group(1)
+            now = time.time()
+            req = self.active.pop(rid, None)
+            if req is None:
+                self.counter += 1
+                req = {"id": self.counter, "task_id": rid, "request_id": rid,
+                       "start_time": now, "start_time_str": local_time_str(now),
+                       "path": "/v1/chat/completions",
+                       "model": self.state.model_name or "vllm",
+                       "prompt_tokens": 0}
+            tail = RE_VLLM_RESP_TAIL.search(line)
+            toks, reason = 0, None
+            if tail:
+                ids = tail.group(1)
+                if ids != "None" and ids.strip("[] "):
+                    toks = ids.count(",") + 1
+                reason = tail.group(2)
+            elapsed = now - req.get("start_time", now)
+            req.update({
+                "status": "cancelled" if reason in ("abort", "error")
+                else "completed",
+                "completion_tokens": toks,
+                "total_tokens": (req.get("prompt_tokens") or 0) + toks,
+                "finish_reason": reason,
+                "total_ms": round(elapsed * 1000, 1),
+                "end_time": now, "end_time_str": local_time_str(now),
+                "gen_tps": round(toks / elapsed, 1) if elapsed > 0 and toks else 0,
+            })
+            self.state.remove_active_request(rid)
+            self.state.add_request(req)
+            self.state.notify_subscribers()
+
+
+vllm_log_tracker = VllmLogTracker()
+
+
+def tail_docker_logs(container, monitor_port):
+    """Tail the model container logs, auto-detecting it when not pinned.
+
+    Dispatches each line to the engine-appropriate parser (vLLM vs the llama.cpp
+    family). Re-detects after the stream ends (container restart) so the observer
+    keeps working across redeploys without a hardcoded container name.
     """
     while True:
         target = container or detect_container(monitor_port)
@@ -2510,6 +2642,8 @@ def tail_docker_logs(container, monitor_port):
             time.sleep(CONTAINER_DETECT_INTERVAL)
             continue
         state.set_container(target)
+        tracker = (vllm_log_tracker if infer_engine(state.model_info) == "vllm"
+                   else request_tracker)
         try:
             proc = subprocess.Popen(
                 ["docker", "logs", "-f", "--tail", "100", target],
@@ -2520,7 +2654,7 @@ def tail_docker_logs(container, monitor_port):
             print(f"Observer tailing docker logs for {target}", file=sys.stderr)
             for line in proc.stdout:
                 try:
-                    request_tracker.process_line(line)
+                    tracker.process_line(line)
                 except Exception as e:
                     print(f"Observer log parse error: {e} ({line[:100]})",
                           file=sys.stderr)
@@ -2567,6 +2701,7 @@ DASHBOARD_HTML = """<!doctype html>
 </select><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
+<section class="card full" id="vllmTimelineCard"><h2>vLLM Activity (live)</h2><div id="vllmTimeline"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
@@ -2615,7 +2750,7 @@ function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
 let lastBusy=false;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doInstallVariant('${esc(h.variant)}','${esc(h.preset||selectedPreset())}',${h.force?'true':'false'},true,'${esc(h.model||'')}','${esc(h.weight_key||'')}','${esc(h.model_dir||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
@@ -2656,6 +2791,9 @@ if(m.requests_total!=null){let br=m.success_by_reason||{};let parts=Object.keys(
 if(m.preemptions_total)rows+=infoRow('Preemptions',Number(m.preemptions_total).toLocaleString(),'num_preemptions_total — requests evicted under KV pressure');
 }
 el.innerHTML=rows}
+function renderVllmTimeline(d){let card=document.getElementById('vllmTimelineCard');let el=document.getElementById('vllmTimeline');let m=d.metrics||{};if(m.engine!=='vllm'){card.style.display='none';return}card.style.display='';let h=d.vllm_history||[];if(!h.length){el.innerHTML='<div class="row"><span class="label">no samples yet</span></div>';return}
+let spark=(key,color,unit,dec)=>{let vals=h.map(s=>Number(s[key])||0);let max=Math.max(1,...vals);let bars=vals.map(v=>`<span style="display:inline-block;width:3px;margin-right:1px;background:${color};height:${Math.max(1,Math.round(30*v/max))}px;vertical-align:bottom" title="${v}${unit}"></span>`).join('');let last=vals[vals.length-1];let peak=Math.max(...vals);return `<div class="row" style="align-items:flex-end"><span class="label" style="min-width:130px">${key}</span><span style="height:32px;line-height:0;flex:1;overflow:hidden;white-space:nowrap">${bars}</span><span class="value" style="min-width:120px;text-align:right">${last.toFixed(dec||0)}${unit} <span class="label">(peak ${peak.toFixed(dec||0)})</span></span></div>`};
+let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
 async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
@@ -2794,7 +2932,7 @@ let rawResp=r.response_detail_json?`<details><summary class="label" style="curso
 return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${renderMessages(r.request_messages)}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
 function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
 function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
-function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">vLLM does not emit per-request rows — see live throughput, latency, and KV/prefix-cache stats in the Server Metrics card above.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}
+function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">No request rows yet — pick the insight preset and Restart model to enable vLLM request logging (PT/TTFT stay blank: vLLM does not log them at INFO). Live throughput/latency are in the cards above.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}
 connect();
 </script>
 </body></html>"""

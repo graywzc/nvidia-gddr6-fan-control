@@ -1190,6 +1190,23 @@ class RestartModelTests(unittest.TestCase):
         self.assertEqual(svc["image"], "img:1")
         self.assertNotIn("command", svc)
 
+    def test_vllm_insight_injects_request_logging_flags(self):
+        import json
+
+        mi = dict(MODEL_INFO)
+        mi["image"] = "vllm/vllm-openai:v0.22.0"
+        mi["compose_file"] = "/repo/models/m/vllm/compose/dual/fp8.yml"
+        mi["working_dir"] = "/repo/models/m/vllm/compose/dual"
+        result = self._restart("insight", model_info=mi)
+        # vLLM never drops capabilities (it bypasses the llama.cpp --help probe).
+        self.assertEqual(result["dropped_capabilities"], [])
+        with open(self.override_path) as f:
+            argv = json.load(f)["services"]["svc"]["command"]
+        self.assertIn("--enable-log-requests", argv)
+        self.assertIn("--enable-log-outputs", argv)
+        # llama.cpp insight flags must NOT leak onto a vLLM command.
+        self.assertNotIn("--metrics", argv)
+
 
 class PresetResolveTests(unittest.TestCase):
     """Preset capabilities resolve to the flags each build advertises."""
@@ -1552,6 +1569,72 @@ class VllmMetricsTests(unittest.TestCase):
         m = aipc_observer.summarize_vllm_metrics("")
         self.assertEqual(m["engine"], "vllm")
         self.assertNotIn("processing", m)
+
+    def test_timeline_sample_is_compact(self):
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        s = aipc_observer.vllm_timeline_sample(m)
+        self.assertEqual(s["running"], 2)
+        self.assertEqual(s["waiting"], 1)
+        self.assertAlmostEqual(s["kv"], 3.1)
+        self.assertEqual(s["spec"], m["spec_accept_pct"])
+        self.assertIn("t", s)
+
+
+class VllmLogTrackerTests(unittest.TestCase):
+    RECV = ("(APIServer pid=1) INFO 06-14 17:27:48 [logger.py:39] Received "
+            "request chatcmpl-abc: params: SamplingParams(temperature=0.7, "
+            "max_tokens=512, top_p=0.9), lora_request: None.")
+    RESP = ("(APIServer pid=1) INFO 06-14 17:27:50 [logger.py:71] Generated "
+            "response chatcmpl-abc (streaming complete): output: 'hi there', "
+            "output_token_ids: [1, 2, 3, 4], finish_reason: stop")
+
+    def setUp(self):
+        self.state = aipc_observer.ObserverState()
+        self.tracker = aipc_observer.VllmLogTracker(self.state)
+
+    def test_arrival_creates_active_row_with_params(self):
+        self.tracker.process_line(self.RECV)
+        snap = self.state.snapshot()
+        self.assertEqual(len(snap["active_requests"]), 1)
+        row = snap["active_requests"][0]
+        self.assertEqual(row["task_id"], "chatcmpl-abc")
+        self.assertEqual(row["status"], "processing")
+        self.assertEqual(row["max_tokens"], 512)
+        self.assertAlmostEqual(row["temperature"], 0.7)
+
+    def test_response_finalizes_row(self):
+        self.tracker.process_line(self.RECV)
+        self.tracker.process_line(self.RESP)
+        snap = self.state.snapshot()
+        self.assertEqual(len(snap["active_requests"]), 0)
+        self.assertEqual(len(snap["requests"]), 1)
+        row = snap["requests"][0]
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["completion_tokens"], 4)
+        self.assertEqual(row["finish_reason"], "stop")
+        self.assertGreaterEqual(row["total_ms"], 0)
+
+    def test_streaming_delta_lines_are_ignored(self):
+        delta = self.RESP.replace("(streaming complete)", "(streaming delta)")
+        self.tracker.process_line(self.RECV)
+        self.tracker.process_line(delta)
+        # Still in-flight: a delta must not finalize the row.
+        self.assertEqual(len(self.state.snapshot()["active_requests"]), 1)
+        self.assertEqual(len(self.state.snapshot()["requests"]), 0)
+
+    def test_abort_marks_cancelled(self):
+        self.tracker.process_line(self.RECV)
+        self.tracker.process_line(self.RESP.replace("finish_reason: stop",
+                                                    "finish_reason: abort"))
+        self.assertEqual(self.state.snapshot()["requests"][0]["status"],
+                         "cancelled")
+
+    def test_response_without_arrival_still_logs(self):
+        # Observer started mid-stream: a completion with no prior arrival.
+        self.tracker.process_line(self.RESP)
+        reqs = self.state.snapshot()["requests"]
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0]["completion_tokens"], 4)
 
 
 class TraceLogTests(unittest.TestCase):
