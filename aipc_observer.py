@@ -2539,91 +2539,141 @@ request_tracker = RequestTracker()
 
 
 # vLLM's --enable-log-requests / --enable-log-outputs lines (see RequestLogger
-# in vllm/entrypoints/logger.py). Arrival logs params (not the prompt, at INFO);
-# the response log carries output_token_ids + finish_reason, and the two log
-# timestamps bracket the request so latency is the wall time between them.
+# in vllm/entrypoints/logger.py). Arrival logs params (not the prompt, at INFO).
+# Streaming responses log one line per token delta (each with its own
+# output_token_ids chunk + finish_reason: None) then a final "streaming
+# complete" line whose own output_token_ids is None and finish_reason is the
+# literal "streaming_complete" — so the real output token count is summed from
+# the deltas and the timing comes from the delta timestamps. Non-streaming
+# responses log a single line carrying the full token id list + finish_reason.
 RE_VLLM_RECV = re.compile(r"Received request (\S+?): params: (.*), lora_request:")
 RE_VLLM_RESP_ID = re.compile(
     r"Generated response (\S+?)(?: \(streaming[^)]*\))?: output:")
-RE_VLLM_RESP_TAIL = re.compile(
-    r"output_token_ids: (\[[\d,\s]*\]|None), finish_reason: (\S+)")
+RE_VLLM_IDS = re.compile(r"output_token_ids: (\[[\d,\s]*\]|None)")
+RE_VLLM_FINISH = re.compile(r"finish_reason: (\S+)\s*$")
 RE_VLLM_MAXTOK = re.compile(r"max_tokens=(\d+)")
 RE_VLLM_TEMP = re.compile(r"temperature=([\d.]+)")
+VLLM_OUTPUT_PREVIEW_MAX = 2000
+
+
+def _vllm_count_ids(line):
+    """Count the token ids in a 'Generated response' line (0 for None/empty)."""
+    m = RE_VLLM_IDS.search(line)
+    if not m or m.group(1) == "None" or not m.group(1).strip("[] "):
+        return 0
+    return m.group(1).count(",") + 1
+
+
+def _vllm_extract_output(line, limit=VLLM_OUTPUT_PREVIEW_MAX):
+    """Pull the response text out of a 'Generated response' line's output: %r."""
+    head, sep, _ = line.rpartition(", output_token_ids:")
+    if not sep:
+        return None
+    i = head.find("output: ")
+    if i < 0:
+        return None
+    s = head[i + len("output: "):].strip()
+    if len(s) >= 2 and s[0] in "'\"" and s[-1] == s[0]:
+        s = s[1:-1]
+    s = (s.replace("\\n", "\n").replace("\\t", "\t")
+          .replace("\\'", "'").replace('\\"', '"'))
+    return s[:limit]
 
 
 class VllmLogTracker:
     """Turn vLLM request/response log lines into the dashboard's request rows.
 
-    Only active when the model runs with the insight preset (which injects
-    --enable-log-requests/--enable-log-outputs). Streaming responses emit a
-    final non-delta "Generated response" line we finalize on; per-delta lines
-    are skipped. Prompt token counts aren't logged at INFO, so PT stays blank.
+    Active only under the insight preset (which injects --enable-log-requests /
+    --enable-log-outputs). Output tokens are accumulated across streaming delta
+    lines (the final line reports None); TTFT is arrival -> first delta, and the
+    generation rate is tokens over the delta span. Prompt tokens aren't logged
+    at INFO so PT stays blank; the streaming finish reason is always reported as
+    "stop" since vLLM only logs "streaming_complete" there.
     """
 
     def __init__(self, observer_state=None):
         self.state = observer_state or state
-        self.active = {}
+        self.active = {}   # request_id -> display row (shared into state)
+        self.meta = {}     # request_id -> delta accounting {tokens,first,last,push}
         self.counter = 0
+
+    def _new_row(self, rid, now, params=None):
+        self.counter += 1
+        mt = RE_VLLM_MAXTOK.search(params) if params else None
+        tp = RE_VLLM_TEMP.search(params) if params else None
+        return {
+            "id": self.counter, "task_id": rid, "request_id": rid,
+            "start_time": now, "start_time_str": local_time_str(now),
+            "status": "processing", "path": "/v1/chat/completions",
+            "model": self.state.model_name or "vllm",
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "ttft_ms": 0, "prompt_tps": 0, "gen_tps": 0,
+            "prompt_eval_ms": 0, "eval_ms": 0, "total_ms": 0,
+            "cache_hit_pct": None, "finish_reason": None,
+            "max_tokens": int(mt.group(1)) if mt else None,
+            "temperature": float(tp.group(1)) if tp else None,
+        }
 
     def process_line(self, line):
         m = RE_VLLM_RECV.search(line)
         if m:
-            rid, params = m.group(1), m.group(2)
-            now = time.time()
-            self.counter += 1
-            mt = RE_VLLM_MAXTOK.search(params)
-            tp = RE_VLLM_TEMP.search(params)
-            req = {
-                "id": self.counter, "task_id": rid, "request_id": rid,
-                "start_time": now, "start_time_str": local_time_str(now),
-                "status": "processing", "path": "/v1/chat/completions",
-                "model": self.state.model_name or "vllm",
-                "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-                "ttft_ms": 0, "prompt_tps": 0, "gen_tps": 0,
-                "prompt_eval_ms": 0, "eval_ms": 0, "total_ms": 0,
-                "cache_hit_pct": None, "finish_reason": None,
-                "max_tokens": int(mt.group(1)) if mt else None,
-                "temperature": float(tp.group(1)) if tp else None,
-            }
+            rid, now = m.group(1), time.time()
+            req = self._new_row(rid, now, m.group(2))
             self.active[rid] = req
+            self.meta[rid] = {"tokens": 0, "first": None, "last": now, "push": 0.0}
             self.state.add_active_request(req)
             self.state.notify_subscribers()
             return
-        if "(streaming delta)" in line:
+        if "Generated response" not in line:
             return
         m = RE_VLLM_RESP_ID.search(line)
-        if m:
-            rid = m.group(1)
-            now = time.time()
-            req = self.active.pop(rid, None)
-            if req is None:
-                self.counter += 1
-                req = {"id": self.counter, "task_id": rid, "request_id": rid,
-                       "start_time": now, "start_time_str": local_time_str(now),
-                       "path": "/v1/chat/completions",
-                       "model": self.state.model_name or "vllm",
-                       "prompt_tokens": 0}
-            tail = RE_VLLM_RESP_TAIL.search(line)
-            toks, reason = 0, None
-            if tail:
-                ids = tail.group(1)
-                if ids != "None" and ids.strip("[] "):
-                    toks = ids.count(",") + 1
-                reason = tail.group(2)
-            elapsed = now - req.get("start_time", now)
-            req.update({
-                "status": "cancelled" if reason in ("abort", "error")
-                else "completed",
-                "completion_tokens": toks,
-                "total_tokens": (req.get("prompt_tokens") or 0) + toks,
-                "finish_reason": reason,
-                "total_ms": round(elapsed * 1000, 1),
-                "end_time": now, "end_time_str": local_time_str(now),
-                "gen_tps": round(toks / elapsed, 1) if elapsed > 0 and toks else 0,
-            })
-            self.state.remove_active_request(rid)
-            self.state.add_request(req)
-            self.state.notify_subscribers()
+        if not m:
+            return
+        rid, now = m.group(1), time.time()
+        if "(streaming delta)" in line:
+            meta = self.meta.get(rid)
+            if meta is None:
+                return  # arrival not seen (observer started mid-stream)
+            meta["tokens"] += _vllm_count_ids(line)
+            if meta["first"] is None:
+                meta["first"] = now
+            meta["last"] = now
+            req = self.active.get(rid)
+            if req is not None and now - meta["push"] > 0.5:
+                meta["push"] = now  # throttle live pushes, not one per token
+                self.state.update_active_request(rid, {
+                    "completion_tokens": meta["tokens"],
+                    "ttft_ms": round((meta["first"] - req["start_time"]) * 1000, 1),
+                })
+                self.state.notify_subscribers()
+            return
+        # Completion: a streaming-complete line, or a whole non-streaming response.
+        req = self.active.pop(rid, None) or self._new_row(rid, now)
+        meta = self.meta.pop(rid, {})
+        toks = _vllm_count_ids(line) or meta.get("tokens", 0)
+        fin = RE_VLLM_FINISH.search(line)
+        reason = fin.group(1) if fin else None
+        if reason in (None, "None", "streaming_complete"):
+            reason = "stop"
+        first = meta.get("first")
+        if first:
+            req["ttft_ms"] = round((first - req["start_time"]) * 1000, 1)
+        gen_secs = (now - first) if first else (now - req.get("start_time", now))
+        output = _vllm_extract_output(line)
+        req.update({
+            "status": "cancelled" if reason in ("abort", "error") else "completed",
+            "completion_tokens": toks,
+            "total_tokens": (req.get("prompt_tokens") or 0) + toks,
+            "finish_reason": reason,
+            "total_ms": round((now - req.get("start_time", now)) * 1000, 1),
+            "end_time": now, "end_time_str": local_time_str(now),
+            "gen_tps": round(toks / gen_secs, 1) if gen_secs > 0 and toks else 0,
+        })
+        if output:
+            req["response_output"] = output
+        self.state.remove_active_request(rid)
+        self.state.add_request(req)
+        self.state.notify_subscribers()
 
 
 vllm_log_tracker = VllmLogTracker()
@@ -2926,10 +2976,13 @@ function rowAttrs(r){let k=requestKey(r);requestRowsByKey[k]=r;return ` role="bu
 function detailField(label,value){if(value===undefined||value===null||value==='')return '';return `<div class="row"><span class="label">${label}</span><span class="value">${esc(value)}</span></div>`}
 function renderMessages(messages){if(!messages||!messages.length)return '<div class="label">No request body captured. Restart with insight+debug to log messages.</div>';return messages.map(m=>`<div class="message-card"><div class="message-role">${esc(m.role||'message')}${m.name?' · '+esc(m.name):''}</div><div class="prewrap">${esc(m.content||'')}</div></div>`).join('')}
 function renderRequestDetail(r){let meta='';meta+=detailField('Status',r.status);meta+=detailField('Task',r.task_id);meta+=detailField('Group',r.request_group_label);meta+=detailField('Group id',r.request_group_id);meta+=detailField('Model',r.request_model||r.model);meta+=detailField('Messages',r.request_message_count);meta+=detailField('Tools',r.request_tools_count);meta+=detailField('Response format',r.request_has_response_format?'yes':'');meta+=detailField('Stream',r.request_stream?'yes':'');meta+=detailField('Finish reason',r.response_finish_reason||r.finish_reason);
-let out=r.response_output?`<div class="prewrap">${esc(r.response_output)}</div>`:'<div class="label">No response body captured yet. Non-streaming responses require insight+debug logs.</div>';
+let vllm=!!r.request_id;
+if(vllm){meta+=detailField('Max tokens',r.max_tokens);meta+=detailField('Temperature',r.temperature);meta+=detailField('Output tokens',r.completion_tokens);meta+=detailField('TTFT',r.ttft_ms?Math.round(r.ttft_ms)+' ms':'');meta+=detailField('Gen t/s',r.gen_tps?Number(r.gen_tps).toFixed(1):'');meta+=detailField('Latency',r.total_ms?formatDuration(r.total_ms):'')}
+let out=r.response_output?`<div class="prewrap">${esc(r.response_output)}</div>`:`<div class="label">${vllm?'No output captured — enable the insight preset (--enable-log-outputs) to log responses.':'No response body captured yet. Non-streaming responses require insight+debug logs.'}</div>`;
 let rawReq=r.request_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw request JSON</summary><div class="prewrap">${esc(r.request_detail_json)}</div></details>`:'';
 let rawResp=r.response_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw response JSON</summary><div class="prewrap">${esc(r.response_detail_json)}</div></details>`:'';
-return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${renderMessages(r.request_messages)}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
+let reqBody=(vllm&&!(r.request_messages&&r.request_messages.length))?'<div class="label">Prompt not logged — vLLM only logs prompts at DEBUG level.</div>':renderMessages(r.request_messages);
+return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${reqBody}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
 function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
 function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
 function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">No request rows yet — pick the insight preset and Restart model to enable vLLM request logging (PT/TTFT stay blank: vLLM does not log them at INFO). Live throughput/latency are in the cards above.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}

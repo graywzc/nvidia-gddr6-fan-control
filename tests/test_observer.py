@@ -1581,12 +1581,23 @@ class VllmMetricsTests(unittest.TestCase):
 
 
 class VllmLogTrackerTests(unittest.TestCase):
-    RECV = ("(APIServer pid=1) INFO 06-14 17:27:48 [logger.py:39] Received "
+    # Real vLLM streaming shapes (see vllm/entrypoints/logger.py).
+    RECV = ("(APIServer pid=1) INFO 06-14 17:27:48 [logger.py:65] Received "
             "request chatcmpl-abc: params: SamplingParams(temperature=0.7, "
             "max_tokens=512, top_p=0.9), lora_request: None.")
-    RESP = ("(APIServer pid=1) INFO 06-14 17:27:50 [logger.py:71] Generated "
-            "response chatcmpl-abc (streaming complete): output: 'hi there', "
-            "output_token_ids: [1, 2, 3, 4], finish_reason: stop")
+    DELTA1 = ("(APIServer pid=1) INFO 06-14 17:27:49 [logger.py:92] Generated "
+              "response chatcmpl-abc (streaming delta): output: 'Hello', "
+              "output_token_ids: [310, 716], finish_reason: None")
+    DELTA2 = ("(APIServer pid=1) INFO 06-14 17:27:50 [logger.py:92] Generated "
+              "response chatcmpl-abc (streaming delta): output: ' there', "
+              "output_token_ids: [264], finish_reason: None")
+    COMPLETE = ("(APIServer pid=1) INFO 06-14 17:27:50 [logger.py:92] Generated "
+                "response chatcmpl-abc (streaming complete): output: 'Hello "
+                "there, it doesn't stop', output_token_ids: None, "
+                "finish_reason: streaming_complete")
+    NONSTREAM = ("(APIServer pid=1) INFO 06-14 17:27:50 [logger.py:92] Generated "
+                 "response chatcmpl-xyz: output: 'ok', output_token_ids: "
+                 "[1, 2, 3], finish_reason: length")
 
     def setUp(self):
         self.state = aipc_observer.ObserverState()
@@ -1594,47 +1605,54 @@ class VllmLogTrackerTests(unittest.TestCase):
 
     def test_arrival_creates_active_row_with_params(self):
         self.tracker.process_line(self.RECV)
-        snap = self.state.snapshot()
-        self.assertEqual(len(snap["active_requests"]), 1)
-        row = snap["active_requests"][0]
+        row = self.state.snapshot()["active_requests"][0]
         self.assertEqual(row["task_id"], "chatcmpl-abc")
         self.assertEqual(row["status"], "processing")
         self.assertEqual(row["max_tokens"], 512)
         self.assertAlmostEqual(row["temperature"], 0.7)
 
-    def test_response_finalizes_row(self):
+    def test_streaming_accumulates_tokens_and_captures_output(self):
         self.tracker.process_line(self.RECV)
-        self.tracker.process_line(self.RESP)
+        self.tracker.process_line(self.DELTA1)
+        self.tracker.process_line(self.DELTA2)
+        self.tracker.process_line(self.COMPLETE)
         snap = self.state.snapshot()
         self.assertEqual(len(snap["active_requests"]), 0)
-        self.assertEqual(len(snap["requests"]), 1)
         row = snap["requests"][0]
         self.assertEqual(row["status"], "completed")
-        self.assertEqual(row["completion_tokens"], 4)
+        # 2 (delta1) + 1 (delta2); the complete line's own ids are None.
+        self.assertEqual(row["completion_tokens"], 3)
+        # "streaming_complete" is normalized to a real finish reason.
         self.assertEqual(row["finish_reason"], "stop")
+        # Output preview captured (apostrophe in repr unescaped).
+        self.assertIn("doesn't stop", row["response_output"])
         self.assertGreaterEqual(row["total_ms"], 0)
 
-    def test_streaming_delta_lines_are_ignored(self):
-        delta = self.RESP.replace("(streaming complete)", "(streaming delta)")
-        self.tracker.process_line(self.RECV)
-        self.tracker.process_line(delta)
-        # Still in-flight: a delta must not finalize the row.
-        self.assertEqual(len(self.state.snapshot()["active_requests"]), 1)
-        self.assertEqual(len(self.state.snapshot()["requests"]), 0)
+    def test_delta_without_arrival_is_dropped(self):
+        self.tracker.process_line(self.DELTA1)  # observer started mid-stream
+        snap = self.state.snapshot()
+        self.assertEqual(len(snap["active_requests"]), 0)
+        self.assertEqual(len(snap["requests"]), 0)
+
+    def test_nonstreaming_uses_inline_token_list_and_reason(self):
+        self.tracker.process_line(self.NONSTREAM)
+        row = self.state.snapshot()["requests"][0]
+        self.assertEqual(row["completion_tokens"], 3)
+        self.assertEqual(row["finish_reason"], "length")
+        self.assertEqual(row["response_output"], "ok")
 
     def test_abort_marks_cancelled(self):
-        self.tracker.process_line(self.RECV)
-        self.tracker.process_line(self.RESP.replace("finish_reason: stop",
-                                                    "finish_reason: abort"))
+        self.tracker.process_line(
+            self.NONSTREAM.replace("finish_reason: length", "finish_reason: abort"))
         self.assertEqual(self.state.snapshot()["requests"][0]["status"],
                          "cancelled")
 
-    def test_response_without_arrival_still_logs(self):
-        # Observer started mid-stream: a completion with no prior arrival.
-        self.tracker.process_line(self.RESP)
-        reqs = self.state.snapshot()["requests"]
-        self.assertEqual(len(reqs), 1)
-        self.assertEqual(reqs[0]["completion_tokens"], 4)
+    def test_count_ids_and_extract_output_helpers(self):
+        self.assertEqual(aipc_observer._vllm_count_ids("output_token_ids: None"), 0)
+        self.assertEqual(
+            aipc_observer._vllm_count_ids("output_token_ids: [1, 2, 3]"), 3)
+        self.assertEqual(
+            aipc_observer._vllm_extract_output(self.NONSTREAM), "ok")
 
 
 class TraceLogTests(unittest.TestCase):
