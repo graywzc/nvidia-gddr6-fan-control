@@ -84,6 +84,62 @@ journalctl -u nvidia-gddr6-fan-control -f
 
 The first log line should say `HTTP API listening on 100.x.x.x:8765` (the Tailscale IP).
 
+#### Model-serving stack (for the observer's Install / Switch buttons)
+
+The fan controller needs none of this. The observer dashboard's **Install** and
+**Switch** buttons drive the [club-3090](https://github.com/graywzc/nvidia-gddr6-fan-control)
+checkout's `scripts/setup.sh` (downloads model weights) and `scripts/switch.sh`
+(`docker compose up` a variant), expected at `/home/<user>/projects/club-3090`.
+Those need a model-serving stack the base install doesn't set up:
+
+```bash
+# 1. HuggingFace CLI (setup.sh downloads weights with it).
+#    Ubuntu 24.04 ships an apt 'rich' with no pip RECORD, so install a
+#    pip-managed rich first to avoid an uninstall error, then huggingface-hub.
+sudo pip install --break-system-packages --ignore-installed rich
+sudo pip install --break-system-packages 'huggingface-hub[hf_transfer]'
+
+# 2. Container runtime + compose (switch.sh runs `docker compose`)
+sudo apt install -y docker.io docker-compose-v2
+
+# 3. GPU access inside containers (NVIDIA container toolkit)
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+  | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt update && sudo apt install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# 4. Let the repo owner drive docker without sudo (the daemon runs these as
+#    that user, not root)
+sudo usermod -aG docker "$USER"
+```
+
+> **PATH gotcha:** the observer runs `setup.sh`/`switch.sh` via `runuser -u <owner>`
+> with **no login shell**, so their PATH is the systemd daemon's
+> (`…:/usr/local/bin:…:/usr/bin:…`) and excludes `~/.local/bin`. Install `hf`
+> system-wide (as above, it lands in `/usr/local/bin`) — a `pipx` install in
+> `~/.local/bin` works in your shell but the Install button won't find it.
+> A `pipx` install therefore needs `sudo ln -s ~/.local/bin/hf /usr/local/bin/hf`.
+
+Verify the stack the way the observer will use it:
+
+```bash
+# hf reachable under the daemon's environment
+sudo env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  runuser -u "$USER" -- hf version
+# both GPUs visible inside a container, run as the repo owner
+sudo runuser -u "$USER" -- \
+  docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+```
+
+Gated models (e.g. Qwen3.6) usually download without auth; if one needs a token,
+put `HF_TOKEN=hf_...` in `/home/<user>/projects/club-3090/.env` (gitignored;
+`setup.sh` sources it). Weights default to `<repo>/models-cache` (~20 GB); set
+`MODEL_DIR=` in the same `.env` to relocate.
+
 ### macOS
 
 ```bash
