@@ -2679,6 +2679,12 @@ class VllmLogTracker:
 vllm_log_tracker = VllmLogTracker()
 
 
+def log_tracker_for(model_info):
+    """Pick the per-line log parser for the running engine."""
+    return (vllm_log_tracker if infer_engine(model_info) == "vllm"
+            else request_tracker)
+
+
 def tail_docker_logs(container, monitor_port):
     """Tail the model container logs, auto-detecting it when not pinned.
 
@@ -2692,8 +2698,6 @@ def tail_docker_logs(container, monitor_port):
             time.sleep(CONTAINER_DETECT_INTERVAL)
             continue
         state.set_container(target)
-        tracker = (vllm_log_tracker if infer_engine(state.model_info) == "vllm"
-                   else request_tracker)
         try:
             proc = subprocess.Popen(
                 ["docker", "logs", "-f", "--tail", "100", target],
@@ -2703,6 +2707,12 @@ def tail_docker_logs(container, monitor_port):
             )
             print(f"Observer tailing docker logs for {target}", file=sys.stderr)
             for line in proc.stdout:
+                # Pick the parser per line: model_info often isn't populated yet
+                # when the stream starts, so choosing once would wrongly pin the
+                # llama.cpp tracker until the next container restart. The check is
+                # cheap, so re-evaluating self-corrects as soon as the engine is
+                # known.
+                tracker = log_tracker_for(state.model_info)
                 try:
                     tracker.process_line(line)
                 except Exception as e:
