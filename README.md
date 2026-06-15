@@ -1,6 +1,6 @@
 # nvidia-gddr6-fan-control
 
-VRAM-junction-temperature-driven fan control for NVIDIA GDDR6/GDDR6X GPUs on Linux, with a SwiftUI macOS menubar app for live monitoring and remote curve editing.
+VRAM-junction-temperature-driven fan control for NVIDIA GDDR6/GDDR6X GPUs on Linux, with SwiftUI macOS and iOS apps for live monitoring and remote curve editing.
 
 Why this exists: NVIDIA's stock fan curve on Linux is driven by core temperature only. On RTX 3080/3090/A6000-class cards with GDDR6X, the memory junction temperature can sit ≥100°C while the core is happily under 70°C and the fans stay quiet. This project reads the actual VRAM junction temperature from the GPU's internal sensor, applies a user-defined fan curve, and exposes a small HTTP API so a Mac menubar app can monitor multiple GPUs and edit the curve live.
 
@@ -23,6 +23,7 @@ Why this exists: NVIDIA's stock fan curve on Linux is driven by core temperature
 - **Power limiting:** NVML power-management APIs apply and report the board power cap when supported by the GPU/driver.
 - **Observer dashboard:** the controller can serve an integrated llama.cpp/GPU request dashboard at `/observer`.
 - **Transport:** plaintext HTTP, bound only to the host's Tailscale interface. Tailscale handles encryption and identity.
+- **iOS client:** an iPhone/iPad app mirrors the macOS client features: multi-host monitoring, per-GPU telemetry, observer launch, fan-curve editing, and power-limit editing.
 
 ## Supported hardware
 
@@ -49,6 +50,12 @@ See [olealgoritme/gddr6 supported GPUs](https://github.com/olealgoritme/gddr6#su
 - macOS **≥ 13** (for SwiftUI `MenuBarExtra`).
 - Xcode Command Line Tools (`xcode-select --install`) — provides the `swift` compiler. The full Xcode IDE is **not** required.
 - Tailscale, on the same tailnet as the Linux hosts.
+
+### iOS
+
+- iOS/iPadOS **≥ 17**.
+- Full Xcode, for opening and running `ios/GPUFanControl/GPUFanControl.xcodeproj`.
+- Tailscale installed and connected to the same tailnet as the Linux hosts.
 
 ## Install
 
@@ -157,6 +164,13 @@ The installer runs `swift build -c release`, assembles `/Applications/MenubarApp
 
 After install, click the menubar item → **Add Host…** and enter each Linux host's Tailscale name (e.g. `aipc1`, `aipc`) with port `8765`. The temp appears within ~1 second.
 
+### iOS
+
+Open `ios/GPUFanControl/GPUFanControl.xcodeproj` in Xcode, select the
+`GPUFanControl` scheme, and run it on an iPhone/iPad simulator or device. On a
+real device, install and connect Tailscale first so hostnames such as `aipc1`
+resolve the same way they do from the Mac.
+
 ## Usage
 
 ### Menubar
@@ -166,6 +180,16 @@ After install, click the menubar item → **Add Host…** and enter each Linux h
 - Click a host row to open that host's observer dashboard in the browser.
 - Slider icon next to each host opens the curve editor for that host.
 - Bolt icon next to each host opens the power-limit editor for that host.
+
+### iOS app
+
+- Add the same Linux GPU hosts used by the macOS app, including optional bearer tokens.
+- Monitor multiple hosts and per-GPU VRAM temperature, fan percentage, board power, power cap, and utilization.
+- Open a host detail view for live telemetry and the rolling GPU-utilization sparkline.
+- Open the observer dashboard in Safari.
+- Edit fan curves per host/GPU, with the active temperature segment highlighted.
+- Edit or restore board power limits per host/GPU when the GPU reports power-limit support.
+- Swipe to delete hosts.
 
 ### Curve editor
 
