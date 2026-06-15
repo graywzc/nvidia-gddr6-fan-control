@@ -1261,6 +1261,8 @@ class RestartModelTests(unittest.TestCase):
         self.assertIn("--enable-log-outputs", argv)
         # llama.cpp debug flags must NOT leak onto a vLLM command.
         self.assertNotIn("--metrics", argv)
+        self.assertNotIn("--cache-ram", argv)
+        self.assertFalse(result["cache_ram"])
 
     def test_vllm_debug_sets_debug_logging_env(self):
         import json
@@ -1276,8 +1278,27 @@ class RestartModelTests(unittest.TestCase):
         self.assertEqual(
             svc["labels"][aipc_observer.OBSERVER_PRESET_LABEL], "debug"
         )
+        self.assertEqual(
+            svc["labels"][aipc_observer.OBSERVER_CACHE_RAM_LABEL], "false"
+        )
         self.assertIn("--enable-log-requests", svc["command"])
         self.assertIn("--enable-log-outputs", svc["command"])
+
+    def test_vllm_baseline_ignores_cache_toggle(self):
+        import json
+
+        mi = dict(MODEL_INFO)
+        mi["image"] = "vllm/vllm-openai:v0.22.0"
+        mi["compose_file"] = "/repo/models/m/vllm/compose/dual/fp8.yml"
+        mi["working_dir"] = "/repo/models/m/vllm/compose/dual"
+        result = self._restart("baseline", model_info=mi, cache_ram=True)
+        with open(self.override_path) as f:
+            svc = json.load(f)["services"]["svc"]
+        self.assertFalse(result["cache_ram"])
+        self.assertNotIn("command", svc)
+        self.assertEqual(
+            svc["labels"][aipc_observer.OBSERVER_CACHE_RAM_LABEL], "false"
+        )
 
 
 class PresetResolveTests(unittest.TestCase):
