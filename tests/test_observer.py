@@ -953,11 +953,11 @@ class PresetTests(unittest.TestCase):
     def test_known_presets(self):
         self.assertEqual(
             set(aipc_observer.INSIGHT_PRESETS),
-            {"baseline", "insight", "insight-cache", "insight-debug"},
+            {"baseline", "debug"},
         )
         self.assertEqual(aipc_observer.INSIGHT_PRESETS["baseline"], [])
         self.assertIn(
-            ("--log-verbosity", "5"), aipc_observer.INSIGHT_PRESETS["insight-debug"]
+            ("--log-verbosity", "5"), aipc_observer.INSIGHT_PRESETS["debug"]
         )
 
     def test_infers_baseline_when_no_managed_flags_are_present(self):
@@ -968,26 +968,26 @@ class PresetTests(unittest.TestCase):
             "baseline",
         )
 
-    def test_infers_insight_cache_from_live_command(self):
+    def test_infers_debug_ignoring_cache_from_live_command(self):
         cmd = [
             "--host", "0.0.0.0", "--metrics", "--props", "--log-verbosity",
-            "4", "--log-timestamps", "--cache-ram", "8192",
+            "5", "--log-timestamps", "--cache-ram", "8192",
         ]
-        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-cache")
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "debug")
 
     def test_infers_debug_before_cache(self):
         cmd = [
             "--metrics", "--props", "--log-verbosity", "5",
             "--log-timestamps", "--cache-ram", "8192",
         ]
-        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-debug")
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "debug")
 
     def test_infers_debug_from_live_alias_command(self):
         cmd = [
             "--host", "0.0.0.0", "--cache-ram", "8192", "--metrics",
             "--props", "-lv", "5", "--log-timestamps",
         ]
-        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-debug")
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "debug")
 
     def test_infers_baseline_with_disabled_cache_ram(self):
         cmd = ["--host", "0.0.0.0", "--cache-ram", "0", "--reasoning", "off"]
@@ -999,10 +999,37 @@ class PresetTests(unittest.TestCase):
 
     def test_infers_equals_style_values(self):
         cmd = [
-            "--metrics", "--props", "--log-verbosity=4",
+            "--metrics", "--props", "--log-verbosity=5",
             "--log-timestamps", "--cache-ram=8192",
         ]
-        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "insight-cache")
+        self.assertEqual(aipc_observer.infer_insight_preset(cmd), "debug")
+
+    def test_infers_vllm_baseline_without_request_logs(self):
+        self.assertEqual(
+            aipc_observer.infer_insight_preset(
+                ["vllm", "serve", "model"], engine="vllm"
+            ),
+            "baseline",
+        )
+
+    def test_infers_vllm_debug_from_request_logs(self):
+        self.assertEqual(
+            aipc_observer.infer_insight_preset(
+                ["--enable-log-requests", "--enable-log-outputs"],
+                engine="vllm",
+            ),
+            "debug",
+        )
+
+    def test_infers_vllm_debug_from_logging_env(self):
+        self.assertEqual(
+            aipc_observer.infer_insight_preset(
+                ["--enable-log-requests", "--enable-log-outputs"],
+                engine="vllm",
+                env={"VLLM_LOGGING_LEVEL": "debug"},
+            ),
+            "debug",
+        )
 
     def test_build_compose_override_shape(self):
         ov = aipc_observer.build_compose_override("svc", ["--a", "1"])
@@ -1094,19 +1121,21 @@ class RestartModelTests(unittest.TestCase):
 
         os.unlink(self.override_path)
 
-    def _restart(self, preset, model_info=None):
+    def _restart(self, preset, model_info=None, cache_ram=None):
         return aipc_observer.restart_model(
             preset,
             model_info=dict(MODEL_INFO) if model_info is None else model_info,
             runner=self.runner,
+            cache_ram=cache_ram,
             override_path=self.override_path,
         )
 
-    def test_insight_cache_resolves_baseline_then_ups_with_override(self):
+    def test_debug_with_cache_resolves_baseline_then_ups_with_override(self):
         import json
 
-        result = self._restart("insight-cache")
+        result = self._restart("debug")
         self.assertTrue(result["restarted"])
+        self.assertTrue(result["cache_ram"])
         self.assertEqual(len(self.runner.calls), 2)
         config_call, up_call = self.runner.calls
         self.assertIn("config", config_call["cmd"])
@@ -1120,6 +1149,7 @@ class RestartModelTests(unittest.TestCase):
         svc = override["services"]["svc"]
         argv = svc["command"]
         self.assertIn("--metrics", argv)
+        self.assertEqual(argv[argv.index("--log-verbosity") + 1], "5")
         self.assertEqual(argv[argv.index("--cache-ram") + 1], "8192")
         # Built on the compose baseline, not the running command.
         self.assertIn("--host", argv)
@@ -1135,8 +1165,17 @@ class RestartModelTests(unittest.TestCase):
             aipc_observer.LOG_ROTATE_MAX_FILE,
         )
 
+    def test_debug_without_cache_leaves_cache_disabled(self):
+        import json
+
+        self._restart("debug", cache_ram=False)
+        with open(self.override_path) as f:
+            argv = json.load(f)["services"]["svc"]["command"]
+        self.assertIn("--metrics", argv)
+        self.assertEqual(argv[argv.index("--cache-ram") + 1], "0")
+
     def test_compose_env_reproduces_boot_substitutions(self):
-        self._restart("insight")
+        self._restart("debug")
         env = self.runner.calls[-1]["env"]
         self.assertEqual(env["PORT"], "8020")
         self.assertEqual(env["ESTATE_PORT"], "8020")
@@ -1175,7 +1214,7 @@ class RestartModelTests(unittest.TestCase):
 
     def test_incomplete_model_info_is_rejected(self):
         with self.assertRaises(RuntimeError):
-            self._restart("insight", model_info={"command": ["--x"]})
+            self._restart("debug", model_info={"command": ["--x"]})
         self.assertEqual(self.runner.calls, [])
 
     def test_multi_config_file_uses_first(self):
@@ -1190,22 +1229,76 @@ class RestartModelTests(unittest.TestCase):
         self.assertEqual(svc["image"], "img:1")
         self.assertNotIn("command", svc)
 
-    def test_vllm_insight_injects_request_logging_flags(self):
+    def test_build_compose_override_environment(self):
+        ov = aipc_observer.build_compose_override(
+            "svc", ["--a"], environment={"VLLM_LOGGING_LEVEL": "DEBUG"}
+        )
+        svc = ov["services"]["svc"]
+        self.assertEqual(svc["environment"]["VLLM_LOGGING_LEVEL"], "DEBUG")
+
+    def test_build_compose_override_labels(self):
+        ov = aipc_observer.build_compose_override(
+            "svc", ["--a"], labels={aipc_observer.OBSERVER_PRESET_LABEL: "debug"}
+        )
+        svc = ov["services"]["svc"]
+        self.assertEqual(
+            svc["labels"][aipc_observer.OBSERVER_PRESET_LABEL], "debug"
+        )
+
+    def test_vllm_debug_injects_request_logging_flags(self):
         import json
 
         mi = dict(MODEL_INFO)
         mi["image"] = "vllm/vllm-openai:v0.22.0"
         mi["compose_file"] = "/repo/models/m/vllm/compose/dual/fp8.yml"
         mi["working_dir"] = "/repo/models/m/vllm/compose/dual"
-        result = self._restart("insight", model_info=mi)
+        result = self._restart("debug", model_info=mi)
         # vLLM never drops capabilities (it bypasses the llama.cpp --help probe).
         self.assertEqual(result["dropped_capabilities"], [])
         with open(self.override_path) as f:
             argv = json.load(f)["services"]["svc"]["command"]
         self.assertIn("--enable-log-requests", argv)
         self.assertIn("--enable-log-outputs", argv)
-        # llama.cpp insight flags must NOT leak onto a vLLM command.
+        # llama.cpp debug flags must NOT leak onto a vLLM command.
         self.assertNotIn("--metrics", argv)
+        self.assertNotIn("--cache-ram", argv)
+        self.assertFalse(result["cache_ram"])
+
+    def test_vllm_debug_sets_debug_logging_env(self):
+        import json
+
+        mi = dict(MODEL_INFO)
+        mi["image"] = "vllm/vllm-openai:v0.22.0"
+        mi["compose_file"] = "/repo/models/m/vllm/compose/dual/fp8.yml"
+        mi["working_dir"] = "/repo/models/m/vllm/compose/dual"
+        self._restart("debug", model_info=mi)
+        with open(self.override_path) as f:
+            svc = json.load(f)["services"]["svc"]
+        self.assertEqual(svc["environment"]["VLLM_LOGGING_LEVEL"], "DEBUG")
+        self.assertEqual(
+            svc["labels"][aipc_observer.OBSERVER_PRESET_LABEL], "debug"
+        )
+        self.assertEqual(
+            svc["labels"][aipc_observer.OBSERVER_CACHE_RAM_LABEL], "false"
+        )
+        self.assertIn("--enable-log-requests", svc["command"])
+        self.assertIn("--enable-log-outputs", svc["command"])
+
+    def test_vllm_baseline_ignores_cache_toggle(self):
+        import json
+
+        mi = dict(MODEL_INFO)
+        mi["image"] = "vllm/vllm-openai:v0.22.0"
+        mi["compose_file"] = "/repo/models/m/vllm/compose/dual/fp8.yml"
+        mi["working_dir"] = "/repo/models/m/vllm/compose/dual"
+        result = self._restart("baseline", model_info=mi, cache_ram=True)
+        with open(self.override_path) as f:
+            svc = json.load(f)["services"]["svc"]
+        self.assertFalse(result["cache_ram"])
+        self.assertNotIn("command", svc)
+        self.assertEqual(
+            svc["labels"][aipc_observer.OBSERVER_CACHE_RAM_LABEL], "false"
+        )
 
 
 class PresetResolveTests(unittest.TestCase):
@@ -1248,7 +1341,7 @@ class PresetResolveTests(unittest.TestCase):
     def test_translates_to_the_flag_the_build_advertises(self):
         # ik-llama: --verbosity (not --log-verbosity), no --props/--log-* flags.
         result = self._restart(
-            "insight-debug",
+            "debug",
             help_flags={"--metrics", "--cache-ram", "--verbosity", "--host"},
         )
         argv = self._override_argv()
@@ -1263,7 +1356,7 @@ class PresetResolveTests(unittest.TestCase):
 
     def test_drops_capabilities_with_no_supported_flag(self):
         result = self._restart(
-            "insight-cache",
+            "debug",
             help_flags={"--metrics", "--props", "--cache-ram", "--host"},
         )
         argv = self._override_argv()
@@ -1273,10 +1366,10 @@ class PresetResolveTests(unittest.TestCase):
         self.assertNotIn("--log-verbosity", argv)
         self.assertNotIn("--verbosity", argv)
         self.assertEqual(sorted(result["dropped_capabilities"]),
-                         ["timestamps", "verbose_logging"])
+                         ["timestamps", "trace_logging"])
 
     def test_unknown_help_falls_back_to_default_flags(self):
-        result = self._restart("insight-cache", help_flags=None)
+        result = self._restart("debug", help_flags=None)
         argv = self._override_argv()
         self.assertIn("--log-verbosity", argv)
         self.assertIn("--log-timestamps", argv)
@@ -1284,7 +1377,7 @@ class PresetResolveTests(unittest.TestCase):
 
     def test_supported_build_keeps_default_flags(self):
         result = self._restart(
-            "insight",
+            "debug",
             help_flags={"--metrics", "--props", "--log-verbosity",
                         "--log-timestamps", "--host"},
         )
@@ -1294,13 +1387,13 @@ class PresetResolveTests(unittest.TestCase):
     def test_resolve_preset_is_capability_aware(self):
         # Unit-level: ik-llama-style support set.
         supported = {"--metrics", "--cache-ram", "--verbosity"}
-        tweaks, dropped = aipc_observer.resolve_preset("insight-debug", supported)
+        tweaks, dropped = aipc_observer.resolve_preset("debug", supported)
         self.assertIn(("--verbosity", "5"), tweaks)
         self.assertIn(("--metrics", None), tweaks)
         self.assertNotIn(("--log-verbosity", "5"), tweaks)
         self.assertEqual(sorted(dropped), ["props", "timestamps"])
         # Unknown support -> default (mainline) flags, nothing dropped.
-        tweaks, dropped = aipc_observer.resolve_preset("insight-debug", None)
+        tweaks, dropped = aipc_observer.resolve_preset("debug", None)
         self.assertIn(("--log-verbosity", "5"), tweaks)
         self.assertEqual(dropped, [])
 
@@ -1598,6 +1691,10 @@ class VllmLogTrackerTests(unittest.TestCase):
     NONSTREAM = ("(APIServer pid=1) INFO 06-14 17:27:50 [logger.py:92] Generated "
                  "response chatcmpl-xyz: output: 'ok', output_token_ids: "
                  "[1, 2, 3], finish_reason: length")
+    DEBUG_PROMPT = ("(APIServer pid=1) DEBUG 06-14 17:27:48 [logger.py:71] "
+                    "Request chatcmpl-abc details: prompt: 'system\\nuser: "
+                    "don\\'t stop', prompt_token_ids: [11, 22, 33], "
+                    "prompt_embeds shape: None.")
 
     def setUp(self):
         self.state = aipc_observer.ObserverState()
@@ -1610,6 +1707,23 @@ class VllmLogTrackerTests(unittest.TestCase):
         self.assertEqual(row["status"], "processing")
         self.assertEqual(row["max_tokens"], 512)
         self.assertAlmostEqual(row["temperature"], 0.7)
+
+    def test_debug_prompt_before_arrival_is_attached_to_row(self):
+        self.tracker.process_line(self.DEBUG_PROMPT)
+        self.tracker.process_line(self.RECV)
+        row = self.state.snapshot()["active_requests"][0]
+        self.assertEqual(row["prompt_tokens"], 3)
+        self.assertEqual(row["request_messages"][0]["role"], "prompt")
+        self.assertIn("don't stop", row["request_messages"][0]["content"])
+        self.assertIn("request_group_id", row)
+        self.assertIn("system", row["request_detail_json"])
+
+    def test_debug_prompt_after_arrival_updates_active_row(self):
+        self.tracker.process_line(self.RECV)
+        self.tracker.process_line(self.DEBUG_PROMPT)
+        row = self.state.snapshot()["active_requests"][0]
+        self.assertEqual(row["prompt_tokens"], 3)
+        self.assertIn("don't stop", row["request_messages"][0]["content"])
 
     def test_streaming_accumulates_tokens_and_captures_output(self):
         self.tracker.process_line(self.RECV)
@@ -1667,7 +1781,7 @@ class VllmLogTrackerTests(unittest.TestCase):
 
 
 class TraceLogTests(unittest.TestCase):
-    """Lines that only appear at -lv 4 (the insight presets)."""
+    """Lines that only appear under debug/trace logging."""
 
     def setUp(self):
         self.state = aipc_observer.ObserverState()

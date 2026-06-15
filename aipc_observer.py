@@ -6,6 +6,7 @@ server. It monitors llama.cpp docker logs, active TCP connections, and nvidia-sm
 GPU stats, then serves a small dashboard at /observer with SSE updates.
 """
 
+import ast
 import json
 import hashlib
 import os
@@ -45,10 +46,12 @@ MESSAGE_TEXT_MAX = 4000
 OVERRIDE_FILE = "/tmp/aipc-observer-compose-override.yml"
 AUDIT_LOG = "/var/log/aipc-observer-actions.log"
 # Docker log rotation applied on every controlled restart. The container
-# otherwise runs json-file with no limits, and the insight-debug preset logs
+# otherwise runs json-file with no limits, and debug mode logs
 # full request bodies — a long context is a ~400 KB log line.
 LOG_ROTATE_MAX_SIZE = "100m"
 LOG_ROTATE_MAX_FILE = "5"
+OBSERVER_PRESET_LABEL = "aipc.observer.preset"
+OBSERVER_CACHE_RAM_LABEL = "aipc.observer.cache_ram"
 
 HOSTNAME = socket.gethostname().split(".")[0]
 
@@ -457,7 +460,7 @@ def response_detail_metadata(payload):
 
 
 def request_group_metadata(payload):
-    """Derive passive conversation grouping from an insight-debug request body.
+    """Derive passive conversation grouping from a debug-mode request body.
 
     Store only a short hash and a truncated first-user label, not the full
     prompt. Hermes requests from the same conversation share the initial
@@ -684,7 +687,8 @@ def inspect_container(name):
                 "docker", "inspect", name, "--format",
                 '{"image":{{json .Config.Image}},"cmd":{{json .Config.Cmd}},'
                 '"entrypoint":{{json .Config.Entrypoint}},'
-                '"labels":{{json .Config.Labels}},"mounts":{{json .Mounts}},'
+                '"labels":{{json .Config.Labels}},"env":{{json .Config.Env}},'
+                '"mounts":{{json .Mounts}},'
                 '"ports":{{json .HostConfig.PortBindings}},'
                 '"devices":{{json .HostConfig.DeviceRequests}}}',
             ],
@@ -698,8 +702,24 @@ def inspect_container(name):
     except Exception:
         return None
     labels = data.get("labels") or {}
+    env_map = _env_list_to_map(data.get("env"))
     compose_file = labels.get("com.docker.compose.project.config_files") or ""
     cmd = data.get("cmd") or []
+    engine_probe = {
+        "compose_file": compose_file,
+        "variant": variant_from_compose_path(compose_file),
+        "image": data.get("image"),
+    }
+    engine = infer_engine(engine_probe)
+    labeled_preset = normalize_observer_mode(labels.get(OBSERVER_PRESET_LABEL))
+    labeled_cache = labels.get(OBSERVER_CACHE_RAM_LABEL)
+    if labeled_cache is None:
+        labeled_cache = infer_cache_ram_enabled(cmd)
+    else:
+        labeled_cache = labeled_cache.lower() == "true"
+    cache_supported = engine != "vllm"
+    if not cache_supported:
+        labeled_cache = False
     help_info = inspect_container_help(name, data.get("entrypoint"))
     help_index = (help_info or {}).get("flags") or {}
     if help_info and "flags" in help_info:
@@ -710,8 +730,14 @@ def inspect_container(name):
         "entrypoint": _entrypoint_argv(data.get("entrypoint")),
         "compose_file": compose_file,
         "variant": variant_from_compose_path(compose_file),
+        "engine": engine,
         "command": cmd,
-        "preset": infer_insight_preset(cmd),
+        "preset": labeled_preset or infer_insight_preset(
+            cmd, engine=engine, env=env_map
+        ),
+        "cache_ram_enabled": labeled_cache,
+        "cache_ram_supported": cache_supported,
+        "vllm_logging_level": env_map.get("VLLM_LOGGING_LEVEL"),
         "flags": summarize_command(cmd),
         "help": help_info,
         "command_guide": command_guide(cmd, help_index),
@@ -1011,11 +1037,11 @@ def catalog_has_changes(diff):
 
 # --- model control plane (phase 2b) ----------------------------------------
 
-# Insight presets are command-line flag tweaks, not env vars: llama.cpp CLI
+# Observer modes are command-line flag tweaks, not env vars: llama.cpp CLI
 # args take precedence over LLAMA_ARG_* env, and flags like --cache-ram are
 # already present in the compose command, so env could never override them.
 # (flag, None) appends a switch if absent; (flag, value) replaces or appends.
-# Presets are defined by *capability* (what we want on), not by hard flags,
+# Modes are defined by *capability* (what we want on), not by hard flags,
 # because llama.cpp forks spell the same capability differently (ik-llama uses
 # --verbosity where mainline/beellama use --log-verbosity, etc.). Each
 # capability lists candidate (flag, value) pairs in preference order; at
@@ -1030,38 +1056,50 @@ CAPABILITY_FLAGS = {
     "timestamps": [("--log-timestamps", None), ("--log-format", "json")],
 }
 
-PRESET_CAPABILITIES = {
+MODE_CAPABILITIES = {
     "baseline": [],
-    "insight": ["metrics", "props", "verbose_logging", "timestamps"],
-    "insight-cache": ["metrics", "props", "verbose_logging", "timestamps",
-                      "ram_cache"],
-    # Debug verbosity logs full request/response bodies — the passive path to
-    # grouping agent requests by session. Very chatty; use for experiments.
-    "insight-debug": ["metrics", "props", "trace_logging", "timestamps",
-                      "ram_cache"],
+    # Debug verbosity logs full request/response bodies where the engine
+    # supports it. Very chatty; use for experiments.
+    "debug": ["metrics", "props", "trace_logging", "timestamps"],
+}
+LEGACY_PRESET_TO_MODE = {
+    "baseline": "baseline",
+    "insight": "debug",
+    "insight-cache": "debug",
+    "insight-debug": "debug",
+    "debug": "debug",
+}
+LEGACY_PRESET_CACHE_DEFAULT = {
+    "baseline": False,
+    "insight": False,
+    "insight-cache": True,
+    "insight-debug": True,
+    "debug": True,
 }
 
-# Legacy flag view of each preset (the first/default candidate per capability).
-# Kept for the dashboard's preset diff and mode inference, which reason about
-# the mainline/beellama spelling.
+# Legacy flag view of each observer mode (the first/default candidate per
+# capability). Kept for validation call sites that historically referenced
+# INSIGHT_PRESETS.
 INSIGHT_PRESETS = {
     name: [CAPABILITY_FLAGS[cap][0] for cap in caps]
-    for name, caps in PRESET_CAPABILITIES.items()
+    for name, caps in MODE_CAPABILITIES.items()
 }
 
 # vLLM speaks its own flags, and the llama.cpp capability/--help machinery
 # doesn't apply (vLLM's `serve --help` can't even run in a busy container — it
-# re-infers the GPU device and errors). So non-baseline presets just turn on
-# vLLM's per-request logging, which feeds the dashboard's request rows. Output
-# logging is what carries the finish reason + output token ids per request.
+# re-infers the GPU device and errors). So debug mode turns on vLLM's
+# per-request logging, which feeds the dashboard's request rows. Output logging
+# is what carries the finish reason + output token ids per request.
 VLLM_REQUEST_LOG_FLAGS = [("--enable-log-requests", None),
                           ("--enable-log-outputs", None)]
 VLLM_PRESET_FLAGS = {
     "baseline": [],
-    "insight": VLLM_REQUEST_LOG_FLAGS,
-    "insight-cache": VLLM_REQUEST_LOG_FLAGS,
-    "insight-debug": VLLM_REQUEST_LOG_FLAGS,
+    "debug": VLLM_REQUEST_LOG_FLAGS,
 }
+VLLM_PRESET_ENV = {
+    "debug": {"VLLM_LOGGING_LEVEL": "DEBUG"},
+}
+CACHE_RAM_TWEAK = ("--cache-ram", "8192")
 
 _control_lock = threading.Lock()
 
@@ -1090,6 +1128,26 @@ def apply_preset_to_command(cmd, tweaks):
             if value is not None:
                 argv.append(value)
     return argv
+
+
+def remove_command_options(cmd, flags):
+    """Remove flag/value options from argv, including --flag=value spelling."""
+    flags = {normalize_preset_flag(f) for f in flags}
+    argv = list(cmd or [])
+    out = []
+    i = 0
+    while i < len(argv):
+        tok = str(argv[i])
+        flag = tok.split("=", 1)[0] if tok.startswith("--") else tok
+        if normalize_preset_flag(flag) in flags:
+            if "=" not in tok and i + 1 < len(argv) and not str(argv[i + 1]).startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
 
 
 PRESET_FLAG_ALIASES = {
@@ -1155,18 +1213,52 @@ def command_capabilities(cmd):
     return caps
 
 
-def infer_insight_preset(cmd):
-    """Infer which observer-managed insight preset the live argv matches."""
+def normalize_observer_mode(name):
+    return LEGACY_PRESET_TO_MODE.get(str(name or ""), None)
+
+
+def infer_cache_ram_enabled(cmd):
+    options = _command_option_map(cmd)
+    return options.get("--cache-ram") not in (None, "0")
+
+
+def _env_list_to_map(items):
+    out = {}
+    for item in items or []:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        out[key] = value
+    return out
+
+
+def infer_vllm_preset(cmd, env=None):
+    """Infer the high-level observer mode from vLLM-specific argv/env state."""
+    options = _command_option_map(cmd)
+    has_request_logs = (
+        "--enable-log-requests" in options and "--enable-log-outputs" in options
+    )
+    if not has_request_logs:
+        return "baseline"
+    return "debug"
+
+
+def infer_insight_preset(cmd, engine=None, env=None):
+    """Infer which observer-managed observability mode the live argv matches."""
+    if engine == "vllm":
+        return infer_vllm_preset(cmd, env)
     caps = command_capabilities(cmd)
-    for name in ("insight-debug", "insight-cache", "insight"):
-        if caps == set(PRESET_CAPABILITIES[name]):
+    mode_caps = caps - {"ram_cache"}
+    for name in ("debug",):
+        if mode_caps == set(MODE_CAPABILITIES[name]):
             return name
-    if not caps:
+    if not mode_caps:
         return "baseline"
     return "custom"
 
 
-def build_compose_override(service, argv=None, image=None):
+def build_compose_override(service, argv=None, image=None, environment=None,
+                           labels=None):
     svc = {
         # Cap docker log growth; club-3090 composes set no logging limits.
         "logging": {
@@ -1181,6 +1273,10 @@ def build_compose_override(service, argv=None, image=None):
         svc["command"] = argv
     if image:
         svc["image"] = image
+    if environment:
+        svc["environment"] = environment
+    if labels:
+        svc["labels"] = labels
     return {"services": {service: svc}}
 
 
@@ -1335,7 +1431,7 @@ def _supported_flags(model_info, help_getter=inspect_container_help):
 
 
 def resolve_preset(preset_name, supported):
-    """Resolve a preset's capabilities to flags this build supports.
+    """Resolve an observer mode's capabilities to flags this build supports.
 
     For each capability, pick the first candidate flag the build advertises in
     --help (`supported`); other forks spell the same capability differently
@@ -1344,7 +1440,8 @@ def resolve_preset(preset_name, supported):
     matches the legacy hardcoded preset. Returns (tweaks, dropped) where dropped
     names capabilities no candidate flag could satisfy on this build.
     """
-    caps = PRESET_CAPABILITIES.get(preset_name)
+    mode = normalize_observer_mode(preset_name)
+    caps = MODE_CAPABILITIES.get(mode)
     if caps is None:
         return None, []
     tweaks, dropped = [], []
@@ -1361,9 +1458,9 @@ def resolve_preset(preset_name, supported):
     return tweaks, dropped
 
 
-def restart_model(preset_name, model_info=None, runner=_run,
+def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
                   override_path=OVERRIDE_FILE, help_getter=inspect_container_help):
-    """Recreate the model container with an insight preset applied.
+    """Recreate the model container with an observer mode/cache toggle applied.
 
     Presets always build on the compose file's own command (resolved via
     `docker compose config`), never the running container's — so switching
@@ -1372,9 +1469,12 @@ def restart_model(preset_name, model_info=None, runner=_run,
     a fork that spells (or lacks) a flag differently boots cleanly instead of
     crash-looping (see resolve_preset).
     """
-    if preset_name not in PRESET_CAPABILITIES:
+    mode = normalize_observer_mode(preset_name)
+    if mode not in MODE_CAPABILITIES:
         raise ValueError(f"unknown preset {preset_name!r}; "
-                         f"known: {', '.join(PRESET_CAPABILITIES)}")
+                         f"known: {', '.join(MODE_CAPABILITIES)}")
+    if cache_ram is None:
+        cache_ram = LEGACY_PRESET_CACHE_DEFAULT.get(str(preset_name), True)
     mi = model_info if model_info is not None else state.model_info
     missing = [k for k in ("compose_file", "service", "working_dir", "command")
                if not mi.get(k)]
@@ -1384,29 +1484,45 @@ def restart_model(preset_name, model_info=None, runner=_run,
     compose_file = mi["compose_file"].split(",")[0]
     env = _compose_env(mi)
     cwd = mi["working_dir"]
+    engine = infer_engine(mi)
+    effective_cache_ram = bool(cache_ram) and engine != "vllm"
     argv = None
+    preset_env = None
     dropped = []
-    if preset_name != "baseline":
+    if mode != "baseline" or effective_cache_ram:
         baseline = compose_baseline_command(compose_file, mi["service"], env,
                                             cwd, runner=runner)
-        if infer_engine(mi) == "vllm":
+        if engine == "vllm":
             # vLLM: inject its own request-logging flags directly; the llama.cpp
             # --help capability probe doesn't apply (and can't run here).
-            tweaks = VLLM_PRESET_FLAGS.get(preset_name, VLLM_REQUEST_LOG_FLAGS)
+            tweaks = VLLM_PRESET_FLAGS.get(mode, [])
+            preset_env = VLLM_PRESET_ENV.get(mode)
         else:
             tweaks, dropped = resolve_preset(
-                preset_name, _supported_flags(mi, help_getter))
+                mode, _supported_flags(mi, help_getter))
+            if effective_cache_ram:
+                tweaks = [*tweaks, CACHE_RAM_TWEAK]
         argv = apply_preset_to_command(baseline, tweaks)
+        if engine == "vllm":
+            argv = remove_command_options(argv, ["--cache-ram"])
     # Always pin the running image: launchers may have injected a different
     # image (e.g. BEELLAMA_IMAGE) than the compose file's fallback, and a
     # restart must never silently switch images.
     with open(override_path, "w") as f:
         json.dump(
-            build_compose_override(mi["service"], argv, image=mi.get("image")),
+            build_compose_override(
+                mi["service"], argv, image=mi.get("image"),
+                environment=preset_env,
+                labels={
+                    OBSERVER_PRESET_LABEL: mode,
+                    OBSERVER_CACHE_RAM_LABEL: str(effective_cache_ram).lower(),
+                },
+            ),
             f, indent=1,
         )
     os.chmod(override_path, 0o644)
-    detail = f"preset={preset_name} variant={mi.get('variant')}"
+    detail = (f"preset={mode} cache_ram={effective_cache_ram} "
+              f"variant={mi.get('variant')}")
     if dropped:
         detail += f" dropped={','.join(dropped)}"
     audit("restart", detail)
@@ -1415,7 +1531,7 @@ def restart_model(preset_name, model_info=None, runner=_run,
          "up", "-d", "--remove-orphans"],
         env=env, cwd=cwd,
     )
-    return {"restarted": True, "preset": preset_name,
+    return {"restarted": True, "preset": mode, "cache_ram": effective_cache_ram,
             "variant": mi.get("variant"), "dropped_capabilities": dropped}
 
 
@@ -1630,7 +1746,8 @@ def _wait_for_model_info(monitor_port, timeout=120):
 
 
 def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
-                   info_getter=None, override_path=OVERRIDE_FILE):
+                   info_getter=None, override_path=OVERRIDE_FILE,
+                   cache_ram=False):
     """Background body of a model switch; releases the control lock when done.
 
     switch.sh always boots the variant verbatim; the preset re-up afterwards
@@ -1644,25 +1761,30 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
         )
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
         _set_control_status(
-            "switch", f"{variant} is up; applying preset {preset} + log "
-                      "rotation (one more model reload)…"
+            "switch", f"{variant} is up; applying mode {preset} + cache "
+                      f"{'on' if cache_ram else 'off'} + log rotation "
+                      "(one more model reload)…"
         )
         info = (info_getter or _wait_for_model_info)(monitor_port)
         result = restart_model(preset, model_info=info, runner=runner,
+                               cache_ram=cache_ram,
                                override_path=override_path)
         dropped = result.get("dropped_capabilities") or []
         note = (f" — this build can't do {', '.join(dropped)}"
                 if dropped else "")
         _set_control_status(
-            "switch", f"switched to {variant} (preset {preset}){note}",
+            "switch", f"switched to {variant} (mode {result['preset']}, "
+                      f"cache {'on' if result.get('cache_ram') else 'off'}){note}",
             done=True, ok=True
         )
-        audit("switch-done", f"variant={variant} preset={preset}")
+        audit("switch-done", f"variant={variant} preset={preset} "
+                             f"cache_ram={cache_ram}")
     except Exception as e:
         audit("switch-failed", f"variant={variant}: {e}")
         setup = parse_setup_hint(str(e))
         if setup:
-            setup.update({"variant": variant, "preset": preset, "force": force})
+            setup.update({"variant": variant, "preset": preset, "force": force,
+                          "cache_ram": cache_ram})
         _set_control_status(
             "switch", f"switch to {variant} failed: {e}", done=True, ok=False,
             install_hint=setup or None,
@@ -1673,7 +1795,7 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
 
 def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     setup, runner=_run, info_getter=None,
-                    override_path=OVERRIDE_FILE):
+                    override_path=OVERRIDE_FILE, cache_ram=False):
     try:
         _set_control_status(
             "install", f"installing assets for {variant} (can take a while)…"
@@ -1712,17 +1834,21 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
         )
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
         _set_control_status(
-            "switch", f"{variant} is up; applying preset {preset} + log "
-                      "rotation (one more model reload)…"
+            "switch", f"{variant} is up; applying mode {preset} + cache "
+                      f"{'on' if cache_ram else 'off'} + log rotation "
+                      "(one more model reload)…"
         )
         info = (info_getter or _wait_for_model_info)(monitor_port)
         restart_model(preset, model_info=info, runner=runner,
+                      cache_ram=cache_ram,
                       override_path=override_path)
         _set_control_status(
-            "switch", f"switched to {variant} (preset {preset})",
+            "switch", f"switched to {variant} (mode {preset}, "
+                      f"cache {'on' if cache_ram else 'off'})",
             done=True, ok=True
         )
-        audit("install-switch-done", f"variant={variant} preset={preset}")
+        audit("install-switch-done", f"variant={variant} preset={preset} "
+                                     f"cache_ram={cache_ram}")
     except Exception as e:
         audit("install-failed", f"variant={variant}: {e}")
         _set_control_status(
@@ -1918,7 +2044,7 @@ def vllm_timeline_sample(metrics):
 def poll_metrics(monitor_port):
     """Scrape the model server's /metrics endpoint.
 
-    llama.cpp only serves /metrics under an insight preset (else it 404s →
+    llama.cpp only serves /metrics under debug mode (else it 404s →
     available=False, so the dashboard hints at the preset). vLLM serves a richer
     /metrics unconditionally but in its own dialect, so the engine (derived from
     the live model_info) selects the summarizer.
@@ -2234,7 +2360,7 @@ RE_CTX_SHIFT = re.compile(
 )
 RE_ROUTE_WARM = re.compile(r"selected slot by LCP similarity,\s*sim_best\s*=\s*([\d.]+)")
 RE_ROUTE_LRU = re.compile(r"selected slot by LRU")
-# Trace-level (-lv 4) lines from the insight presets:
+# Trace/debug-level lines from debug mode:
 RE_ACCESS = re.compile(r"done request:\s+(\w+)\s+(\S+)\s+\S+\s+(\d{3})")
 RE_REQUEST_BODY = re.compile(r"\brequest:\s*(\{.*\})\s*$")
 RE_RESPONSE_BODY = re.compile(r"\bresponse:\s*(\{.*\})\s*$")
@@ -2547,6 +2673,10 @@ request_tracker = RequestTracker()
 # the deltas and the timing comes from the delta timestamps. Non-streaming
 # responses log a single line carrying the full token id list + finish_reason.
 RE_VLLM_RECV = re.compile(r"Received request (\S+?): params: (.*), lora_request:")
+RE_VLLM_DEBUG = re.compile(
+    r"Request (\S+?) details: prompt: (.*), prompt_token_ids: (.*), "
+    r"prompt_embeds shape:"
+)
 RE_VLLM_RESP_ID = re.compile(
     r"Generated response (\S+?)(?: \(streaming[^)]*\))?: output:")
 RE_VLLM_IDS = re.compile(r"output_token_ids: (\[[\d,\s]*\]|None)")
@@ -2580,10 +2710,42 @@ def _vllm_extract_output(line, limit=VLLM_OUTPUT_PREVIEW_MAX):
     return s[:limit]
 
 
+def _vllm_debug_prompt_metadata(prompt_repr, token_ids_repr):
+    try:
+        prompt = ast.literal_eval(prompt_repr)
+    except (SyntaxError, ValueError):
+        prompt = prompt_repr
+    if prompt is None:
+        prompt = ""
+    prompt = _bounded_text(str(prompt), MESSAGE_TEXT_MAX)
+    meta = {
+        "request_messages": [{"role": "prompt", "name": "", "content": prompt}],
+        "request_message_count": 1 if prompt else 0,
+        "request_detail_json": _bounded_json({"prompt": prompt}),
+    }
+    if token_ids_repr not in ("None", ""):
+        meta["prompt_tokens"] = _vllm_count_debug_ids(token_ids_repr)
+        meta["total_tokens"] = meta["prompt_tokens"]
+    if prompt:
+        meta["request_group_label"] = _shorten(prompt)
+        meta["request_group_id"] = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    return meta
+
+
+def _vllm_count_debug_ids(token_ids_repr):
+    try:
+        token_ids = ast.literal_eval(token_ids_repr)
+    except (SyntaxError, ValueError):
+        token_ids = None
+    if isinstance(token_ids, list):
+        return len(token_ids)
+    return 0
+
+
 class VllmLogTracker:
     """Turn vLLM request/response log lines into the dashboard's request rows.
 
-    Active only under the insight preset (which injects --enable-log-requests /
+    Active only under debug mode (which injects --enable-log-requests /
     --enable-log-outputs). Output tokens are accumulated across streaming delta
     lines (the final line reports None); TTFT is arrival -> first delta, and the
     generation rate is tokens over the delta span. Prompt tokens aren't logged
@@ -2595,6 +2757,7 @@ class VllmLogTracker:
         self.state = observer_state or state
         self.active = {}   # request_id -> display row (shared into state)
         self.meta = {}     # request_id -> delta accounting {tokens,first,last,push}
+        self.pending_debug = {}
         self.counter = 0
 
     def _new_row(self, rid, now, params=None):
@@ -2615,10 +2778,23 @@ class VllmLogTracker:
         }
 
     def process_line(self, line):
+        m = RE_VLLM_DEBUG.search(line)
+        if m:
+            rid = m.group(1)
+            detail = _vllm_debug_prompt_metadata(m.group(2), m.group(3))
+            req = self.active.get(rid)
+            if req is None:
+                self.pending_debug[rid] = detail
+            else:
+                req.update(detail)
+                self.state.update_active_request(rid, detail)
+                self.state.notify_subscribers()
+            return
         m = RE_VLLM_RECV.search(line)
         if m:
             rid, now = m.group(1), time.time()
             req = self._new_row(rid, now, m.group(2))
+            req.update(self.pending_debug.pop(rid, {}))
             self.active[rid] = req
             self.meta[rid] = {"tokens": 0, "first": None, "last": now, "push": 0.0}
             self.state.add_active_request(req)
@@ -2649,6 +2825,7 @@ class VllmLogTracker:
             return
         # Completion: a streaming-complete line, or a whole non-streaming response.
         req = self.active.pop(rid, None) or self._new_row(rid, now)
+        req.update(self.pending_debug.pop(rid, {}))
         meta = self.meta.pop(rid, {})
         toks = _vllm_count_ids(line) or meta.get("tokens", 0)
         fin = RE_VLLM_FINISH.search(line)
@@ -2756,9 +2933,9 @@ DASHBOARD_HTML = """<!doctype html>
 </div></section>
 <section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
-<div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · insight: +metrics/props/trace logs · insight-cache: insight + cache-ram 8192">
-<option value="baseline">baseline</option><option value="insight">insight</option><option value="insight-cache" selected>insight+cache</option><option value="insight-debug">insight+debug</option>
-</select><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
+<div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · debug: add engine-specific observability/debug flags">
+<option value="baseline">baseline</option><option value="debug" selected>debug</option>
+</select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
 <section class="card full" id="vllmTimelineCard"><h2>vLLM Activity (live)</h2><div id="vllmTimeline"></div></section>
@@ -2787,22 +2964,23 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="requestModalBody" class="modal-body"></div>
 </div></div>
 <script>
-let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};
-const PRESET_LABELS={'baseline':'baseline','insight':'insight','insight-cache':'insight+cache','insight-debug':'insight+debug','custom':'custom'};
+let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};let cacheRamUserEdited=false;let lastCacheSourceKey='';
+const PRESET_LABELS={'baseline':'baseline','debug':'debug','insight':'debug','insight-cache':'debug','insight-debug':'debug','custom':'custom'};
 const PRESET_DESCRIPTIONS={
 baseline:'club-3090 compose command with no observer insight flags added',
-insight:'adds /metrics, /props, verbosity 4, and timestamps for observer visibility',
-'insight-cache':'insight plus cache-ram 8192 for prompt-cache experiments',
-'insight-debug':'cache plus verbosity 5, including very chatty request/response body logs',
+debug:'engine-specific metrics, request logging, timestamps, and debug details where supported',
 custom:'live command has observer-managed flags but does not exactly match a preset'
 };
 const PRESET_OPTIONS={
 baseline:{},
-insight:{'--metrics':null,'--props':null,'--log-verbosity':'4','--log-timestamps':null},
-'insight-cache':{'--metrics':null,'--props':null,'--log-verbosity':'4','--log-timestamps':null,'--cache-ram':'8192'},
-'insight-debug':{'--metrics':null,'--props':null,'--log-verbosity':'5','--log-timestamps':null,'--cache-ram':'8192'}
+debug:{'--metrics':null,'--props':null,'--log-verbosity':'5','--log-timestamps':null}
 };
-const MANAGED_FLAGS=new Set(Object.values(PRESET_OPTIONS).flatMap(o=>Object.keys(o)));
+const VLLM_PRESET_OPTIONS={
+baseline:{},
+debug:{'--enable-log-requests':null,'--enable-log-outputs':null}
+};
+const VLLM_PRESET_ENV={baseline:{},debug:{'VLLM_LOGGING_LEVEL':'DEBUG'}};
+const MANAGED_FLAGS=new Set([...Object.values(PRESET_OPTIONS),...Object.values(VLLM_PRESET_OPTIONS)].flatMap(o=>Object.keys(o)).concat(['--cache-ram']));
 const PRESET_FLAG_ALIASES={'-lv':'--log-verbosity'};
 function presetFlag(flag){return PRESET_FLAG_ALIASES[flag]||flag}
 function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
@@ -2819,17 +2997,17 @@ document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
 let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
 if(rb){rb.disabled=lastBusy||!running;rb.title=running?'':'no model running — use Start in the Catalog below'}
 if(sb){sb.disabled=lastBusy||!running;sb.title=running?'':'no model running'}}
-function doSwitch(v,status){let p=document.getElementById('presetSel').value;let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
-if(!confirm(`Switch model to '${v}' with preset '${p}'?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`))return;
-ctlPost('/observer/api/switch',{variant:v,preset:p,force:lastActive>0||(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
-function doStart(v,status){let p=document.getElementById('presetSel').value;let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
-if(!confirm(`Start model '${v}' with preset '${p}'?\nNo model is running — this boots the variant and waits for it to load, which takes a few minutes.${exp}`))return;
-ctlPost('/observer/api/switch',{variant:v,preset:p,force:(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
-function doInstallVariant(v,preset,force,retry,model,weightKey,modelDir){let msg=retry?`Install missing assets for '${v}' and retry switch?`:`Install assets for '${v}'?`;if(!confirm(msg))return;let body={variant:v,preset:preset||selectedPreset(),force:!!force,retry:!!retry};if(model)body.model=model;if(weightKey)body.weight_key=weightKey;if(modelDir)body.model_dir=modelDir;ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent=retry?'⏳ installing, then retrying switch…':'⏳ installing…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
+if(!confirm(`Switch model to '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`))return;
+ctlPost('/observer/api/switch',{variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doStart(v,status){let p=selectedPreset(),cache=selectedCacheRam();let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
+if(!confirm(`Start model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nNo model is running — this boots the variant and waits for it to load, which takes a few minutes.${exp}`))return;
+ctlPost('/observer/api/switch',{variant:v,preset:p,cache_ram:cache,force:(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doInstallVariant(v,preset,force,retry,model,weightKey,modelDir){let msg=retry?`Install missing assets for '${v}' and retry switch?`:`Install assets for '${v}'?`;if(!confirm(msg))return;let body={variant:v,preset:preset||selectedPreset(),cache_ram:selectedCacheRam(),force:!!force,retry:!!retry};if(model)body.model=model;if(weightKey)body.weight_key=weightKey;if(modelDir)body.model_dir=modelDir;ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent=retry?'⏳ installing, then retrying switch…':'⏳ installing…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
 let vllm=m.engine==='vllm';
-if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">'+(vllm?'vLLM /metrics not reachable yet — model may still be loading':'/metrics disabled — restart with an insight preset to enable')+'</span></div>';return}
+if(!m.available){q.textContent='-';q.className='summary-value';el.innerHTML='<div class="row"><span class="label">'+(vllm?'vLLM /metrics not reachable yet — model may still be loading':'/metrics disabled — restart with debug mode to enable')+'</span></div>';return}
 q.textContent=m.queued??'-';q.className='summary-value '+((m.queued||0)>0?'hot':'');
 let rows='';
 rows+=infoRow('Running / waiting',`${m.processing??'-'} / ${(m.queued||0)>0?`<span class="hot">${m.queued}</span>`:m.queued??'-'}`,vllm?'num_requests_running / num_requests_waiting':'requests_processing / requests_deferred — queued means all slots are busy');
@@ -2857,7 +3035,7 @@ let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_t
 async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
-function doRestart(){let p=document.getElementById('presetSel').value;let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with preset '${p}'?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,force:lastActive>0});let dr=(r.dropped_capabilities||[]).length?` (this build can't do ${r.dropped_capabilities.join(', ')})`:'';return `restarted with ${r.preset}${dr} (model reloading…)`})}
+function doRestart(){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with mode '${p}' and cache ${cache?'on':'off'}?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,cache_ram:cache,force:lastActive>0});let dr=(r.dropped_capabilities||[]).length?` (this build can't do ${r.dropped_capabilities.join(', ')})`:'';return `restarted with ${r.preset}, cache ${r.cache_ram?'on':'off'}${dr} (model reloading…)`})}
 function doStop(){let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Stop model serving on this host?${warn}`,async()=>{let r=await ctlPost('/observer/api/stop',{force:lastActive>0});return r.stopped?`stopped ${r.container||'model'}`:(r.detail||'already stopped')})}
 function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
 function variantDoc(v){return v.doc||{}}
@@ -2926,23 +3104,31 @@ function renderCommandGuideButton(mi){let guide=mi.command_guide||[];if(!guide.l
 function presetLabel(name){return PRESET_LABELS[name]||name||'unknown'}
 function liveOptionMap(cmd){let out={};let argv=cmd||[];for(let i=0;i<argv.length;i++){let tok=String(argv[i]);if(!tok.startsWith('-'))continue;if(tok.startsWith('--')&&tok.includes('=')){let parts=tok.split(/=(.*)/s);out[presetFlag(parts[0])]=parts[1]??''}else if(i+1<argv.length&&!String(argv[i+1]).startsWith('-')){out[presetFlag(tok)]=String(argv[i+1]);i++}else out[presetFlag(tok)]=null}if(out['--cache-ram']==='0')delete out['--cache-ram'];return out}
 function optionText(flag,value){return value==null?flag:`${flag} ${value}`}
-function selectedPreset(){let el=document.getElementById('presetSel');return el?el.value:'insight-cache'}
-function presetDiff(mi,selected){let live=liveOptionMap(mi.command||[]);let want=PRESET_OPTIONS[selected]||{};let rows=[];MANAGED_FLAGS.forEach(flag=>{let hasLive=Object.prototype.hasOwnProperty.call(live,flag);let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(hasLive&&hasWant&&String(live[flag])!==String(want[flag]))rows.push(`<span class="cmd-add">${esc(flag)}: ${esc(live[flag]??'switch')} → ${esc(want[flag]??'switch')}</span>`);else if(!hasLive&&hasWant)rows.push(`<span class="cmd-add">add ${esc(optionText(flag,want[flag]))}</span>`);else if(hasLive&&!hasWant)rows.push(`<span class="cmd-add">remove ${esc(optionText(flag,live[flag]))}</span>`)});return rows.join('')}
+function selectedPreset(){let el=document.getElementById('presetSel');return el?el.value:'debug'}
+function selectedCacheRam(){if(lastModelInfo&&lastModelInfo.cache_ram_supported===false)return false;let el=document.getElementById('cacheRamChk');return el?el.checked:true}
+function syncCacheControl(mi){let lab=document.getElementById('cacheRamLabel'),chk=document.getElementById('cacheRamChk');if(!lab||!chk)return;let supported=mi.cache_ram_supported!==false&&engineOf(mi)!=='vllm';lab.style.display=supported?'':'none';let key=[mi.container||'',engineOf(mi),supported,!!mi.cache_ram_enabled].join('|');if(key!==lastCacheSourceKey){lastCacheSourceKey=key;cacheRamUserEdited=false}if(!cacheRamUserEdited)chk.checked=supported?!!mi.cache_ram_enabled:true}
+function engineOf(mi){if(mi.engine)return mi.engine;let blob=[mi.image,mi.compose_file,mi.variant].join(' ').toLowerCase();return blob.includes('vllm')?'vllm':'llamacpp'}
+function presetOptionsFor(mi,selected,cacheRam){let opts=engineOf(mi)==='vllm'?(VLLM_PRESET_OPTIONS[selected]||{}):(PRESET_OPTIONS[selected]||{});opts={...opts};if(engineOf(mi)!=='vllm'&&cacheRam)opts['--cache-ram']='8192';return opts}
+function presetEnvFor(mi,selected){return engineOf(mi)==='vllm'?(VLLM_PRESET_ENV[selected]||{}):{}}
+function liveEnvMap(mi){let out={};if(mi.vllm_logging_level)out.VLLM_LOGGING_LEVEL=mi.vllm_logging_level;return out}
+function presetDiff(mi,selected){let live=liveOptionMap(mi.command||[]);let want=presetOptionsFor(mi,selected,selectedCacheRam());let envLive=liveEnvMap(mi);let envWant=presetEnvFor(mi,selected);let flags=new Set([...Object.keys(live),...Object.keys(want)].filter(f=>MANAGED_FLAGS.has(f)));let rows=[];flags.forEach(flag=>{let hasLive=Object.prototype.hasOwnProperty.call(live,flag);let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(hasLive&&hasWant&&String(live[flag])!==String(want[flag]))rows.push(`<span class="cmd-add">${esc(flag)}: ${esc(live[flag]??'switch')} → ${esc(want[flag]??'switch')}</span>`);else if(!hasLive&&hasWant)rows.push(`<span class="cmd-add">add ${esc(optionText(flag,want[flag]))}</span>`);else if(hasLive&&!hasWant)rows.push(`<span class="cmd-add">remove ${esc(optionText(flag,live[flag]))}</span>`)});Object.keys(envWant).forEach(k=>{if(String(envLive[k]||'')!==String(envWant[k]))rows.push(`<span class="cmd-add">set ${esc(k)}=${esc(envWant[k])}</span>`)});Object.keys(envLive).forEach(k=>{if(!Object.prototype.hasOwnProperty.call(envWant,k))rows.push(`<span class="cmd-add">unset ${esc(k)}</span>`)});return rows.join('')}
 function renderPresetStatus(mi){let running=mi.preset||'unknown';let selected=selectedPreset();let cls=running==='custom'?'preset-custom':(running===selected?'preset-match':'preset-diff');let rows='';
 rows+=infoRow('Running mode',`<span class="preset-pill ${cls}">${esc(presetLabel(running))}</span>`,PRESET_DESCRIPTIONS[running]||'inferred from the live container command');
 rows+=infoRow('Selected mode',`<span class="preset-pill ${running===selected?'preset-match':'preset-diff'}">${esc(presetLabel(selected))}</span>`,PRESET_DESCRIPTIONS[selected]||'');
+rows+=infoRow('Cache option',`<span class="preset-pill ${mi.cache_ram_enabled===selectedCacheRam()?'preset-match':'preset-diff'}">${selectedCacheRam()?'cache on':'cache off'}</span>`,engineOf(mi)==='vllm'?'No vLLM equivalent; ignored for vLLM':'llama.cpp --cache-ram 8192 toggle');
 rows+=infoRow('Mode difference',`<span class="label preset-desc">${esc(PRESET_DESCRIPTIONS[selected]||'')}</span>`);
 let diff=presetDiff(mi,selected);if(diff)rows+=`<div class="row"><span class="label">Selected changes</span><span class="value" style="text-align:right">${diff}</span></div>`;
 return rows}
 function commandFlagAt(argv,i){let tok=String(argv[i]);if(tok.startsWith('--')&&tok.includes('='))return presetFlag(tok.split('=')[0]);return tok.startsWith('-')?presetFlag(tok):null}
 function commandTokenClass(argv,i,want,live){let flag=commandFlagAt(argv,i);let prev=i>0?commandFlagAt(argv,i-1):null;if(prev&&Object.prototype.hasOwnProperty.call(live,prev)&&String(argv[i])===String(live[prev]))flag=prev;if(!flag||!MANAGED_FLAGS.has(flag))return '';let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(!hasWant)return 'cmd-remove';let liveVal=live[flag];let wantVal=want[flag];if(String(liveVal)===String(wantVal))return 'cmd-same';return 'cmd-change'}
-function renderCommandLine(mi){let argv=mi.command||[];let selected=selectedPreset();let want=PRESET_OPTIONS[selected]||{};let live=liveOptionMap(argv);let html=argv.map((tok,i)=>{let c=commandTokenClass(argv,i,want,live);return c?`<span class="cmd-token ${c}">${esc(tok)}</span>`:esc(tok)}).join(' ');
+function renderCommandLine(mi){let argv=mi.command||[];let selected=selectedPreset();let want=presetOptionsFor(mi,selected,selectedCacheRam());let live=liveOptionMap(argv);let html=argv.map((tok,i)=>{let c=commandTokenClass(argv,i,want,live);return c?`<span class="cmd-token ${c}">${esc(tok)}</span>`:esc(tok)}).join(' ');
 let additions=[];MANAGED_FLAGS.forEach(flag=>{if(!Object.prototype.hasOwnProperty.call(live,flag)&&Object.prototype.hasOwnProperty.call(want,flag))additions.push(`<span class="cmd-add">+ ${esc(optionText(flag,want[flag]))}</span>`)});
+let envWant=presetEnvFor(mi,selected);let envLive=liveEnvMap(mi);Object.keys(envWant).forEach(k=>{if(String(envLive[k]||'')!==String(envWant[k]))additions.push(`<span class="cmd-add">+ ${esc(k)}=${esc(envWant[k])}</span>`)});
 let legend='<div class="cmd-legend"><span class="cmd-token cmd-same">same in selected mode</span><span class="cmd-token cmd-change">value changes</span><span class="cmd-token cmd-remove">removed by selected mode</span></div>';
 if(additions.length)legend+=`<div class="cmd-legend">${additions.join('')}</div>`;
 return `<div class="cmd-line">${html}</div>${legend}`}
 function renderModelInfo(d){let mi=d.model_info||{};let ri=d.repo_info||{};let f=mi.flags||{};let rows='';
-lastModelInfo=mi;if(flagModalOpen)renderFlagGuideModal(mi);
+lastModelInfo=mi;syncCacheControl(mi);if(flagModalOpen)renderFlagGuideModal(mi);
 if(mi.variant)rows+=infoRow('Variant',esc(mi.variant),mi.compose_file);
 if(mi.image)rows+=infoRow('Image',esc((mi.image||'').split('/').pop()),mi.image);
 rows+=renderPresetStatus(mi);
@@ -2984,18 +3170,18 @@ function groupCell(r){let label=r.request_group_label||'-';let bits=[];if(r.requ
 function requestKey(r){return String((r.status||'processing')+'-'+(r.task_id??'x')+'-'+(r.start_time||r.end_time||r.id||0))}
 function rowAttrs(r){let k=requestKey(r);requestRowsByKey[k]=r;return ` role="button" tabindex="0" onclick="openRequestDetail('${esc(k)}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openRequestDetail('${esc(k)}')}"`}
 function detailField(label,value){if(value===undefined||value===null||value==='')return '';return `<div class="row"><span class="label">${label}</span><span class="value">${esc(value)}</span></div>`}
-function renderMessages(messages){if(!messages||!messages.length)return '<div class="label">No request body captured. Restart with insight+debug to log messages.</div>';return messages.map(m=>`<div class="message-card"><div class="message-role">${esc(m.role||'message')}${m.name?' · '+esc(m.name):''}</div><div class="prewrap">${esc(m.content||'')}</div></div>`).join('')}
+function renderMessages(messages){if(!messages||!messages.length)return '<div class="label">No request body captured. Restart with debug mode to log messages.</div>';return messages.map(m=>`<div class="message-card"><div class="message-role">${esc(m.role||'message')}${m.name?' · '+esc(m.name):''}</div><div class="prewrap">${esc(m.content||'')}</div></div>`).join('')}
 function renderRequestDetail(r){let meta='';meta+=detailField('Status',r.status);meta+=detailField('Task',r.task_id);meta+=detailField('Group',r.request_group_label);meta+=detailField('Group id',r.request_group_id);meta+=detailField('Model',r.request_model||r.model);meta+=detailField('Messages',r.request_message_count);meta+=detailField('Tools',r.request_tools_count);meta+=detailField('Response format',r.request_has_response_format?'yes':'');meta+=detailField('Stream',r.request_stream?'yes':'');meta+=detailField('Finish reason',r.response_finish_reason||r.finish_reason);
 let vllm=!!r.request_id;
 if(vllm){meta+=detailField('Max tokens',r.max_tokens);meta+=detailField('Temperature',r.temperature);meta+=detailField('Output tokens',r.completion_tokens);meta+=detailField('TTFT',r.ttft_ms?Math.round(r.ttft_ms)+' ms':'');meta+=detailField('Gen t/s',r.gen_tps?Number(r.gen_tps).toFixed(1):'');meta+=detailField('Latency',r.total_ms?formatDuration(r.total_ms):'')}
-let out=r.response_output?`<div class="prewrap">${esc(r.response_output)}</div>`:`<div class="label">${vllm?'No output captured — enable the insight preset (--enable-log-outputs) to log responses.':'No response body captured yet. Non-streaming responses require insight+debug logs.'}</div>`;
+let out=r.response_output?`<div class="prewrap">${esc(r.response_output)}</div>`:`<div class="label">${vllm?'No output captured — enable debug mode (--enable-log-outputs) to log responses.':'No response body captured yet. Non-streaming responses require debug logs.'}</div>`;
 let rawReq=r.request_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw request JSON</summary><div class="prewrap">${esc(r.request_detail_json)}</div></details>`:'';
 let rawResp=r.response_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw response JSON</summary><div class="prewrap">${esc(r.response_detail_json)}</div></details>`:'';
-let reqBody=(vllm&&!(r.request_messages&&r.request_messages.length))?'<div class="label">Prompt not logged — vLLM only logs prompts at DEBUG level.</div>':renderMessages(r.request_messages);
+let reqBody=(vllm&&!(r.request_messages&&r.request_messages.length))?'<div class="label">Prompt not logged — restart with debug mode to set VLLM_LOGGING_LEVEL=DEBUG.</div>':renderMessages(r.request_messages);
 return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${reqBody}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
 function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
 function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
-function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">No request rows yet — pick the insight preset and Restart model to enable vLLM request logging (PT/TTFT stay blank: vLLM does not log them at INFO). Live throughput/latency are in the cards above.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}
+function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">No request rows yet — pick debug mode and Restart model to enable vLLM request logging.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}
 connect();
 </script>
 </body></html>"""
@@ -3050,6 +3236,17 @@ def _send_json(handler, code, payload):
     handler.wfile.write(body)
 
 
+def observer_control_options(body, default_mode="debug"):
+    raw = str(body.get("preset", default_mode))
+    mode = normalize_observer_mode(raw)
+    if mode not in MODE_CAPABILITIES:
+        raise ValueError(f"unknown preset {raw!r}")
+    cache_ram = body.get("cache_ram")
+    if cache_ram is None:
+        cache_ram = LEGACY_PRESET_CACHE_DEFAULT.get(raw, True)
+    return mode, bool(cache_ram)
+
+
 def handle_observer_post(handler):
     """Control endpoints: update the club-3090 checkout / restart the model.
 
@@ -3093,35 +3290,34 @@ def handle_observer_post(handler):
                 _send_json(handler, 503, {"error": "no model repo configured"})
                 return True
             variant = str(body.get("variant", ""))
-            preset = str(body.get("preset", "baseline"))
+            preset, cache_ram = observer_control_options(body, "baseline")
             force = bool(body.get("force"))
-            if preset not in INSIGHT_PRESETS:
-                raise ValueError(f"unknown preset {preset!r}")
             variant = normalize_switch_variant(variant, state.catalog)
             validate_switch(variant, state.catalog, force=force)
             check_restart_allowed(state, force=force)
-            audit("switch", f"variant={variant} preset={preset} force={force}")
+            audit("switch", f"variant={variant} preset={preset} "
+                            f"cache_ram={cache_ram} force={force}")
             # Long-running (minutes): hand off to a worker that owns the
             # control lock; progress streams via control_status over SSE.
             threading.Thread(
                 target=_switch_worker,
                 args=(repo, variant, preset, _config["monitor_port"], force),
+                kwargs={"cache_ram": cache_ram},
                 name="observer-switch",
                 daemon=True,
             ).start()
             release = False
-            result = {"started": True, "variant": variant, "preset": preset}
+            result = {"started": True, "variant": variant, "preset": preset,
+                      "cache_ram": cache_ram}
         elif path == "/observer/api/install":
             repo = _config.get("model_repo")
             if not repo:
                 _send_json(handler, 503, {"error": "no model repo configured"})
                 return True
             variant = str(body.get("variant", ""))
-            preset = str(body.get("preset", "baseline"))
+            preset, cache_ram = observer_control_options(body, "baseline")
             force = bool(body.get("force"))
             retry = bool(body.get("retry"))
-            if preset not in INSIGHT_PRESETS:
-                raise ValueError(f"unknown preset {preset!r}")
             variant = normalize_switch_variant(variant, state.catalog)
             validate_switch(variant, state.catalog, force=True)
             if retry:
@@ -3138,14 +3334,17 @@ def handle_observer_post(handler):
                     repo, variant, preset, _config["monitor_port"], force,
                     retry, setup,
                 ),
+                kwargs={"cache_ram": cache_ram},
                 name="observer-install",
                 daemon=True,
             ).start()
             release = False
-            result = {"started": True, "variant": variant, "retry": retry}
+            result = {"started": True, "variant": variant, "retry": retry,
+                      "preset": preset, "cache_ram": cache_ram}
         else:
             check_restart_allowed(state, force=bool(body.get("force")))
-            result = restart_model(str(body.get("preset", "insight")))
+            preset, cache_ram = observer_control_options(body, "debug")
+            result = restart_model(preset, cache_ram=cache_ram)
         _send_json(
             handler,
             202 if path.endswith(("/switch", "/install")) else 200,
