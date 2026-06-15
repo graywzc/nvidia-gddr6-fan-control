@@ -717,6 +717,9 @@ def inspect_container(name):
         labeled_cache = infer_cache_ram_enabled(cmd)
     else:
         labeled_cache = labeled_cache.lower() == "true"
+    cache_supported = engine != "vllm"
+    if not cache_supported:
+        labeled_cache = False
     help_info = inspect_container_help(name, data.get("entrypoint"))
     help_index = (help_info or {}).get("flags") or {}
     if help_info and "flags" in help_info:
@@ -733,6 +736,7 @@ def inspect_container(name):
             cmd, engine=engine, env=env_map
         ),
         "cache_ram_enabled": labeled_cache,
+        "cache_ram_supported": cache_supported,
         "vllm_logging_level": env_map.get("VLLM_LOGGING_LEVEL"),
         "flags": summarize_command(cmd),
         "help": help_info,
@@ -1126,6 +1130,26 @@ def apply_preset_to_command(cmd, tweaks):
     return argv
 
 
+def remove_command_options(cmd, flags):
+    """Remove flag/value options from argv, including --flag=value spelling."""
+    flags = {normalize_preset_flag(f) for f in flags}
+    argv = list(cmd or [])
+    out = []
+    i = 0
+    while i < len(argv):
+        tok = str(argv[i])
+        flag = tok.split("=", 1)[0] if tok.startswith("--") else tok
+        if normalize_preset_flag(flag) in flags:
+            if "=" not in tok and i + 1 < len(argv) and not str(argv[i + 1]).startswith("-"):
+                i += 2
+            else:
+                i += 1
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
 PRESET_FLAG_ALIASES = {
     "-lv": "--log-verbosity",
 }
@@ -1460,13 +1484,15 @@ def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
     compose_file = mi["compose_file"].split(",")[0]
     env = _compose_env(mi)
     cwd = mi["working_dir"]
+    engine = infer_engine(mi)
+    effective_cache_ram = bool(cache_ram) and engine != "vllm"
     argv = None
     preset_env = None
     dropped = []
-    if mode != "baseline" or cache_ram:
+    if mode != "baseline" or effective_cache_ram:
         baseline = compose_baseline_command(compose_file, mi["service"], env,
                                             cwd, runner=runner)
-        if infer_engine(mi) == "vllm":
+        if engine == "vllm":
             # vLLM: inject its own request-logging flags directly; the llama.cpp
             # --help capability probe doesn't apply (and can't run here).
             tweaks = VLLM_PRESET_FLAGS.get(mode, [])
@@ -1474,9 +1500,11 @@ def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
         else:
             tweaks, dropped = resolve_preset(
                 mode, _supported_flags(mi, help_getter))
-            if cache_ram:
+            if effective_cache_ram:
                 tweaks = [*tweaks, CACHE_RAM_TWEAK]
         argv = apply_preset_to_command(baseline, tweaks)
+        if engine == "vllm":
+            argv = remove_command_options(argv, ["--cache-ram"])
     # Always pin the running image: launchers may have injected a different
     # image (e.g. BEELLAMA_IMAGE) than the compose file's fallback, and a
     # restart must never silently switch images.
@@ -1487,13 +1515,14 @@ def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
                 environment=preset_env,
                 labels={
                     OBSERVER_PRESET_LABEL: mode,
-                    OBSERVER_CACHE_RAM_LABEL: str(bool(cache_ram)).lower(),
+                    OBSERVER_CACHE_RAM_LABEL: str(effective_cache_ram).lower(),
                 },
             ),
             f, indent=1,
         )
     os.chmod(override_path, 0o644)
-    detail = f"preset={mode} cache_ram={bool(cache_ram)} variant={mi.get('variant')}"
+    detail = (f"preset={mode} cache_ram={effective_cache_ram} "
+              f"variant={mi.get('variant')}")
     if dropped:
         detail += f" dropped={','.join(dropped)}"
     audit("restart", detail)
@@ -1502,7 +1531,7 @@ def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
          "up", "-d", "--remove-orphans"],
         env=env, cwd=cwd,
     )
-    return {"restarted": True, "preset": mode, "cache_ram": bool(cache_ram),
+    return {"restarted": True, "preset": mode, "cache_ram": effective_cache_ram,
             "variant": mi.get("variant"), "dropped_capabilities": dropped}
 
 
@@ -2906,7 +2935,7 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
 <div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · debug: add engine-specific observability/debug flags">
 <option value="baseline">baseline</option><option value="debug" selected>debug</option>
-</select><label class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
+</select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
 <section class="card full" id="vllmTimelineCard"><h2>vLLM Activity (live)</h2><div id="vllmTimeline"></div></section>
@@ -2935,7 +2964,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="requestModalBody" class="modal-body"></div>
 </div></div>
 <script>
-let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};
+let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};let cacheRamUserEdited=false;let lastCacheSourceKey='';
 const PRESET_LABELS={'baseline':'baseline','debug':'debug','insight':'debug','insight-cache':'debug','insight-debug':'debug','custom':'custom'};
 const PRESET_DESCRIPTIONS={
 baseline:'club-3090 compose command with no observer insight flags added',
@@ -3076,7 +3105,8 @@ function presetLabel(name){return PRESET_LABELS[name]||name||'unknown'}
 function liveOptionMap(cmd){let out={};let argv=cmd||[];for(let i=0;i<argv.length;i++){let tok=String(argv[i]);if(!tok.startsWith('-'))continue;if(tok.startsWith('--')&&tok.includes('=')){let parts=tok.split(/=(.*)/s);out[presetFlag(parts[0])]=parts[1]??''}else if(i+1<argv.length&&!String(argv[i+1]).startsWith('-')){out[presetFlag(tok)]=String(argv[i+1]);i++}else out[presetFlag(tok)]=null}if(out['--cache-ram']==='0')delete out['--cache-ram'];return out}
 function optionText(flag,value){return value==null?flag:`${flag} ${value}`}
 function selectedPreset(){let el=document.getElementById('presetSel');return el?el.value:'debug'}
-function selectedCacheRam(){let el=document.getElementById('cacheRamChk');return el?el.checked:true}
+function selectedCacheRam(){if(lastModelInfo&&lastModelInfo.cache_ram_supported===false)return false;let el=document.getElementById('cacheRamChk');return el?el.checked:true}
+function syncCacheControl(mi){let lab=document.getElementById('cacheRamLabel'),chk=document.getElementById('cacheRamChk');if(!lab||!chk)return;let supported=mi.cache_ram_supported!==false&&engineOf(mi)!=='vllm';lab.style.display=supported?'':'none';let key=[mi.container||'',engineOf(mi),supported,!!mi.cache_ram_enabled].join('|');if(key!==lastCacheSourceKey){lastCacheSourceKey=key;cacheRamUserEdited=false}if(!cacheRamUserEdited)chk.checked=supported?!!mi.cache_ram_enabled:true}
 function engineOf(mi){if(mi.engine)return mi.engine;let blob=[mi.image,mi.compose_file,mi.variant].join(' ').toLowerCase();return blob.includes('vllm')?'vllm':'llamacpp'}
 function presetOptionsFor(mi,selected,cacheRam){let opts=engineOf(mi)==='vllm'?(VLLM_PRESET_OPTIONS[selected]||{}):(PRESET_OPTIONS[selected]||{});opts={...opts};if(engineOf(mi)!=='vllm'&&cacheRam)opts['--cache-ram']='8192';return opts}
 function presetEnvFor(mi,selected){return engineOf(mi)==='vllm'?(VLLM_PRESET_ENV[selected]||{}):{}}
@@ -3098,7 +3128,7 @@ let legend='<div class="cmd-legend"><span class="cmd-token cmd-same">same in sel
 if(additions.length)legend+=`<div class="cmd-legend">${additions.join('')}</div>`;
 return `<div class="cmd-line">${html}</div>${legend}`}
 function renderModelInfo(d){let mi=d.model_info||{};let ri=d.repo_info||{};let f=mi.flags||{};let rows='';
-lastModelInfo=mi;if(flagModalOpen)renderFlagGuideModal(mi);
+lastModelInfo=mi;syncCacheControl(mi);if(flagModalOpen)renderFlagGuideModal(mi);
 if(mi.variant)rows+=infoRow('Variant',esc(mi.variant),mi.compose_file);
 if(mi.image)rows+=infoRow('Image',esc((mi.image||'').split('/').pop()),mi.image);
 rows+=renderPresetStatus(mi);
