@@ -2263,15 +2263,17 @@ def poll_gpu_stats():
                         if mem_temp_str and mem_temp_str.upper() != "N/A"
                         else -1
                     )
+                    mem_used = safe_float(parts[6])
+                    mem_total = safe_float(parts[7])
                     gpus.append({
                         "index": int(parts[0]),
                         "name": parts[1],
                         "temp_c": safe_float(parts[2]),
                         "mem_temp_c": mem_temp,
                         "gpu_util_pct": safe_float(parts[4]),
-                        "mem_util_pct": safe_float(parts[5]),
-                        "mem_used_mib": safe_float(parts[6]),
-                        "mem_total_mib": safe_float(parts[7]),
+                        "mem_util_pct": (mem_total > 0) and (mem_used / mem_total * 100) or 0,
+                        "mem_used_mib": mem_used,
+                        "mem_total_mib": mem_total,
                         "fan_pct": safe_float(parts[8]),
                         "clock_mhz": safe_float(parts[9]),
                         "power_w": safe_float(parts[10]),
