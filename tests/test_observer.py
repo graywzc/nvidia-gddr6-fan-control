@@ -1958,7 +1958,16 @@ class CompareVariantCommandTests(unittest.TestCase):
         }))
 
         result = aipc_observer.compare_variant_commands(
-            "/repo", ["eng/a", "eng/b"], catalog, runner=runner
+            "/repo", ["eng/a", "eng/b"], catalog, runner=runner,
+            help_info={
+                "source": "vllm serve --help",
+                "flags": {
+                    "--max-model-len": {
+                        "description": "Model context length.",
+                        "aliases": ["--max-model-len"],
+                    }
+                },
+            },
         )
 
         self.assertEqual([v["variant"] for v in result["variants"]],
@@ -1973,6 +1982,15 @@ class CompareVariantCommandTests(unittest.TestCase):
                           "models/m1/eng/compose/dual/a.yml"])
         self.assertEqual(runner.calls[0]["env"]["PORT"], "8020")
         self.assertEqual(runner.calls[1]["env"]["PORT"], "8021")
+        self.assertEqual(result["help"]["source"], "vllm serve --help")
+        by_flag = {row["flag"]: row for row in result["flag_matrix"]}
+        self.assertEqual(
+            by_flag["--max-model-len"]["description"],
+            "Model context length.",
+        )
+        self.assertEqual(
+            by_flag["--max-model-len"]["values"]["eng/a"], "262144"
+        )
 
     def test_compare_requires_two_variants(self):
         with self.assertRaises(ValueError):
