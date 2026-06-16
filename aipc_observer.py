@@ -2926,7 +2926,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="header"><h1 id="title">Observer</h1><div class="meta"><span id="model" class="model">--</span> · Uptime <span id="uptime">0s</span> · <span id="updated">--</span></div></div>
 <div class="grid">
 <section class="card"><h2>GPU</h2><div id="gpuGrid" class="gpu-grid"></div></section>
-<section class="card full" id="gpuHistoryCard" style="display:none"><h2>GPU History</h2><div id="gpuHistoryCharts"></div></section>
+<section class="card" id="gpuHistoryCard" style="display:none"><h2>GPU History</h2><div id="gpuHistoryCharts"></div></section>
 <section class="card"><h2>Summary</h2><div class="summary">
 <div class="summary-item"><div id="active" class="summary-value">0</div><div class="summary-label">Active</div></div>
 <div class="summary-item"><div id="requests" class="summary-value">0</div><div class="summary-label">Completed</div></div>
@@ -2942,7 +2942,7 @@ DASHBOARD_HTML = """<!doctype html>
 </select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
 <section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
 <section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
-<section class="card full" id="vllmTimelineCard"><h2>vLLM Activity (live)</h2><div id="vllmTimeline"></div></section>
+<section class="card" id="vllmTimelineCard"><h2>vLLM Activity (live)</h2><div id="vllmTimeline"></div></section>
 <section class="card"><h2>Inference Health</h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
@@ -2952,7 +2952,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="httpErrors" class="summary-value">0</div><div class="summary-label">HTTP Errors</div></div>
 <div class="summary-item"><div id="budgetHits" class="summary-value">0</div><div class="summary-label">Budget Hits</div></div>
 </div></section>
-<section class="card full"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
+<section class="card"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
 </div>
 <div id="flagModal" class="modal" onclick="if(event.target===this)closeFlagGuide()"><div class="modal-panel">
 <div class="modal-head"><h2 id="flagModalTitle">Flag guide</h2><button class="btn" onclick="closeFlagGuide()">Close</button></div>
