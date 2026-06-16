@@ -2263,15 +2263,17 @@ def poll_gpu_stats():
                         if mem_temp_str and mem_temp_str.upper() != "N/A"
                         else -1
                     )
+                    mem_used = safe_float(parts[6])
+                    mem_total = safe_float(parts[7])
                     gpus.append({
                         "index": int(parts[0]),
                         "name": parts[1],
                         "temp_c": safe_float(parts[2]),
                         "mem_temp_c": mem_temp,
                         "gpu_util_pct": safe_float(parts[4]),
-                        "mem_util_pct": safe_float(parts[5]),
-                        "mem_used_mib": safe_float(parts[6]),
-                        "mem_total_mib": safe_float(parts[7]),
+                        "mem_util_pct": (mem_total > 0) and (mem_used / mem_total * 100) or 0,
+                        "mem_used_mib": mem_used,
+                        "mem_total_mib": mem_total,
                         "fan_pct": safe_float(parts[8]),
                         "clock_mhz": safe_float(parts[9]),
                         "power_w": safe_float(parts[10]),
@@ -2917,12 +2919,14 @@ DASHBOARD_HTML = """<!doctype html>
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px minmax(150px,1.4fr) 60px 56px 70px 74px 78px 74px 60px 78px minmax(80px,1fr);gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.group-label{color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
 .btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.variant-table{min-width:1050px}.variant-row{display:grid;grid-template-columns:minmax(230px,1.1fr) 86px 86px minmax(140px,.8fr) minmax(260px,1.5fr) 120px;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}.variant-row.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.variant-name{font-weight:650;color:var(--accent);overflow-wrap:anywhere}.variant-note{color:var(--dim);line-height:1.35;margin-top:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 @media(max-width:900px){.detail-grid{grid-template-columns:1fr}.request-row{grid-template-columns:88px 120px minmax(140px,1fr) 52px 52px 64px 68px 72px 68px 52px 72px minmax(70px,1fr)}}
+.gpu-history-chart{position:relative;width:100%;height:160px;margin-bottom:12px;border-radius:6px;overflow:hidden;background:var(--bg);border:1px solid var(--border)}.gpu-history-chart:last-child{margin-bottom:0}.gpu-history-chart canvas{display:block;width:100%;height:100%}.gpu-history-label{position:absolute;top:8px;left:10px;font-size:11px;font-weight:650;color:var(--accent);pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend{position:absolute;top:8px;right:10px;display:flex;gap:12px;font-size:10px;font-weight:600;pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend span{display:flex;align-items:center;gap:4px}.legend-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 </style>
 </head>
 <body>
 <div class="header"><h1 id="title">Observer</h1><div class="meta"><span id="model" class="model">--</span> · Uptime <span id="uptime">0s</span> · <span id="updated">--</span></div></div>
 <div class="grid">
 <section class="card"><h2>GPU</h2><div id="gpuGrid" class="gpu-grid"></div></section>
+<section class="card full" id="gpuHistoryCard" style="display:none"><h2>GPU History</h2><div id="gpuHistoryCharts"></div></section>
 <section class="card"><h2>Summary</h2><div class="summary">
 <div class="summary-item"><div id="active" class="summary-value">0</div><div class="summary-label">Active</div></div>
 <div class="summary-item"><div id="requests" class="summary-value">0</div><div class="summary-label">Completed</div></div>
@@ -2988,7 +2992,7 @@ function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
 let lastBusy=false;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doInstallVariant('${esc(h.variant)}','${esc(h.preset||selectedPreset())}',${h.force?'true':'false'},true,'${esc(h.model||'')}','${esc(h.weight_key||'')}','${esc(h.model_dir||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
@@ -3182,6 +3186,123 @@ return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${m
 function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
 function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
 function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">No request rows yet — pick debug mode and Restart model to enable vLLM request logging.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}
+function renderGpuHistory(d){
+let card=document.getElementById('gpuHistoryCard');
+let container=document.getElementById('gpuHistoryCharts');
+let hist=d.gpu_history||[];
+if(!hist.length||!(d.gpu_stats||[]).length){card.style.display='none';return}
+card.style.display='';
+// group history by gpu index
+let gpuIds=[...new Set((d.gpu_stats||[]).map(g=>g.index))].sort((a,b)=>a-b);
+let byGpu={};
+gpuIds.forEach(id=>{byGpu[id]=hist.filter(h=>Array.isArray(h)?false:true).map(h=>{
+if(Array.isArray(h)){let matching=h.filter(g=>g.index===id);return matching[0]||null}
+return h.index===id?h:null}).filter(Boolean)});
+// if history is array-of-arrays (multi-gpu snapshots), handle that
+if(hist.length&&Array.isArray(hist[0])){
+byGpu={};
+gpuIds.forEach(id=>{byGpu[id]=hist.map(snap=>{let arr=Array.isArray(snap)?snap:[snap];return arr.find(g=>g.index===id)||null}).filter(Boolean)});
+}else if(hist.length&&!Array.isArray(hist[0])&&gpuIds.length===1){
+byGpu[gpuIds[0]]=hist;
+}else if(hist.length&&!Array.isArray(hist[0])&&gpuIds.length>1){
+byGpu={};
+gpuIds.forEach(id=>{byGpu[id]=hist.filter(h=>h.index===id)});
+}
+// ensure container has correct number of chart divs
+while(container.children.length<gpuIds.length){
+let wrap=document.createElement('div');
+wrap.className='gpu-history-chart';
+let lbl=document.createElement('div');
+lbl.className='gpu-history-label';
+let leg=document.createElement('div');
+leg.className='gpu-history-legend';
+let cvs=document.createElement('canvas');
+wrap.appendChild(lbl);
+wrap.appendChild(leg);
+wrap.appendChild(cvs);
+container.appendChild(wrap);
+}
+while(container.children.length>gpuIds.length)container.removeChild(container.lastChild);
+gpuIds.forEach((gpuId,ci)=>{
+let wrap=container.children[ci];
+let cvs=wrap.querySelector('canvas');
+let lbl=wrap.querySelector('.gpu-history-label');
+let leg=wrap.querySelector('.gpu-history-legend');
+let samples=byGpu[gpuId]||[];
+if(!samples.length)return;
+let gpuName=samples[samples.length-1].name||('GPU '+gpuId);
+let lastUtil=samples[samples.length-1].gpu_util_pct||0;
+let lastMemUsed=samples[samples.length-1].mem_used_mib||0;
+let lastMemTotal=samples[samples.length-1].mem_total_mib||1;
+let lastMemPct=Math.round(100*lastMemUsed/lastMemTotal);
+lbl.textContent='GPU '+gpuId+': '+gpuName;
+leg.innerHTML='<span><span class="legend-dot" style="background:#58a6ff"></span>GPU '+lastUtil+'%</span>'+
+'<span><span class="legend-dot" style="background:#bc8cff"></span>VRAM '+lastMemPct+'% ('+(lastMemUsed/1024).toFixed(1)+'G)</span>';
+// draw chart
+let rect=wrap.getBoundingClientRect();
+let dpr=window.devicePixelRatio||1;
+let w=Math.round(rect.width*dpr);
+let h=Math.round(rect.height*dpr);
+if(cvs.width!==w||cvs.height!==h){cvs.width=w;cvs.height=h}
+let ctx=cvs.getContext('2d');
+ctx.clearRect(0,0,w,h);
+// margins
+let ml=0,mr=0,mt=30*dpr,mb=18*dpr;
+let cw=w-ml-mr,ch=h-mt-mb;
+// gridlines
+ctx.strokeStyle='rgba(48,54,61,0.8)';
+ctx.lineWidth=dpr;
+ctx.setLineDash([3*dpr,3*dpr]);
+for(let p=0;p<=100;p+=25){
+let y=mt+ch*(1-p/100);
+ctx.beginPath();ctx.moveTo(ml,y);ctx.lineTo(ml+cw,y);ctx.stroke();
+// grid label
+ctx.fillStyle='rgba(139,148,158,0.6)';
+ctx.font=(9*dpr)+'px -apple-system,BlinkMacSystemFont,sans-serif';
+ctx.textAlign='left';
+ctx.fillText(p+'%',ml+3*dpr,y-2*dpr);
+}
+ctx.setLineDash([]);
+// time labels
+let nSamples=samples.length;
+let totalSec=nSamples*2;
+ctx.fillStyle='rgba(139,148,158,0.5)';
+ctx.font=(9*dpr)+'px -apple-system,BlinkMacSystemFont,sans-serif';
+ctx.textAlign='center';
+for(let i=0;i<nSamples;i+=Math.max(1,Math.floor(nSamples/5))){
+let x=ml+(i/(nSamples-1||1))*cw;
+let secAgo=Math.round((nSamples-1-i)*2);
+ctx.fillText(secAgo+'s',x,h-2*dpr);
+}
+// draw a filled area series
+function drawSeries(values,strokeColor,fillColor){
+if(values.length<2)return;
+ctx.beginPath();
+for(let i=0;i<values.length;i++){
+let x=ml+(i/(values.length-1||1))*cw;
+let y=mt+ch*(1-Math.min(100,Math.max(0,values[i]))/100);
+if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);
+}
+ctx.strokeStyle=strokeColor;
+ctx.lineWidth=1.5*dpr;
+ctx.stroke();
+// fill
+let last=values.length-1;
+ctx.lineTo(ml+(last/(values.length-1||1))*cw,mt+ch);
+ctx.lineTo(ml,mt+ch);
+ctx.closePath();
+ctx.fillStyle=fillColor;
+ctx.fill();
+}
+let gpuUtils=samples.map(s=>s.gpu_util_pct||0);
+let vramPcts=samples.map(s=>{
+let used=s.mem_used_mib||0,total=s.mem_total_mib||1;
+return 100*used/total;
+});
+drawSeries(vramPcts,'#bc8cff','rgba(188,140,255,0.15)');
+drawSeries(gpuUtils,'#58a6ff','rgba(88,166,255,0.12)');
+});
+}
 connect();
 </script>
 </body></html>"""
