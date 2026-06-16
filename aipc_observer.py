@@ -3298,6 +3298,20 @@ drawSeries(gpuUtils,'#58a6ff','rgba(88,166,255,0.12)');
 });
 }
 connect();
+// Draggable cards: drag any card in the grid to reorder; layout persists in localStorage.
+(function(){
+function cardId(c){let h=c.querySelector('h2');return h?h.textContent:''}
+function saveOrder(){let grid=document.querySelector('.grid');if(!grid)return;let ids=[];for(let c of grid.children)ids.push(cardId(c));localStorage.setItem('observer-card-order',JSON.stringify(ids))}
+function applyOrder(){let raw=localStorage.getItem('observer-card-order');if(!raw)return false;let grid=document.querySelector('.grid');if(!grid)return false;try{let order=JSON.parse(raw)}catch(e){return false}if(!order||!order.length)return false;let map={};for(let c of grid.children)map[cardId(c)]=c;let applied=0;for(let id of order){if(map[id]){grid.appendChild(map[id]);applied++}}return applied>0}
+if(applyOrder()){return}
+let grid=document.querySelector('.grid');if(!grid)return;let dragSrc=null;
+grid.addEventListener('dragstart',function(e){let card=e.target.closest('.card');if(!card)return;dragSrc=card;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')});
+grid.addEventListener('dragend',function(e){let card=e.target.closest('.card');if(!card)return;card.classList.remove('dragging');for(let c of grid.children)c.classList.remove('drag-over');dragSrc=null;saveOrder()});
+grid.addEventListener('dragover',function(e){e.preventDefault();e.dataTransfer.dropEffect='move';let card=e.target.closest('.card');if(!card||card===dragSrc)return;for(let c of grid.children)c.classList.remove('drag-over');card.classList.add('drag-over')});
+grid.addEventListener('dragleave',function(e){if(e.target.classList.contains('card'))e.target.classList.remove('drag-over')});
+grid.addEventListener('drop',function(e){e.preventDefault();let card=e.target.closest('.card');if(!card||!dragSrc||card===dragSrc)return;card.classList.remove('drag-over');let children=[...grid.children];let fromIdx=children.indexOf(dragSrc);let toIdx=children.indexOf(card);if(fromIdx<toIdx)card.after(dragSrc);else card.before(dragSrc)});
+for(let c of grid.children)c.draggable=true;
+})();
 </script>
 </body></html>"""
 
