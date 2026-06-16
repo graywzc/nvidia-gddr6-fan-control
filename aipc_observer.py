@@ -3298,19 +3298,47 @@ drawSeries(gpuUtils,'#58a6ff','rgba(88,166,255,0.12)');
 });
 }
 connect();
-// Draggable cards: drag any card in the grid to reorder; layout persists in localStorage.
+// Draggable cards: mouse-based drag to reorder; layout persists in localStorage.
 (function(){
 function cardId(c){let h=c.querySelector('h2');return h?h.textContent:''}
 function saveOrder(){let grid=document.querySelector('.grid');if(!grid)return;let ids=[];for(let c of grid.children)ids.push(cardId(c));localStorage.setItem('observer-card-order',JSON.stringify(ids))}
 function applyOrder(){let raw=localStorage.getItem('observer-card-order');if(!raw)return false;let grid=document.querySelector('.grid');if(!grid)return false;try{let order=JSON.parse(raw)}catch(e){return false}if(!order||!order.length)return false;let map={};for(let c of grid.children)map[cardId(c)]=c;let applied=0;for(let id of order){if(map[id]){grid.appendChild(map[id]);applied++}}return applied>0}
 if(applyOrder()){return}
-let grid=document.querySelector('.grid');if(!grid)return;let dragSrc=null;
-grid.addEventListener('dragstart',function(e){let card=e.target.closest('.card');if(!card)return;dragSrc=card;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')});
-grid.addEventListener('dragend',function(e){let card=e.target.closest('.card');if(!card)return;card.classList.remove('dragging');for(let c of grid.children)c.classList.remove('drag-over');dragSrc=null;saveOrder()});
-grid.addEventListener('dragover',function(e){e.preventDefault();e.dataTransfer.dropEffect='move';let card=e.target.closest('.card');if(!card||card===dragSrc)return;for(let c of grid.children)c.classList.remove('drag-over');card.classList.add('drag-over')});
-grid.addEventListener('dragleave',function(e){if(e.target.classList.contains('card'))e.target.classList.remove('drag-over')});
-grid.addEventListener('drop',function(e){e.preventDefault();let card=e.target.closest('.card');if(!card||!dragSrc||card===dragSrc)return;card.classList.remove('drag-over');let children=[...grid.children];let fromIdx=children.indexOf(dragSrc);let toIdx=children.indexOf(card);if(fromIdx<toIdx)card.after(dragSrc);else card.before(dragSrc)});
-for(let c of grid.children)c.draggable=true;
+let grid=document.querySelector('.grid');if(!grid)return;let dragSrc=null;let ghost=null;let offsetX=0,offsetY=0;
+grid.addEventListener('mousedown',function(e){
+let card=e.target.closest('.card');if(!card)return;
+if(e.target.closest('button,select,input,a'))return;
+e.preventDefault();
+dragSrc=card;
+let r=card.getBoundingClientRect();offsetX=e.clientX-r.left;offsetY=e.clientY-r.top;
+card.classList.add('dragging');
+ghost=card.cloneNode(true);ghost.style.position='fixed';ghost.style.left=r.left+'px';ghost.style.top=r.top+'px';ghost.style.width=r.width+'px';ghost.style.height=r.height+'px';ghost.style.zIndex='999';ghost.style.pointerEvents='none';ghost.style.opacity='.8';document.body.appendChild(ghost);
+document.addEventListener('selectstart',function(ev){ev.preventDefault()});
+});
+document.addEventListener('mousemove',function(e){
+if(!dragSrc)return;
+e.preventDefault();
+if(ghost){ghost.style.left=(e.clientX-offsetX)+'px';ghost.style.top=(e.clientY-offsetY)+'px'}
+ghost&&ghost.remove();
+let el=document.elementFromPoint(e.clientX,e.clientY);let card=el?el.closest('.card'):null;
+ghost&&(document.body.appendChild(ghost),ghost.style.left=(e.clientX-offsetX)+'px',ghost.style.top=(e.clientY-offsetY)+'px');
+for(let c of grid.children)c.classList.remove('drag-over');
+if(card&&card!==dragSrc)card.classList.add('drag-over');
+});
+document.addEventListener('mouseup',function(e){
+if(!dragSrc)return;
+document.removeEventListener('selectstart',function(ev){ev.preventDefault()});
+if(ghost){ghost.remove();ghost=null}
+dragSrc.classList.remove('dragging');
+let el=document.elementFromPoint(e.clientX,e.clientY);let card=el?el.closest('.card'):null;
+for(let c of grid.children)c.classList.remove('drag-over');
+if(card&&card!==dragSrc){
+let children=[...grid.children];let fromIdx=children.indexOf(dragSrc);let toIdx=children.indexOf(card);
+if(fromIdx<toIdx)card.after(dragSrc);else card.before(dragSrc);
+}
+saveOrder();dragSrc=null;
+});
+})();
 })();
 </script>
 </body></html>"""
