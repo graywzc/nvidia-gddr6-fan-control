@@ -3308,20 +3308,26 @@ let grid=document.querySelector('.grid');if(!grid)return;let dragSrc=null;let gh
 grid.addEventListener('mousedown',function(e){
 let card=e.target.closest('.card');if(!card)return;
 if(e.target.closest('button,select,input,a'))return;
-e.preventDefault();dragSrc=card;
+e.preventDefault();
+dragSrc=card;
 let r=card.getBoundingClientRect();offsetX=e.clientX-r.left;offsetY=e.clientY-r.top;
 card.classList.add('dragging');
 ghost=card.cloneNode(true);ghost.style.position='fixed';ghost.style.left=r.left+'px';ghost.style.top=r.top+'px';ghost.style.width=r.width+'px';ghost.style.height=r.height+'px';ghost.style.zIndex='999';ghost.style.pointerEvents='none';ghost.style.opacity='.8';document.body.appendChild(ghost);
+document.body.style.userSelect='none';
 });
 document.addEventListener('mousemove',function(e){
 if(!dragSrc)return;
+e.preventDefault();
 if(ghost){ghost.style.left=(e.clientX-offsetX)+'px';ghost.style.top=(e.clientY-offsetY)+'px'}
+ghost&&ghost.remove();
 let el=document.elementFromPoint(e.clientX,e.clientY);let card=el?el.closest('.card'):null;
+ghost&&(document.body.appendChild(ghost),ghost.style.left=(e.clientX-offsetX)+'px',ghost.style.top=(e.clientY-offsetY)+'px');
 for(let c of grid.children)c.classList.remove('drag-over');
 if(card&&card!==dragSrc)card.classList.add('drag-over');
 });
 document.addEventListener('mouseup',function(e){
 if(!dragSrc)return;
+document.body.style.userSelect='';
 if(ghost){ghost.remove();ghost=null}
 dragSrc.classList.remove('dragging');
 let el=document.elementFromPoint(e.clientX,e.clientY);let card=el?el.closest('.card'):null;
