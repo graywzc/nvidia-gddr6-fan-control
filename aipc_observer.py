@@ -3046,18 +3046,23 @@ function variantDoc(v){return v.doc||{}}
 function variantCtx(v){let doc=variantDoc(v);return doc.max_ctx_doc||`${v.max_ctx?Number(v.max_ctx).toLocaleString():'-'}`}
 function variantTps(v){return variantDoc(v).tps||'-'}
 function variantWhy(v){return variantDoc(v).why||v.status_note||''}
-function renderVariantListModal(d,fits,runKey,running){let c=d.catalog||{};let vars=c.variants||{};let installed=d.installed_assets||{};let defSet=new Set(Object.values(c.defaults||{}));let order={production:0,caveats:1};
+function variantTopology(v){let p=(v&&v.compose_path)||'';return p.indexOf('/multi4/')>=0?'multi4':(p.indexOf('/dual/')>=0?'dual':'single')}
+function machineTopology(d){let ngpu=(d.gpu_stats||[]).length||1;return ngpu>=4?'multi4':(ngpu>=2?'dual':'single')}
+function topologyLabel(t){return t==='multi4'?'4-GPU':(t==='dual'?'dual-GPU':'single-GPU')}
+function defaultForVariant(c,k,v,topo){return (c.defaults||{})[`${v.model}/${k.split('/')[0]}/${topo}`]}
+function isTopologyDefault(c,k,v,topo){return defaultForVariant(c,k,v,topo)===k}
+function renderVariantListModal(d,fits,runKey,running,topo){let c=d.catalog||{};let vars=c.variants||{};let installed=d.installed_assets||{};let order={production:0,caveats:1};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let rows='<div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(defSet.has(k)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let install=installed[k]?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`;
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let install=installed[k]?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`;
 return `<div class="variant-row"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${install}${action}</span></div>`}).join('');
 rows+='</div>';
-document.getElementById('variantModalTitle').textContent=`Variants for this machine (${fits.length})`;
+document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;
 document.getElementById('variantModalBody').innerHTML=rows;
 let cs=d.control_status||{};let vms=document.getElementById('variantModalStatus');
 if(cs.action&&!cs.done){let icon=cs.action==='install'?'📦 ':'⏳ ';vms.textContent=icon+esc(cs.detail||cs.action+'…');vms.style.display=''}else{vms.style.display='none'}
 }
-function openVariantList(){if(!lastRenderData)return;let d=lastRenderData;let c=d.catalog||{};let vars=c.variants||{};let keys=Object.keys(vars);let mi=d.model_info||{};let running=!!d.container;let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;let ngpu=(d.gpu_stats||[]).length||1;let reqGpus=p=>p.indexOf('/multi4/')>=0?4:(p.indexOf('/dual/')>=0?2:1);let fits=keys.filter(k=>reqGpus(vars[k].compose_path||'')<=ngpu&&(vars[k].tp||1)<=ngpu);renderVariantListModal(d,fits,runKey,running);document.getElementById('variantModal').classList.add('open')}
+function openVariantList(){if(!lastRenderData)return;let d=lastRenderData;let c=d.catalog||{};let vars=c.variants||{};let keys=Object.keys(vars);let mi=d.model_info||{};let running=!!d.container;let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;let ngpu=(d.gpu_stats||[]).length||1;let topo=machineTopology(d);let fits=keys.filter(k=>variantTopology(vars[k])===topo&&(vars[k].tp||1)<=ngpu);renderVariantListModal(d,fits,runKey,running,topo);document.getElementById('variantModal').classList.add('open')}
 function refreshVariantListIfOpen(){let m=document.getElementById('variantModal');if(m&&m.classList.contains('open'))openVariantList()}
 function closeVariantList(){document.getElementById('variantModal').classList.remove('open')}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
@@ -3080,11 +3085,11 @@ if(def)rows+=infoRow('Curated default',esc(def)+(def===runKey?' <span class="goo
 let counts={};keys.forEach(k=>{let s=vars[k].status||'other';counts[s]=(counts[s]||0)+1});
 rows+=infoRow('Variants',`${keys.length} (${counts.production||0} production · ${counts.caveats||0} caveats)`);
 let ngpu=(d.gpu_stats||[]).length||1;
-let reqGpus=p=>p.indexOf('/multi4/')>=0?4:(p.indexOf('/dual/')>=0?2:1);
-let fits=keys.filter(k=>reqGpus(vars[k].compose_path||'')<=ngpu&&(vars[k].tp||1)<=ngpu);
+let topo=machineTopology(d);
+let fits=keys.filter(k=>variantTopology(vars[k])===topo&&(vars[k].tp||1)<=ngpu);
 let order={production:0,caveats:1};
 fits.sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
-rows+=infoRow('Variants for this machine',`${fits.length} of ${keys.length} <button class="btn" onclick="openVariantList()">View variants</button>`,`${ngpu} GPU detected`);
+rows+=infoRow('Variants for this machine',`${fits.length} of ${keys.length} <button class="btn" onclick="openVariantList()">View variants</button>`,`${ngpu} GPU detected · ${topologyLabel(topo)}`);
 let dl=[];(diff.added||[]).forEach(k=>dl.push('new: '+k));
 (diff.removed||[]).forEach(k=>dl.push('removed: '+k));
 (diff.changed||[]).forEach(ch=>dl.push(ch.key+': '+Object.entries(ch.fields).map(([f,v])=>`${f} ${v[0]??'-'} → ${v[1]??'-'}`).join(', ')));
