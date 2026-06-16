@@ -3305,13 +3305,15 @@ function saveOrder(){let grid=document.querySelector('.grid');if(!grid)return;le
 function applyOrder(){let raw=localStorage.getItem('observer-card-order');if(!raw)return false;let grid=document.querySelector('.grid');if(!grid)return false;try{let order=JSON.parse(raw)}catch(e){return false}if(!order||!order.length)return false;let map={};for(let c of grid.children)map[cardId(c)]=c;for(let i=0;i<order.length;i++){let c=map[order[i]];if(c)c.style.order=i}return true}
 if(applyOrder()){return}
 let grid=document.querySelector('.grid');if(!grid)return;let dragSrc=null;
-grid.addEventListener('dragstart',function(e){let card=e.target.closest('.card');if(!card)return;dragSrc=card;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')});
-grid.addEventListener('dragend',function(e){let card=e.target.closest('.card');if(!card)return;card.classList.remove('dragging');for(let c of grid.children)c.classList.remove('drag-over');dragSrc=null;updateOrders();saveOrder()});
-grid.addEventListener('dragover',function(e){e.preventDefault();e.dataTransfer.dropEffect='move';let card=e.target.closest('.card');if(!card||card===dragSrc)return;for(let c of grid.children)c.classList.remove('drag-over');card.classList.add('drag-over')});
-grid.addEventListener('dragleave',function(e){if(e.target.classList.contains('card'))e.target.classList.remove('drag-over')});
-grid.addEventListener('drop',function(e){e.preventDefault();let card=e.target.closest('.card');if(!card||!dragSrc||card===dragSrc)return;card.classList.remove('drag-over');let children=[...grid.children];let fromIdx=children.indexOf(dragSrc);let toIdx=children.indexOf(card);if(fromIdx<toIdx)card.after(dragSrc);else card.before(dragSrc);updateOrders()});
+for(let c of grid.children){
+c.draggable=true;
+c.addEventListener('dragstart',function(e){dragSrc=c;c.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')});
+c.addEventListener('dragend',function(e){c.classList.remove('dragging');for(let d of grid.children)d.classList.remove('drag-over');dragSrc=null;updateOrders();saveOrder()});
+c.addEventListener('dragover',function(e){e.preventDefault();e.dataTransfer.dropEffect='move';if(c===dragSrc)return;for(let d of grid.children)d.classList.remove('drag-over');c.classList.add('drag-over')});
+c.addEventListener('dragleave',function(){c.classList.remove('drag-over')});
+c.addEventListener('drop',function(e){e.preventDefault();if(!dragSrc||c===dragSrc)return;c.classList.remove('drag-over');let children=[...grid.children];let fromIdx=children.indexOf(dragSrc);let toIdx=children.indexOf(c);if(fromIdx<toIdx)c.after(dragSrc);else c.before(dragSrc);updateOrders()});
+}
 function updateOrders(){let children=[...grid.children];for(let i=0;i<children.length;i++)children[i].style.order=i}
-for(let c of grid.children)c.draggable=true;
 })();
 </script>
 </body></html>"""
