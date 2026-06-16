@@ -5,6 +5,7 @@ import json
 import sys
 import time
 import unittest
+from unittest import mock
 
 import aipc_observer
 
@@ -1995,6 +1996,90 @@ class CompareVariantCommandTests(unittest.TestCase):
     def test_compare_requires_two_variants(self):
         with self.assertRaises(ValueError):
             aipc_observer.compare_variant_commands("/repo", ["eng/a"], {})
+
+
+class _FakeProc:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class VllmHelpProbeTests(unittest.TestCase):
+    # The flag-then-indented-prose layout vLLM's `serve --help=all` emits.
+    HELP = (
+        "  --dtype {auto,bfloat16,float16}\n"
+        "                        Data type for model weights and activations.\n"
+        "  --max-model-len MAX_MODEL_LEN\n"
+        "                        Model context length.\n"
+    )
+
+    def setUp(self):
+        aipc_observer._vllm_help_cache.clear()
+        self.addCleanup(aipc_observer._vllm_help_cache.clear)
+
+    def test_probes_throwaway_container_and_parses_descriptions(self):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return _FakeProc(stdout=self.HELP)
+
+        info = aipc_observer._inspect_vllm_help("vllm/vllm-openai:v0.22.0",
+                                                runner=runner)
+        self.assertEqual(
+            calls[0],
+            ["docker", "run", "--rm", "--gpus", "all", "--entrypoint", "vllm",
+             "vllm/vllm-openai:v0.22.0", "serve", "--help=all"],
+        )
+        self.assertEqual(
+            info["flags"]["--dtype"]["description"],
+            "Data type for model weights and activations.",
+        )
+        self.assertEqual(info["flag_count"], 2)
+
+    def test_caches_success_by_image(self):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append(argv)
+            return _FakeProc(stdout=self.HELP)
+
+        img = "vllm/vllm-openai:v0.22.0"
+        aipc_observer._inspect_vllm_help(img, runner=runner)
+        aipc_observer._inspect_vllm_help(img, runner=runner)
+        self.assertEqual(len(calls), 1)
+
+    def test_failure_returns_error_and_is_not_cached(self):
+        attempts = []
+
+        def failing(argv, **kw):
+            attempts.append(argv)
+            return _FakeProc(stderr="Failed to infer device type", returncode=1)
+
+        img = "vllm/vllm-openai:v0.22.0"
+        first = aipc_observer._inspect_vllm_help(img, runner=failing)
+        self.assertIn("Failed to infer device type", first["error"])
+        self.assertNotIn(img, aipc_observer._vllm_help_cache)
+
+        def ok(argv, **kw):
+            attempts.append(argv)
+            return _FakeProc(stdout=self.HELP)
+
+        retry = aipc_observer._inspect_vllm_help(img, runner=ok)
+        self.assertEqual(retry["flag_count"], 2)
+        self.assertEqual(len(attempts), 2)
+
+    def test_dispatches_vllm_engine_to_image_probe(self):
+        with mock.patch.object(
+            aipc_observer, "_inspect_vllm_help",
+            return_value={"flags": {}, "source": "stub"},
+        ) as probe:
+            aipc_observer.inspect_container_help(
+                "vllm-running", ["bash", "-c", "exec vllm serve m"],
+                engine="vllm", image="vllm/vllm-openai:v0.22.0",
+            )
+        probe.assert_called_once_with("vllm/vllm-openai:v0.22.0")
 
 
 class SwitchModelTests(unittest.TestCase):
