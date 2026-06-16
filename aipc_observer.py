@@ -1834,12 +1834,15 @@ def validate_switch(variant, catalog, force=False):
     """Check the requested variant against the extracted compose registry."""
     variants = (catalog or {}).get("variants") or {}
     if not variants:
+        print(f"[observer] validate_switch: rejected — catalog not loaded", flush=True)
         raise RuntimeError("variant catalog not loaded yet; try again shortly")
     entry = variants.get(variant)
     if entry is None:
+        print(f"[observer] validate_switch: rejected — unknown variant {variant!r}", flush=True)
         raise ValueError(f"unknown variant {variant!r}")
     status = entry.get("status")
     if status not in ("production", "caveats") and not force:
+        print(f"[observer] validate_switch: rejected — status={status!r} force={force}", flush=True)
         raise ValueError(
             f"variant {variant!r} has status {status!r}; pass force to switch anyway"
         )
@@ -1853,7 +1856,10 @@ def normalize_switch_variant(variant, catalog):
         return variant
     for key, entry in variants.items():
         if variant == variant_from_compose_path(entry.get("compose_path") or ""):
+            print(f"[observer] normalize_switch_variant: mapped {variant!r} -> {key!r}", flush=True)
             return key
+    if variant not in variants:
+        print(f"[observer] normalize_switch_variant: could not resolve {variant!r}, returning as-is", flush=True)
     return variant
 
 
@@ -1871,6 +1877,7 @@ def switch_model(repo, variant, monitor_port, force=False, runner=_run):
     if force:
         cmd.append("--force")
     cmd.append(variant)
+    print(f"[observer] switch_model: running {' '.join(cmd)} in {repo}", flush=True)
     runner(_repo_owner_cmd(repo, cmd), env=env, cwd=repo, timeout=SWITCH_TIMEOUT)
 
 
@@ -1948,17 +1955,22 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
     what applies log rotation and the image pin.
     """
     try:
+        print(f"[observer] _switch_worker: START variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
         _set_control_status(
             "switch", f"switching to {variant} — old model stopping, "
                       "new model loading (takes a few minutes)…"
         )
+        print(f"[observer] _switch_worker: calling switch_model()", flush=True)
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
+        print(f"[observer] _switch_worker: switch_model() returned OK", flush=True)
         _set_control_status(
             "switch", f"{variant} is up; applying mode {preset} + cache "
                       f"{'on' if cache_ram else 'off'} + log rotation "
                       "(one more model reload)…"
         )
+        print(f"[observer] _switch_worker: calling _wait_for_model_info()", flush=True)
         info = (info_getter or _wait_for_model_info)(monitor_port)
+        print(f"[observer] _switch_worker: model_info returned, calling restart_model()", flush=True)
         result = restart_model(preset, model_info=info, runner=runner,
                                cache_ram=cache_ram,
                                override_path=override_path)
@@ -1970,9 +1982,11 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                       f"cache {'on' if result.get('cache_ram') else 'off'}){note}",
             done=True, ok=True
         )
+        print(f"[observer] _switch_worker: DONE variant={variant!r}", flush=True)
         audit("switch-done", f"variant={variant} preset={preset} "
                              f"cache_ram={cache_ram}")
     except Exception as e:
+        print(f"[observer] _switch_worker: FAILED variant={variant!r} error={e!r}", flush=True)
         audit("switch-failed", f"variant={variant}: {e}")
         setup = parse_setup_hint(str(e))
         if setup:
@@ -1990,6 +2004,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     setup, runner=_run, info_getter=None,
                     override_path=OVERRIDE_FILE, cache_ram=False):
     try:
+        print(f"[observer] _install_worker: START variant={variant!r} preset={preset!r} retry={retry}", flush=True)
         _set_control_status(
             "install", f"installing assets for {variant} (can take a while)…"
         )
@@ -2009,6 +2024,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
         result = install_variant_assets(
             repo, variant, state.catalog, setup=setup, runner=runner,
             progress=progress)
+        print(f"[observer] _install_worker: install_variant_assets() returned OK", flush=True)
         state.mark_assets_installed(variant, {
             k: v for k, v in result.items()
             if k in ("model", "model_dir", "weight_key")
@@ -2020,18 +2036,23 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 done=True, ok=True, installed_variant=variant,
             )
             audit("install-done", f"variant={variant}")
+            print(f"[observer] _install_worker: DONE (no retry) variant={variant!r}", flush=True)
             return
+        print(f"[observer] _install_worker: assets installed, calling switch_model() for retry", flush=True)
         _set_control_status(
             "install", f"installed assets for {variant}; retrying switch…",
             installed_variant=variant,
         )
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
+        print(f"[observer] _install_worker: switch_model() returned OK after install", flush=True)
         _set_control_status(
             "switch", f"{variant} is up; applying mode {preset} + cache "
                       f"{'on' if cache_ram else 'off'} + log rotation "
                       "(one more model reload)…"
         )
+        print(f"[observer] _install_worker: calling _wait_for_model_info() after switch", flush=True)
         info = (info_getter or _wait_for_model_info)(monitor_port)
+        print(f"[observer] _install_worker: calling restart_model() after switch", flush=True)
         restart_model(preset, model_info=info, runner=runner,
                       cache_ram=cache_ram,
                       override_path=override_path)
@@ -2040,9 +2061,11 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                       f"cache {'on' if cache_ram else 'off'})",
             done=True, ok=True
         )
+        print(f"[observer] _install_worker: DONE (with retry) variant={variant!r}", flush=True)
         audit("install-switch-done", f"variant={variant} preset={preset} "
                                      f"cache_ram={cache_ram}")
     except Exception as e:
+        print(f"[observer] _install_worker: FAILED variant={variant!r} error={e!r}", flush=True)
         audit("install-failed", f"variant={variant}: {e}")
         _set_control_status(
             "install", f"install for {variant} failed: {e}",
@@ -3113,14 +3136,16 @@ DASHBOARD_HTML = """<!doctype html>
 .btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.variant-table{min-width:1050px}.variant-row{display:grid;grid-template-columns:minmax(230px,1.1fr) 86px 86px minmax(140px,.8fr) minmax(260px,1.5fr) 120px;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}.variant-row.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.variant-name{font-weight:650;color:var(--accent);overflow-wrap:anywhere}.variant-note{color:var(--dim);line-height:1.35;margin-top:2px}.variant-pick{display:flex;gap:8px;align-items:flex-start}.variant-pick input{margin-top:2px}.compare-toolbar{display:flex;align-items:center;gap:8px;padding:10px 0;position:sticky;top:0;background:var(--surface);z-index:2;border-bottom:1px solid var(--border)}.compare-grid{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(260px,1fr);gap:12px;min-width:720px;padding-top:12px}.compare-card{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.compare-card h3{font-size:12px;color:var(--accent);margin:0 0 8px;overflow-wrap:anywhere}.compare-field{border-top:1px solid var(--border);padding:8px 0}.compare-field:first-of-type{border-top:0}.compare-field .label{display:block;font-size:10px;text-transform:uppercase;font-weight:700;margin-bottom:4px}.flag-compare{display:grid;min-width:860px;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg);margin-top:12px}.flag-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:7px 8px;font-size:12px;min-width:0}.flag-cell.head{position:sticky;top:0;background:var(--surface);z-index:1;color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.flag-cell.changed{background:rgba(210,153,34,.12)}.flag-cell.same{color:var(--dim)}.flag-desc{line-height:1.35}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 @media(max-width:900px){.detail-grid{grid-template-columns:1fr}.request-row{grid-template-columns:88px 120px minmax(140px,1fr) 52px 52px 64px 68px 72px 68px 52px 72px minmax(70px,1fr)}}
 .gpu-history-chart{position:relative;width:100%;height:160px;margin-bottom:12px;border-radius:6px;overflow:hidden;background:var(--bg);border:1px solid var(--border)}.gpu-history-chart:last-child{margin-bottom:0}.gpu-history-chart canvas{display:block;width:100%;height:100%}.gpu-history-label{position:absolute;top:8px;left:10px;font-size:11px;font-weight:650;color:var(--accent);pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend{position:absolute;top:8px;right:10px;display:flex;gap:12px;font-size:10px;font-weight:600;pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend span{display:flex;align-items:center;gap:4px}.legend-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+/* Drag & resize */
+.card{transition:box-shadow .15s,opacity .15s}.card.dragging{opacity:.4;box-shadow:0 0 0 2px var(--accent)}.card.drag-over{box-shadow:0 0 0 2px var(--green)}.card h2{display:flex;align-items:center;justify-content:space-between}.drag-handle{cursor:grab;color:var(--dim);font-size:14px;user-select:none;display:inline-block;width:20px;text-align:center}.drag-handle:active{cursor:grabbing}.resize-btn{background:transparent;border:1px solid var(--border);color:var(--dim);border-radius:4px;padding:2px 6px;cursor:pointer;font-size:10px;font-family:inherit}.resize-btn:hover{border-color:var(--accent);color:var(--accent)}.half{grid-column:span 2}
 </style>
 </head>
 <body>
 <div class="header"><h1 id="title">Observer</h1><div class="meta"><span id="model" class="model">--</span> · Uptime <span id="uptime">0s</span> · <span id="updated">--</span></div></div>
 <div class="grid">
-<section class="card"><h2>GPU</h2><div id="gpuGrid" class="gpu-grid"></div></section>
-<section class="card full" id="gpuHistoryCard" style="display:none"><h2>GPU History</h2><div id="gpuHistoryCharts"></div></section>
-<section class="card"><h2>Summary</h2><div class="summary">
+<section class="card"><h2><span>GPU</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="gpuGrid" class="gpu-grid"></div></section>
+<section class="card full" id="gpuHistoryCard" style="display:none"><h2><span>GPU History</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="gpuHistoryCharts"></div></section>
+<section class="card"><h2><span>Summary</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div class="summary">
 <div class="summary-item"><div id="active" class="summary-value">0</div><div class="summary-label">Active</div></div>
 <div class="summary-item"><div id="requests" class="summary-value">0</div><div class="summary-label">Completed</div></div>
 <div class="summary-item"><div id="gpuTemp" class="summary-value">--</div><div class="summary-label">GPU Temp</div></div>
@@ -3128,15 +3153,15 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>
 <div class="summary-item"><div id="queued" class="summary-value">-</div><div class="summary-label">Queued</div></div>
 </div></section>
-<section class="card"><h2>Context / KV Cache</h2><div id="slotInfo" class="gpu-grid"></div></section>
-<section class="card"><h2>Model Config</h2><div id="modelInfo"></div>
+<section class="card"><h2><span>Context / KV Cache</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="slotInfo" class="gpu-grid"></div></section>
+<section class="card"><h2><span>Model Config</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="modelInfo"></div>
 <div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · debug: add engine-specific observability/debug flags">
 <option value="baseline">baseline</option><option value="debug" selected>debug</option>
 </select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
-<section class="card"><h2>club-3090 Catalog</h2><div id="catalogInfo"></div></section>
-<section class="card"><h2>Server Metrics</h2><div id="metricsInfo"></div></section>
-<section class="card full" id="vllmTimelineCard"><h2>vLLM Activity (live)</h2><div id="vllmTimeline"></div></section>
-<section class="card"><h2>Inference Health</h2><div class="summary">
+<section class="card"><h2><span>club-3090 Catalog</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="catalogInfo"></div></section>
+<section class="card"><h2><span>Server Metrics</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="metricsInfo"></div></section>
+<section class="card full" id="vllmTimelineCard"><h2><span>vLLM Activity (live)</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="vllmTimeline"></div></section>
+<section class="card"><h2><span>Inference Health</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
 <div class="summary-item"><div id="cacheDefeat" class="summary-value">0</div><div class="summary-label">Cache Defeated</div></div>
@@ -3145,7 +3170,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="httpErrors" class="summary-value">0</div><div class="summary-label">HTTP Errors</div></div>
 <div class="summary-item"><div id="budgetHits" class="summary-value">0</div><div class="summary-label">Budget Hits</div></div>
 </div></section>
-<section class="card full"><h2>Recent Requests</h2><div id="requestList" class="requests"></div></section>
+<section class="card full"><h2><span>Recent Requests</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="requestList" class="requests"></div></section>
 </div>
 <div id="flagModal" class="modal" onclick="if(event.target===this)closeFlagGuide()"><div class="modal-panel">
 <div class="modal-head"><h2 id="flagModalTitle">Flag guide</h2><button class="btn" onclick="closeFlagGuide()">Close</button></div>
@@ -3198,9 +3223,13 @@ document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
 let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
 if(rb){rb.disabled=lastBusy||!running;rb.title=running?'':'no model running — use Start in the Catalog below'}
 if(sb){sb.disabled=lastBusy||!running;sb.title=running?'':'no model running'}}
-function doSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
-if(!confirm(`Switch model to '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`))return;
-ctlPost('/observer/api/switch',{variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();console.log('[observer] doSwitch called:',{variant:v,status:p,cache,lastActive,lastBusy:!!lastBusy});let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
+let confirmMsg=`Switch model to '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`;
+console.log('[observer] doSwitch confirm:',confirmMsg);
+if(!confirm(confirmMsg)){console.log('[observer] doSwitch cancelled by user');return;}
+let body={variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats')};
+console.log('[observer] doSwitch posting:',JSON.stringify(body));
+ctlPost('/observer/api/switch',body).then(r=>{console.log('[observer] doSwitch success:',JSON.stringify(r));document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{console.error('[observer] doSwitch failed:',e);document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function doStart(v,status){let p=selectedPreset(),cache=selectedCacheRam();let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
 if(!confirm(`Start model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nNo model is running — this boots the variant and waits for it to load, which takes a few minutes.${exp}`))return;
 ctlPost('/observer/api/switch',{variant:v,preset:p,cache_ram:cache,force:(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
@@ -3233,7 +3262,7 @@ el.innerHTML=rows}
 function renderVllmTimeline(d){let card=document.getElementById('vllmTimelineCard');let el=document.getElementById('vllmTimeline');let m=d.metrics||{};if(m.engine!=='vllm'){card.style.display='none';return}card.style.display='';let h=d.vllm_history||[];if(!h.length){el.innerHTML='<div class="row"><span class="label">no samples yet</span></div>';return}
 let spark=(key,color,unit,dec)=>{let vals=h.map(s=>Number(s[key])||0);let max=Math.max(1,...vals);let bars=vals.map(v=>`<span style="display:inline-block;width:3px;margin-right:1px;background:${color};height:${Math.max(1,Math.round(30*v/max))}px;vertical-align:bottom" title="${v}${unit}"></span>`).join('');let last=vals[vals.length-1];let peak=Math.max(...vals);return `<div class="row" style="align-items:flex-end"><span class="label" style="min-width:130px">${key}</span><span style="height:32px;line-height:0;flex:1;overflow:hidden;white-space:nowrap">${bars}</span><span class="value" style="min-width:120px;text-align:right">${last.toFixed(dec||0)}${unit} <span class="label">(peak ${peak.toFixed(dec||0)})</span></span></div>`};
 let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
-async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+async function ctlPost(path,body){console.log('[observer] ctlPost:',path,JSON.stringify(body));let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});console.log('[observer] ctlPost response:',r.status,r.ok);let j=await r.json().catch(()=>({}));if(!r.ok){console.error('[observer] ctlPost error:',j.error||'HTTP '+r.status);throw new Error(j.error||('HTTP '+r.status))}console.log('[observer] ctlPost result:',JSON.stringify(j));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
 function doRestart(){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with mode '${p}' and cache ${cache?'on':'off'}?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,cache_ram:cache,force:lastActive>0});let dr=(r.dropped_capabilities||[]).length?` (this build can't do ${r.dropped_capabilities.join(', ')})`:'';return `restarted with ${r.preset}, cache ${r.cache_ram?'on':'off'}${dr} (model reloading…)`})}
@@ -3512,6 +3541,28 @@ drawSeries(vramPcts,'#bc8cff','rgba(188,140,255,0.15)');
 drawSeries(gpuUtils,'#58a6ff','rgba(88,166,255,0.12)');
 });
 }
+// Drag-and-drop + resize
+(function(){
+var STORAGE_KEY='observer-card-order';
+var SIZE_KEY='observer-card-sizes';
+function cardId(c){var h=c.querySelector('h2 span:first-child');return h?h.textContent.trim():''}
+function saveOrder(){var g=document.querySelector('.grid');if(!g)return;var ids=[];for(var i=0;i<g.children.length;i++)ids.push(cardId(g.children[i]));localStorage.setItem(STORAGE_KEY,JSON.stringify(ids))}
+function saveSizes(){var g=document.querySelector('.grid');if(!g)return;var s={};for(var i=0;i<g.children.length;i++){var c=g.children[i];var id=cardId(c);if(c.classList.contains('full'))s[id]='full';else if(c.classList.contains('half'))s[id]='half';else s[id]='default'}localStorage.setItem(SIZE_KEY,JSON.stringify(s))}
+function applyOrder(){var raw=localStorage.getItem(STORAGE_KEY);if(!raw)return false;var g=document.querySelector('.grid');if(!g)return false;var order;try{order=JSON.parse(raw)}catch(e){return false}if(!order||!order.length)return false;var map={};for(var i=0;i<g.children.length;i++)map[cardId(g.children[i])]=g.children[i];var newCards=[];for(var j=0;j<g.children.length;j++){var id=cardId(g.children[j]);if(order.indexOf(id)===-1)newCards.push(id)}for(var k=0;k<order.length;k++){var el=map[order[k]];if(el)g.appendChild(el)}for(var m=0;m<newCards.length;m++){var el2=map[newCards[m]];if(el2)g.appendChild(el2)}return true}
+function applySizes(){var raw=localStorage.getItem(SIZE_KEY);if(!raw)return;var s;try{s=JSON.parse(raw)}catch(e){return}if(!s)return;var g=document.querySelector('.grid');if(!g)return;for(var i=0;i<g.children.length;i++){var c=g.children[i];var id=cardId(c);var sz=s[id];c.classList.remove('full','half');if(sz==='full')c.classList.add('full');else if(sz==='half')c.classList.add('half')}}
+applyOrder();applySizes();
+var grid=document.querySelector('.grid');if(!grid)return;
+var dragSrc=null;
+for(var i=0;i<grid.children.length;i++)grid.children[i].draggable=true;
+grid.addEventListener('dragstart',function(e){var card=e.target.closest('.card');if(!card)return;dragSrc=card;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')});
+grid.addEventListener('dragend',function(e){var card=e.target.closest('.card');if(!card)return;card.classList.remove('dragging');for(var i=0;i<grid.children.length;i++)grid.children[i].classList.remove('drag-over');dragSrc=null;saveOrder()});
+grid.addEventListener('dragover',function(e){e.preventDefault();e.dataTransfer.dropEffect='move';var card=e.target.closest('.card');if(!card||card===dragSrc)return;for(var i=0;i<grid.children.length;i++)grid.children[i].classList.remove('drag-over');card.classList.add('drag-over')});
+grid.addEventListener('dragleave',function(e){if(e.target.classList.contains('card'))e.target.classList.remove('drag-over')});
+grid.addEventListener('drop',function(e){e.preventDefault();var card=e.target.closest('.card');if(!card||!dragSrc||card===dragSrc)return;card.classList.remove('drag-over');var children=[].slice.call(grid.children);var fromIdx=children.indexOf(dragSrc);var toIdx=children.indexOf(card);if(fromIdx<toIdx)card.after(dragSrc);else card.before(dragSrc)});
+grid.addEventListener('click',function(e){var btn=e.target.closest('.resize-btn');if(!btn)return;var card=btn.closest('.card');if(!card)return;if(!card.classList.contains('half')&&!card.classList.contains('full'))card.classList.add('half');else if(card.classList.contains('half')){card.classList.remove('half');card.classList.add('full')}else card.classList.remove('full');saveSizes()});
+var obs=new MutationObserver(function(mutations){mutations.forEach(function(m){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];if(n.nodeType===1&&n.classList&&n.classList.contains('card'))n.draggable=true}})});
+obs.observe(grid,{childList:true});
+})();
 connect();
 </script>
 </body></html>"""
@@ -3623,6 +3674,7 @@ def handle_observer_post(handler):
             _send_json(handler, 409, {"error": str(e)})
         return True
     if not _control_lock.acquire(blocking=False):
+        print(f"[observer] {path}: rejected — another control action is running", flush=True)
         _send_json(handler, 409, {"error": "another control action is running"})
         return True
     release = True
@@ -3638,18 +3690,23 @@ def handle_observer_post(handler):
             check_restart_allowed(state, force=bool(body.get("force")))
             result = stop_model(repo=_config.get("model_repo"))
         elif path == "/observer/api/switch":
+            print(f"[observer] SWITCH request: body={body}", flush=True)
             repo = _config.get("model_repo")
             if not repo:
+                print(f"[observer] SWITCH rejected: no model repo configured", flush=True)
                 _send_json(handler, 503, {"error": "no model repo configured"})
                 return True
             variant = str(body.get("variant", ""))
             preset, cache_ram = observer_control_options(body, "baseline")
             force = bool(body.get("force"))
+            print(f"[observer] SWITCH: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
             variant = normalize_switch_variant(variant, state.catalog)
+            print(f"[observer] SWITCH: normalized variant={variant!r}", flush=True)
             validate_switch(variant, state.catalog, force=force)
             check_restart_allowed(state, force=force)
             audit("switch", f"variant={variant} preset={preset} "
                             f"cache_ram={cache_ram} force={force}")
+            print(f"[observer] SWITCH: spawning worker thread", flush=True)
             # Long-running (minutes): hand off to a worker that owns the
             # control lock; progress streams via control_status over SSE.
             threading.Thread(
@@ -3663,8 +3720,10 @@ def handle_observer_post(handler):
             result = {"started": True, "variant": variant, "preset": preset,
                       "cache_ram": cache_ram}
         elif path == "/observer/api/install":
+            print(f"[observer] INSTALL request: body={body}", flush=True)
             repo = _config.get("model_repo")
             if not repo:
+                print(f"[observer] INSTALL rejected: no model repo configured", flush=True)
                 _send_json(handler, 503, {"error": "no model repo configured"})
                 return True
             variant = str(body.get("variant", ""))
@@ -3672,6 +3731,7 @@ def handle_observer_post(handler):
             force = bool(body.get("force"))
             retry = bool(body.get("retry"))
             variant = normalize_switch_variant(variant, state.catalog)
+            print(f"[observer] INSTALL: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force} retry={retry}", flush=True)
             validate_switch(variant, state.catalog, force=True)
             if retry:
                 check_restart_allowed(state, force=force)
@@ -3681,6 +3741,7 @@ def handle_observer_post(handler):
                 if body.get(k)
             }
             audit("install", f"variant={variant} retry={retry}")
+            print(f"[observer] INSTALL: spawning worker thread", flush=True)
             threading.Thread(
                 target=_install_worker,
                 args=(
@@ -3704,8 +3765,10 @@ def handle_observer_post(handler):
             result,
         )
     except ValueError as e:
+        print(f"[observer] {path}: ValueError — {e}", flush=True)
         _send_json(handler, 400, {"error": str(e)})
     except Exception as e:
+        print(f"[observer] {path}: Exception — {e}", flush=True)
         _send_json(handler, 409, {"error": str(e)})
     finally:
         if release:
