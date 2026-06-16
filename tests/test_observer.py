@@ -1924,6 +1924,61 @@ class ValidateSwitchTests(unittest.TestCase):
         )
 
 
+class CompareVariantCommandTests(unittest.TestCase):
+    def test_resolves_compose_command_without_launching_variant(self):
+        catalog = {
+            "variants": {
+                "eng/a": {
+                    "status": "production",
+                    "model": "m1",
+                    "engine": "vllm",
+                    "tp": 2,
+                    "default_port": 8020,
+                    "compose_path": "models/m1/eng/compose/dual/a.yml",
+                },
+                "eng/b": {
+                    "status": "caveats",
+                    "model": "m1",
+                    "engine": "vllm",
+                    "tp": 2,
+                    "default_port": 8021,
+                    "compose_path": "models/m1/eng/compose/dual/b.yml",
+                },
+            }
+        }
+        runner = FakeRunner(json.dumps({
+            "services": {
+                "model": {
+                    "image": "example/model:latest",
+                    "entrypoint": ["/bin/bash", "-lc"],
+                    "command": "exec python -m server --max-model-len 262144",
+                    "environment": {"VLLM_LOGGING_LEVEL": "INFO"},
+                }
+            }
+        }))
+
+        result = aipc_observer.compare_variant_commands(
+            "/repo", ["eng/a", "eng/b"], catalog, runner=runner
+        )
+
+        self.assertEqual([v["variant"] for v in result["variants"]],
+                         ["eng/a", "eng/b"])
+        self.assertEqual(result["variants"][0]["service"], "model")
+        self.assertEqual(
+            result["variants"][0]["command"],
+            "exec python -m server --max-model-len 262144",
+        )
+        self.assertEqual(runner.calls[0]["cmd"][:4],
+                         ["docker", "compose", "-f",
+                          "models/m1/eng/compose/dual/a.yml"])
+        self.assertEqual(runner.calls[0]["env"]["PORT"], "8020")
+        self.assertEqual(runner.calls[1]["env"]["PORT"], "8021")
+
+    def test_compare_requires_two_variants(self):
+        with self.assertRaises(ValueError):
+            aipc_observer.compare_variant_commands("/repo", ["eng/a"], {})
+
+
 class SwitchModelTests(unittest.TestCase):
     def test_parses_setup_hint_from_preflight(self):
         hint = aipc_observer.parse_setup_hint(
