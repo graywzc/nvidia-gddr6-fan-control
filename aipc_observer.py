@@ -1413,6 +1413,82 @@ def compose_baseline_command(compose_file, service, env, cwd, runner=_run):
     return [str(tok) for tok in command]
 
 
+def _compose_config_for_variant(repo, key, entry, runner=_run):
+    compose_path = (entry or {}).get("compose_path")
+    if not compose_path:
+        raise ValueError(f"variant {key!r} has no compose_path")
+    env = dict(os.environ)
+    if entry.get("default_port"):
+        env["PORT"] = env["ESTATE_PORT"] = str(entry["default_port"])
+    out = runner(
+        ["docker", "compose", "-f", compose_path, "config", "--format", "json"],
+        env=env, cwd=repo, timeout=60,
+    )
+    cfg = json.loads(out)
+    services = cfg.get("services") or {}
+    if not services:
+        raise RuntimeError(f"{key}: compose has no services")
+    command_services = [
+        (name, svc) for name, svc in services.items() if svc.get("command")
+    ]
+    if command_services:
+        service, svc = command_services[0]
+    else:
+        service, svc = next(iter(services.items()))
+    return service, svc
+
+
+def compare_variant_commands(repo, variants, catalog, runner=_run):
+    variants = [str(v) for v in (variants or []) if str(v)]
+    if len(variants) < 2:
+        raise ValueError("select at least two variants to compare")
+    if len(variants) > 4:
+        raise ValueError("compare at most four variants at a time")
+    results = []
+    seen = set()
+    entries = (catalog or {}).get("variants") or {}
+    if not entries:
+        raise RuntimeError("variant catalog not loaded yet; try again shortly")
+    for raw in variants:
+        key = normalize_switch_variant(raw, catalog)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry = entries.get(key)
+        if entry is None:
+            raise ValueError(f"unknown variant {raw!r}")
+        try:
+            service, svc = _compose_config_for_variant(
+                repo, key, entry, runner=runner
+            )
+            result = {
+                "variant": key,
+                "service": service,
+                "compose_path": entry.get("compose_path"),
+                "image": svc.get("image"),
+                "entrypoint": svc.get("entrypoint"),
+                "command": svc.get("command"),
+                "environment": svc.get("environment") or {},
+                "status": entry.get("status"),
+                "model": entry.get("model"),
+                "engine": entry.get("engine"),
+                "tp": entry.get("tp"),
+                "error": None,
+            }
+        except Exception as e:
+            result = {
+                "variant": key,
+                "compose_path": entry.get("compose_path"),
+                "status": entry.get("status"),
+                "model": entry.get("model"),
+                "engine": entry.get("engine"),
+                "tp": entry.get("tp"),
+                "error": str(e),
+            }
+        results.append(result)
+    return {"variants": results}
+
+
 def _supported_flags(model_info, help_getter=inspect_container_help):
     """Flags the running build's --help advertises, or None when unknown.
 
@@ -2917,7 +2993,7 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{max-height:520px;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px minmax(150px,1.4fr) 60px 56px 70px 74px 78px 74px 60px 78px minmax(80px,1fr);gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.group-label{color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
-.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.variant-table{min-width:1050px}.variant-row{display:grid;grid-template-columns:minmax(230px,1.1fr) 86px 86px minmax(140px,.8fr) minmax(260px,1.5fr) 120px;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}.variant-row.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.variant-name{font-weight:650;color:var(--accent);overflow-wrap:anywhere}.variant-note{color:var(--dim);line-height:1.35;margin-top:2px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.variant-table{min-width:1050px}.variant-row{display:grid;grid-template-columns:minmax(230px,1.1fr) 86px 86px minmax(140px,.8fr) minmax(260px,1.5fr) 120px;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}.variant-row.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.variant-name{font-weight:650;color:var(--accent);overflow-wrap:anywhere}.variant-note{color:var(--dim);line-height:1.35;margin-top:2px}.variant-pick{display:flex;gap:8px;align-items:flex-start}.variant-pick input{margin-top:2px}.compare-toolbar{display:flex;align-items:center;gap:8px;padding:10px 0;position:sticky;top:0;background:var(--surface);z-index:2;border-bottom:1px solid var(--border)}.compare-grid{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(260px,1fr);gap:12px;min-width:720px;padding-top:12px}.compare-card{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.compare-card h3{font-size:12px;color:var(--accent);margin:0 0 8px;overflow-wrap:anywhere}.compare-field{border-top:1px solid var(--border);padding:8px 0}.compare-field:first-of-type{border-top:0}.compare-field .label{display:block;font-size:10px;text-transform:uppercase;font-weight:700;margin-bottom:4px}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 @media(max-width:900px){.detail-grid{grid-template-columns:1fr}.request-row{grid-template-columns:88px 120px minmax(140px,1fr) 52px 52px 64px 68px 72px 68px 52px 72px minmax(70px,1fr)}}
 .gpu-history-chart{position:relative;width:100%;height:160px;margin-bottom:12px;border-radius:6px;overflow:hidden;background:var(--bg);border:1px solid var(--border)}.gpu-history-chart:last-child{margin-bottom:0}.gpu-history-chart canvas{display:block;width:100%;height:100%}.gpu-history-label{position:absolute;top:8px;left:10px;font-size:11px;font-weight:650;color:var(--accent);pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend{position:absolute;top:8px;right:10px;display:flex;gap:12px;font-size:10px;font-weight:600;pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend span{display:flex;align-items:center;gap:4px}.legend-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 </style>
@@ -2963,12 +3039,16 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="variantModalStatus" style="display:none;padding:8px 16px;font-size:12px;border-bottom:1px solid var(--border);color:var(--accent);background:rgba(88,166,255,.06);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
 <div id="variantModalBody" class="modal-body"></div>
 </div></div>
+<div id="compareModal" class="modal" onclick="if(event.target===this)closeCompareModal()"><div class="modal-panel">
+<div class="modal-head"><h2 id="compareModalTitle">Command compare</h2><button class="btn" onclick="closeCompareModal()">Close</button></div>
+<div id="compareModalBody" class="modal-body"></div>
+</div></div>
 <div id="requestModal" class="modal" onclick="if(event.target===this)closeRequestDetail()"><div class="modal-panel">
 <div class="modal-head"><h2 id="requestModalTitle">Request detail</h2><button class="btn" onclick="closeRequestDetail()">Close</button></div>
 <div id="requestModalBody" class="modal-body"></div>
 </div></div>
 <script>
-let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};let cacheRamUserEdited=false;let lastCacheSourceKey='';
+let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};let cacheRamUserEdited=false;let lastCacheSourceKey='';let compareSelections=new Set();
 const PRESET_LABELS={'baseline':'baseline','debug':'debug','insight':'debug','insight-cache':'debug','insight-debug':'debug','custom':'custom'};
 const PRESET_DESCRIPTIONS={
 baseline:'club-3090 compose command with no observer insight flags added',
@@ -3051,20 +3131,31 @@ function machineTopology(d){let ngpu=(d.gpu_stats||[]).length||1;return ngpu>=4?
 function topologyLabel(t){return t==='multi4'?'4-GPU':(t==='dual'?'dual-GPU':'single-GPU')}
 function defaultForVariant(c,k,v,topo){return (c.defaults||{})[`${v.model}/${k.split('/')[0]}/${topo}`]}
 function isTopologyDefault(c,k,v,topo){return defaultForVariant(c,k,v,topo)===k}
+function updateCompareToolbar(){let count=compareSelections.size;let n=document.getElementById('compareCount'),b=document.getElementById('btnCompareVariants');if(n)n.textContent=`${count} selected`;if(b)b.disabled=count<2||count>4}
+function toggleCompareVariant(k,on){if(on)compareSelections.add(k);else compareSelections.delete(k);updateCompareToolbar()}
 function renderVariantListModal(d,fits,runKey,running,topo){let c=d.catalog||{};let vars=c.variants||{};let installed=d.installed_assets||{};let order={production:0,caveats:1};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
-let rows='<div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let install=installed[k]?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`;
-return `<div class="variant-row"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${install}${action}</span></div>`}).join('');
+let visible=new Set(fits);compareSelections.forEach(k=>{if(!visible.has(k))compareSelections.delete(k)});
+let rows='<div class="compare-toolbar"><button id="btnCompareVariants" class="btn" onclick="compareSelectedVariants()">Compare commands</button><span id="compareCount" class="label">0 selected</span><span class="label">select 2-4 variants</span></div><div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let install=installed[k]?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`;let checked=compareSelections.has(k)?' checked':'';
+return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${install}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;
 document.getElementById('variantModalBody').innerHTML=rows;
+updateCompareToolbar();
 let cs=d.control_status||{};let vms=document.getElementById('variantModalStatus');
 if(cs.action&&!cs.done){let icon=cs.action==='install'?'📦 ':'⏳ ';vms.textContent=icon+esc(cs.detail||cs.action+'…');vms.style.display=''}else{vms.style.display='none'}
 }
 function openVariantList(){if(!lastRenderData)return;let d=lastRenderData;let c=d.catalog||{};let vars=c.variants||{};let keys=Object.keys(vars);let mi=d.model_info||{};let running=!!d.container;let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;let ngpu=(d.gpu_stats||[]).length||1;let topo=machineTopology(d);let fits=keys.filter(k=>variantTopology(vars[k])===topo&&(vars[k].tp||1)<=ngpu);renderVariantListModal(d,fits,runKey,running,topo);document.getElementById('variantModal').classList.add('open')}
 function refreshVariantListIfOpen(){let m=document.getElementById('variantModal');if(m&&m.classList.contains('open'))openVariantList()}
 function closeVariantList(){document.getElementById('variantModal').classList.remove('open')}
+function closeCompareModal(){document.getElementById('compareModal').classList.remove('open')}
+function commandText(v){let c=v.command;if(Array.isArray(c))return c.join(' ');if(c==null)return '-';return String(c)}
+function entrypointText(v){let e=v.entrypoint;if(Array.isArray(e))return e.join(' ');if(e==null)return '-';return String(e)}
+function envText(env){if(!env)return '-';if(Array.isArray(env))return env.join('\\n');let keys=Object.keys(env).sort();return keys.length?keys.map(k=>`${k}=${env[k]}`).join('\\n'):'-'}
+function compareCard(v){if(v.error)return `<div class="compare-card"><h3>${esc(v.variant)}</h3><div class="compare-field"><span class="label">Error</span><div class="critical mono">${esc(v.error)}</div></div></div>`;return `<div class="compare-card"><h3>${esc(v.variant)}</h3><div class="compare-field"><span class="label">Status</span><div>${statusSpan(v.status)} <span class="label">TP=${esc(v.tp||'-')}</span></div></div><div class="compare-field"><span class="label">Compose</span><div class="mono">${esc(v.compose_path||'-')}</div></div><div class="compare-field"><span class="label">Service</span><div class="mono">${esc(v.service||'-')}</div></div><div class="compare-field"><span class="label">Image</span><div class="mono">${esc(v.image||'-')}</div></div><div class="compare-field"><span class="label">Entrypoint</span><div class="mono">${esc(entrypointText(v))}</div></div><div class="compare-field"><span class="label">Command</span><div class="mono">${esc(commandText(v))}</div></div><div class="compare-field"><span class="label">Environment</span><div class="mono prewrap">${esc(envText(v.environment))}</div></div></div>`}
+function renderCompareModal(data){let vars=data.variants||[];document.getElementById('compareModalTitle').textContent=`Command compare (${vars.length})`;document.getElementById('compareModalBody').innerHTML=`<div class="compare-grid">${vars.map(compareCard).join('')}</div>`;document.getElementById('compareModal').classList.add('open')}
+function compareSelectedVariants(){let variants=[...compareSelections];if(variants.length<2||variants.length>4){updateCompareToolbar();return}let btn=document.getElementById('btnCompareVariants');if(btn)btn.disabled=true;ctlPost('/observer/api/compare',{variants}).then(renderCompareModal).catch(e=>{document.getElementById('compareModalTitle').textContent='Command compare';document.getElementById('compareModalBody').innerHTML=`<div class="row"><span class="critical">${esc(e.message)}</span></div>`;document.getElementById('compareModal').classList.add('open')}).finally(()=>updateCompareToolbar())}
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
 if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
 let vars=c.variants||{};let keys=Object.keys(vars);
@@ -3376,7 +3467,7 @@ def handle_observer_post(handler):
     path = handler.path.split("?", 1)[0]
     if path not in ("/observer/api/update", "/observer/api/restart",
                     "/observer/api/stop", "/observer/api/switch",
-                    "/observer/api/install"):
+                    "/observer/api/install", "/observer/api/compare"):
         return False
     body = {}
     length = int(handler.headers.get("Content-Length") or 0)
@@ -3389,6 +3480,21 @@ def handle_observer_post(handler):
         except json.JSONDecodeError as e:
             _send_json(handler, 400, {"error": f"invalid JSON: {e}"})
             return True
+    if path == "/observer/api/compare":
+        repo = _config.get("model_repo")
+        if not repo:
+            _send_json(handler, 503, {"error": "no model repo configured"})
+            return True
+        try:
+            _send_json(
+                handler, 200,
+                compare_variant_commands(repo, body.get("variants"), state.catalog),
+            )
+        except ValueError as e:
+            _send_json(handler, 400, {"error": str(e)})
+        except Exception as e:
+            _send_json(handler, 409, {"error": str(e)})
+        return True
     if not _control_lock.acquire(blocking=False):
         _send_json(handler, 409, {"error": "another control action is running"})
         return True
