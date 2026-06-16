@@ -703,8 +703,58 @@ def build_flag_compare_matrix(results, help_index):
     return rows
 
 
-def inspect_container_help(name, entrypoint):
-    """Run the live container's server --help and parse flag descriptions."""
+# vLLM's `serve --help` can't be probed by exec-ing the running container: its
+# entrypoint is a `bash -c <launch script>`, so appending --help just re-runs
+# the launcher. Even a direct `vllm serve --help` fails in a docker-exec'd
+# process because NVML can't initialise there (CUDA platform -> unavailable ->
+# device inference raises "Failed to infer device type"). A throwaway
+# `docker run --gpus all` wires NVML up correctly. v0.22.0 also paginates help,
+# so the full flag list needs `--help=all`. The probe spins a fresh container
+# (slow), so results are cached per image — help only changes when the image
+# does. Failures aren't cached, so a transient error retries on the next probe.
+VLLM_HELP_PROBE_TIMEOUT = 120
+_vllm_help_cache = {}
+
+
+def _inspect_vllm_help(image, runner=subprocess.run):
+    if not image:
+        return None
+    cached = _vllm_help_cache.get(image)
+    if cached is not None:
+        return cached
+    argv = ["docker", "run", "--rm", "--gpus", "all",
+            "--entrypoint", "vllm", image, "serve", "--help=all"]
+    source = " ".join(argv)
+    try:
+        result = runner(argv, capture_output=True, text=True,
+                        timeout=VLLM_HELP_PROBE_TIMEOUT)
+    except Exception as e:
+        return {"source": source, "error": str(e)}
+    output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    index = parse_help_flags(output)
+    if result.returncode != 0 and not index:
+        return {
+            "source": source,
+            "error": output.strip()[-400:] or "vllm serve --help failed",
+        }
+    info = {
+        "source": source,
+        "flag_count": len(index),
+        "flags": index,
+        **({"warning": f"--help exited {result.returncode}"} if result.returncode != 0 else {}),
+    }
+    _vllm_help_cache[image] = info
+    return info
+
+
+def inspect_container_help(name, entrypoint, engine=None, image=None):
+    """Run the server's --help and parse flag descriptions.
+
+    vLLM is special-cased to a throwaway-container probe by image (see
+    _inspect_vllm_help); every other engine execs the running container.
+    """
+    if engine == "vllm":
+        return _inspect_vllm_help(image)
     argv = _entrypoint_argv(entrypoint)
     if not name or not argv:
         return None
@@ -779,7 +829,9 @@ def inspect_container(name):
     cache_supported = engine != "vllm"
     if not cache_supported:
         labeled_cache = False
-    help_info = inspect_container_help(name, data.get("entrypoint"))
+    help_info = inspect_container_help(
+        name, data.get("entrypoint"), engine=engine, image=data.get("image")
+    )
     help_index = (help_info or {}).get("flags") or {}
     if help_info and "flags" in help_info:
         help_info = {k: v for k, v in help_info.items() if k != "flags"}
@@ -3554,11 +3606,10 @@ def handle_observer_post(handler):
             return True
         try:
             mi = state.model_info or {}
-            help_info = {}
-            if mi.get("container") and mi.get("entrypoint"):
-                help_info = inspect_container_help(
-                    mi["container"], mi.get("entrypoint")
-                ) or {}
+            help_info = inspect_container_help(
+                mi.get("container"), mi.get("entrypoint"),
+                engine=infer_engine(mi), image=mi.get("image"),
+            ) or {}
             _send_json(
                 handler, 200,
                 compare_variant_commands(
