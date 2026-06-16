@@ -3194,20 +3194,14 @@ if(!hist.length||!(d.gpu_stats||[]).length){card.style.display='none';return}
 card.style.display='';
 // group history by gpu index
 let gpuIds=[...new Set((d.gpu_stats||[]).map(g=>g.index))].sort((a,b)=>a-b);
+// hist entries are {timestamp, gpus:[{index, ...}, ...]} — extract per-gpu samples
 let byGpu={};
-gpuIds.forEach(id=>{byGpu[id]=hist.filter(h=>Array.isArray(h)?false:true).map(h=>{
-if(Array.isArray(h)){let matching=h.filter(g=>g.index===id);return matching[0]||null}
-return h.index===id?h:null}).filter(Boolean)});
-// if history is array-of-arrays (multi-gpu snapshots), handle that
-if(hist.length&&Array.isArray(hist[0])){
-byGpu={};
-gpuIds.forEach(id=>{byGpu[id]=hist.map(snap=>{let arr=Array.isArray(snap)?snap:[snap];return arr.find(g=>g.index===id)||null}).filter(Boolean)});
-}else if(hist.length&&!Array.isArray(hist[0])&&gpuIds.length===1){
-byGpu[gpuIds[0]]=hist;
-}else if(hist.length&&!Array.isArray(hist[0])&&gpuIds.length>1){
-byGpu={};
-gpuIds.forEach(id=>{byGpu[id]=hist.filter(h=>h.index===id)});
-}
+gpuIds.forEach(id=>{byGpu[id]=[]});
+hist.forEach(entry=>{
+let gpus=Array.isArray(entry)?entry:(entry.gpus||[]);
+if(!Array.isArray(gpus))return;
+gpus.forEach(g=>{if(g.index!=null&&byGpu[g.index]!=null)byGpu[g.index].push(g)});
+});
 // ensure container has correct number of chart divs
 while(container.children.length<gpuIds.length){
 let wrap=document.createElement('div');
