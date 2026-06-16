@@ -1834,12 +1834,15 @@ def validate_switch(variant, catalog, force=False):
     """Check the requested variant against the extracted compose registry."""
     variants = (catalog or {}).get("variants") or {}
     if not variants:
+        print(f"[observer] validate_switch: rejected — catalog not loaded", flush=True)
         raise RuntimeError("variant catalog not loaded yet; try again shortly")
     entry = variants.get(variant)
     if entry is None:
+        print(f"[observer] validate_switch: rejected — unknown variant {variant!r}", flush=True)
         raise ValueError(f"unknown variant {variant!r}")
     status = entry.get("status")
     if status not in ("production", "caveats") and not force:
+        print(f"[observer] validate_switch: rejected — status={status!r} force={force}", flush=True)
         raise ValueError(
             f"variant {variant!r} has status {status!r}; pass force to switch anyway"
         )
@@ -1853,7 +1856,10 @@ def normalize_switch_variant(variant, catalog):
         return variant
     for key, entry in variants.items():
         if variant == variant_from_compose_path(entry.get("compose_path") or ""):
+            print(f"[observer] normalize_switch_variant: mapped {variant!r} -> {key!r}", flush=True)
             return key
+    if variant not in variants:
+        print(f"[observer] normalize_switch_variant: could not resolve {variant!r}, returning as-is", flush=True)
     return variant
 
 
@@ -1871,6 +1877,7 @@ def switch_model(repo, variant, monitor_port, force=False, runner=_run):
     if force:
         cmd.append("--force")
     cmd.append(variant)
+    print(f"[observer] switch_model: running {' '.join(cmd)} in {repo}", flush=True)
     runner(_repo_owner_cmd(repo, cmd), env=env, cwd=repo, timeout=SWITCH_TIMEOUT)
 
 
@@ -1948,17 +1955,22 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
     what applies log rotation and the image pin.
     """
     try:
+        print(f"[observer] _switch_worker: START variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
         _set_control_status(
             "switch", f"switching to {variant} — old model stopping, "
                       "new model loading (takes a few minutes)…"
         )
+        print(f"[observer] _switch_worker: calling switch_model()", flush=True)
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
+        print(f"[observer] _switch_worker: switch_model() returned OK", flush=True)
         _set_control_status(
             "switch", f"{variant} is up; applying mode {preset} + cache "
                       f"{'on' if cache_ram else 'off'} + log rotation "
                       "(one more model reload)…"
         )
+        print(f"[observer] _switch_worker: calling _wait_for_model_info()", flush=True)
         info = (info_getter or _wait_for_model_info)(monitor_port)
+        print(f"[observer] _switch_worker: model_info returned, calling restart_model()", flush=True)
         result = restart_model(preset, model_info=info, runner=runner,
                                cache_ram=cache_ram,
                                override_path=override_path)
@@ -1970,9 +1982,11 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                       f"cache {'on' if result.get('cache_ram') else 'off'}){note}",
             done=True, ok=True
         )
+        print(f"[observer] _switch_worker: DONE variant={variant!r}", flush=True)
         audit("switch-done", f"variant={variant} preset={preset} "
                              f"cache_ram={cache_ram}")
     except Exception as e:
+        print(f"[observer] _switch_worker: FAILED variant={variant!r} error={e!r}", flush=True)
         audit("switch-failed", f"variant={variant}: {e}")
         setup = parse_setup_hint(str(e))
         if setup:
@@ -1990,6 +2004,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     setup, runner=_run, info_getter=None,
                     override_path=OVERRIDE_FILE, cache_ram=False):
     try:
+        print(f"[observer] _install_worker: START variant={variant!r} preset={preset!r} retry={retry}", flush=True)
         _set_control_status(
             "install", f"installing assets for {variant} (can take a while)…"
         )
@@ -2009,6 +2024,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
         result = install_variant_assets(
             repo, variant, state.catalog, setup=setup, runner=runner,
             progress=progress)
+        print(f"[observer] _install_worker: install_variant_assets() returned OK", flush=True)
         state.mark_assets_installed(variant, {
             k: v for k, v in result.items()
             if k in ("model", "model_dir", "weight_key")
@@ -2020,18 +2036,23 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 done=True, ok=True, installed_variant=variant,
             )
             audit("install-done", f"variant={variant}")
+            print(f"[observer] _install_worker: DONE (no retry) variant={variant!r}", flush=True)
             return
+        print(f"[observer] _install_worker: assets installed, calling switch_model() for retry", flush=True)
         _set_control_status(
             "install", f"installed assets for {variant}; retrying switch…",
             installed_variant=variant,
         )
         switch_model(repo, variant, monitor_port, force=force, runner=runner)
+        print(f"[observer] _install_worker: switch_model() returned OK after install", flush=True)
         _set_control_status(
             "switch", f"{variant} is up; applying mode {preset} + cache "
                       f"{'on' if cache_ram else 'off'} + log rotation "
                       "(one more model reload)…"
         )
+        print(f"[observer] _install_worker: calling _wait_for_model_info() after switch", flush=True)
         info = (info_getter or _wait_for_model_info)(monitor_port)
+        print(f"[observer] _install_worker: calling restart_model() after switch", flush=True)
         restart_model(preset, model_info=info, runner=runner,
                       cache_ram=cache_ram,
                       override_path=override_path)
@@ -2040,9 +2061,11 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                       f"cache {'on' if cache_ram else 'off'})",
             done=True, ok=True
         )
+        print(f"[observer] _install_worker: DONE (with retry) variant={variant!r}", flush=True)
         audit("install-switch-done", f"variant={variant} preset={preset} "
                                      f"cache_ram={cache_ram}")
     except Exception as e:
+        print(f"[observer] _install_worker: FAILED variant={variant!r} error={e!r}", flush=True)
         audit("install-failed", f"variant={variant}: {e}")
         _set_control_status(
             "install", f"install for {variant} failed: {e}",
@@ -3198,9 +3221,13 @@ document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
 let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
 if(rb){rb.disabled=lastBusy||!running;rb.title=running?'':'no model running — use Start in the Catalog below'}
 if(sb){sb.disabled=lastBusy||!running;sb.title=running?'':'no model running'}}
-function doSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
-if(!confirm(`Switch model to '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`))return;
-ctlPost('/observer/api/switch',{variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();console.log('[observer] doSwitch called:',{variant:v,status:p,cache,lastActive,lastBusy:!!lastBusy});let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
+let confirmMsg=`Switch model to '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`;
+console.log('[observer] doSwitch confirm:',confirmMsg);
+if(!confirm(confirmMsg)){console.log('[observer] doSwitch cancelled by user');return;}
+let body={variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats')};
+console.log('[observer] doSwitch posting:',JSON.stringify(body));
+ctlPost('/observer/api/switch',body).then(r=>{console.log('[observer] doSwitch success:',JSON.stringify(r));document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{console.error('[observer] doSwitch failed:',e);document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function doStart(v,status){let p=selectedPreset(),cache=selectedCacheRam();let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
 if(!confirm(`Start model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nNo model is running — this boots the variant and waits for it to load, which takes a few minutes.${exp}`))return;
 ctlPost('/observer/api/switch',{variant:v,preset:p,cache_ram:cache,force:(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
@@ -3233,7 +3260,7 @@ el.innerHTML=rows}
 function renderVllmTimeline(d){let card=document.getElementById('vllmTimelineCard');let el=document.getElementById('vllmTimeline');let m=d.metrics||{};if(m.engine!=='vllm'){card.style.display='none';return}card.style.display='';let h=d.vllm_history||[];if(!h.length){el.innerHTML='<div class="row"><span class="label">no samples yet</span></div>';return}
 let spark=(key,color,unit,dec)=>{let vals=h.map(s=>Number(s[key])||0);let max=Math.max(1,...vals);let bars=vals.map(v=>`<span style="display:inline-block;width:3px;margin-right:1px;background:${color};height:${Math.max(1,Math.round(30*v/max))}px;vertical-align:bottom" title="${v}${unit}"></span>`).join('');let last=vals[vals.length-1];let peak=Math.max(...vals);return `<div class="row" style="align-items:flex-end"><span class="label" style="min-width:130px">${key}</span><span style="height:32px;line-height:0;flex:1;overflow:hidden;white-space:nowrap">${bars}</span><span class="value" style="min-width:120px;text-align:right">${last.toFixed(dec||0)}${unit} <span class="label">(peak ${peak.toFixed(dec||0)})</span></span></div>`};
 let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
-async function ctlPost(path,body){let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});let j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
+async function ctlPost(path,body){console.log('[observer] ctlPost:',path,JSON.stringify(body));let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});console.log('[observer] ctlPost response:',r.status,r.ok);let j=await r.json().catch(()=>({}));if(!r.ok){console.error('[observer] ctlPost error:',j.error||'HTTP '+r.status);throw new Error(j.error||('HTTP '+r.status))}console.log('[observer] ctlPost result:',JSON.stringify(j));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
 function doRestart(){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with mode '${p}' and cache ${cache?'on':'off'}?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,cache_ram:cache,force:lastActive>0});let dr=(r.dropped_capabilities||[]).length?` (this build can't do ${r.dropped_capabilities.join(', ')})`:'';return `restarted with ${r.preset}, cache ${r.cache_ram?'on':'off'}${dr} (model reloading…)`})}
@@ -3623,6 +3650,7 @@ def handle_observer_post(handler):
             _send_json(handler, 409, {"error": str(e)})
         return True
     if not _control_lock.acquire(blocking=False):
+        print(f"[observer] {path}: rejected — another control action is running", flush=True)
         _send_json(handler, 409, {"error": "another control action is running"})
         return True
     release = True
@@ -3638,18 +3666,23 @@ def handle_observer_post(handler):
             check_restart_allowed(state, force=bool(body.get("force")))
             result = stop_model(repo=_config.get("model_repo"))
         elif path == "/observer/api/switch":
+            print(f"[observer] SWITCH request: body={body}", flush=True)
             repo = _config.get("model_repo")
             if not repo:
+                print(f"[observer] SWITCH rejected: no model repo configured", flush=True)
                 _send_json(handler, 503, {"error": "no model repo configured"})
                 return True
             variant = str(body.get("variant", ""))
             preset, cache_ram = observer_control_options(body, "baseline")
             force = bool(body.get("force"))
+            print(f"[observer] SWITCH: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
             variant = normalize_switch_variant(variant, state.catalog)
+            print(f"[observer] SWITCH: normalized variant={variant!r}", flush=True)
             validate_switch(variant, state.catalog, force=force)
             check_restart_allowed(state, force=force)
             audit("switch", f"variant={variant} preset={preset} "
                             f"cache_ram={cache_ram} force={force}")
+            print(f"[observer] SWITCH: spawning worker thread", flush=True)
             # Long-running (minutes): hand off to a worker that owns the
             # control lock; progress streams via control_status over SSE.
             threading.Thread(
@@ -3663,8 +3696,10 @@ def handle_observer_post(handler):
             result = {"started": True, "variant": variant, "preset": preset,
                       "cache_ram": cache_ram}
         elif path == "/observer/api/install":
+            print(f"[observer] INSTALL request: body={body}", flush=True)
             repo = _config.get("model_repo")
             if not repo:
+                print(f"[observer] INSTALL rejected: no model repo configured", flush=True)
                 _send_json(handler, 503, {"error": "no model repo configured"})
                 return True
             variant = str(body.get("variant", ""))
@@ -3672,6 +3707,7 @@ def handle_observer_post(handler):
             force = bool(body.get("force"))
             retry = bool(body.get("retry"))
             variant = normalize_switch_variant(variant, state.catalog)
+            print(f"[observer] INSTALL: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force} retry={retry}", flush=True)
             validate_switch(variant, state.catalog, force=True)
             if retry:
                 check_restart_allowed(state, force=force)
@@ -3681,6 +3717,7 @@ def handle_observer_post(handler):
                 if body.get(k)
             }
             audit("install", f"variant={variant} retry={retry}")
+            print(f"[observer] INSTALL: spawning worker thread", flush=True)
             threading.Thread(
                 target=_install_worker,
                 args=(
@@ -3704,8 +3741,10 @@ def handle_observer_post(handler):
             result,
         )
     except ValueError as e:
+        print(f"[observer] {path}: ValueError — {e}", flush=True)
         _send_json(handler, 400, {"error": str(e)})
     except Exception as e:
+        print(f"[observer] {path}: Exception — {e}", flush=True)
         _send_json(handler, 409, {"error": str(e)})
     finally:
         if release:
