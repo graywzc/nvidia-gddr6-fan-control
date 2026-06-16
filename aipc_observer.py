@@ -3307,7 +3307,7 @@ if(applyOrder()){return}
 let grid=document.querySelector('.grid');if(!grid)return;let dragSrc=null;let ghost=null;let offsetX=0,offsetY=0;
 grid.addEventListener('mousedown',function(e){
 let card=e.target.closest('.card');if(!card)return;
-if(card.querySelector('button,select,input,a'))return;
+if(e.target.closest('button,select,input,a'))return;
 e.preventDefault();dragSrc=card;
 let r=card.getBoundingClientRect();offsetX=e.clientX-r.left;offsetY=e.clientY-r.top;
 card.classList.add('dragging');
