@@ -1885,7 +1885,13 @@ def switch_model(repo, variant, monitor_port, force=False, runner=_run):
         cmd.append("--force")
     cmd.append(variant)
     print(f"[observer] switch_model: running {' '.join(cmd)} in {repo}", flush=True)
-    runner(_repo_owner_cmd(repo, cmd), env=env, cwd=repo, timeout=SWITCH_TIMEOUT)
+    full_cmd = _repo_owner_cmd(repo, cmd)
+    # Stream output to docker_logs for the card; fall back to _run for tests
+    if runner is _run:
+        _run_with_progress(full_cmd, env=env, cwd=repo, timeout=SWITCH_TIMEOUT,
+                           on_line=lambda line: state.add_docker_log(f"[switch] {line}\n"))
+    else:
+        runner(full_cmd, env=env, cwd=repo, timeout=SWITCH_TIMEOUT)
 
 
 def _install_progress_detail(variant, line):
@@ -2027,6 +2033,8 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 "install", _install_progress_detail(variant, clean),
                 progress_line=clean[-500:],
             )
+            # Also pipe install progress into docker_logs for the card
+            state.add_docker_log(f"[install] {clean}\n")
 
         result = install_variant_assets(
             repo, variant, state.catalog, setup=setup, runner=runner,
