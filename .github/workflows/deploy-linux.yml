@@ -16,17 +16,16 @@ permissions:
 
 jobs:
   # A deploy job pinned to an offline self-hosted runner would otherwise sit
-  # queued for up to 24h waiting for that host to come back. Instead, ask the
-  # API which runners are online and build the deploy matrix from only those —
-  # offline hosts are silently skipped rather than left hanging.
+  # queued for up to 24h waiting for that host to come back. Instead, run a
+  # preflight on whichever host *is* up and ask Tailscale which candidates are
+  # online, then build the deploy matrix from only those — offline hosts are
+  # silently skipped rather than left hanging. (GITHUB_TOKEN can't list runners,
+  # so we probe the tailnet instead, which needs no secret.) If every host is
+  # offline this preflight queues too, but then there is nothing to deploy.
   select-hosts:
     name: Select online hosts
-    runs-on: ubuntu-latest
-    permissions:
-      # Listing repository runners requires the Administration read permission.
-      # If org policy blocks granting it to GITHUB_TOKEN, swap GH_TOKEN below
-      # for a PAT secret with `administration:read`.
-      administration: read
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
       any: ${{ steps.pick.outputs.any }}
@@ -34,36 +33,42 @@ jobs:
       - name: Pick online hosts
         id: pick
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
+          # Candidate hosts this workflow can deploy to.
+          CANDIDATES: aipc aipc1
         run: |
           set -euo pipefail
-          # Candidate hosts this workflow can deploy to.
-          candidates=(aipc aipc1)
-          # Label names carried by every runner that is currently connected.
-          online="$(gh api --paginate "repos/${REPO}/actions/runners" \
-            --jq '.runners[] | select(.status=="online") | .labels[].name' \
-            | sort -u)"
+          # `tailscale status` reports each tailnet node's online state. The
+          # host running this job is online by definition (Self); peers carry
+          # an explicit Online flag.
+          status_json="$(tailscale status --json)"
+          TS_STATUS="$status_json" python3 - <<'PY'
+          import json, os
 
-          selected=()
-          for host in "${candidates[@]}"; do
-            if grep -qxF "$host" <<<"$online"; then
-              echo "✅ $host is online — will deploy"
-              selected+=("$host")
-            else
-              echo "⏭️  $host is offline — skipping"
-            fi
-          done
+          cands = os.environ["CANDIDATES"].split()
+          data = json.loads(os.environ["TS_STATUS"])
 
-          if [ ${#selected[@]} -eq 0 ]; then
-            echo "No candidate hosts are online; nothing to deploy."
-            echo "matrix={\"host\":[]}" >> "$GITHUB_OUTPUT"
-            echo "any=false" >> "$GITHUB_OUTPUT"
-          else
-            hosts_json="$(printf '%s\n' "${selected[@]}" | jq -R . | jq -cs .)"
-            echo "matrix={\"host\":${hosts_json}}" >> "$GITHUB_OUTPUT"
-            echo "any=true" >> "$GITHUB_OUTPUT"
-          fi
+          def names(node):
+              out = []
+              if node.get("HostName"):
+                  out.append(node["HostName"])
+              if node.get("DNSName"):
+                  out.append(node["DNSName"].split(".")[0])
+              return out
+
+          online = set(names(data.get("Self") or {}))
+          for peer in (data.get("Peer") or {}).values():
+              if peer.get("Online"):
+                  online.update(names(peer))
+
+          selected = [h for h in cands if h in online]
+          for h in cands:
+              print(f"{'✅' if h in online else '⏭️ '} {h} "
+                    f"{'online — will deploy' if h in online else 'offline — skipping'}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f'matrix={{"host": {json.dumps(selected)}}}\n')
+              f.write(f'any={"true" if selected else "false"}\n')
+          PY
 
   deploy:
     name: Deploy ${{ matrix.host }}
