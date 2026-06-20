@@ -43,6 +43,7 @@ See [olealgoritme/gddr6 supported GPUs](https://github.com/olealgoritme/gddr6#su
 - Python **≥ 3.9** (uses `http.server`, ctypes, only the standard library — no `pip install` needed).
 - `libpci-dev`, `cmake`, `build-essential` — only to build the `gddr6` binary.
 - `gddr6` binary — see install steps below.
+- `liquidctl` and/or `lm-sensors` (optional) — only for **case-fan** control; see [Case fans](#case-fans). GPU fan control works without them.
 - Tailscale (optional but recommended) — provides network-layer auth so we don't need bearer tokens for the HTTP API.
 
 ### macOS
@@ -215,6 +216,10 @@ PUT  http://<host>:8765/power-limit
        body: {"power_limit_w": 250}
              Or {"gpu_index": 1, "power_limit_w": 250} for one GPU.
              Use null to restore the GPU default power limit.
+PUT  http://<host>:8765/case-fans
+       body: {"fan": "<fan id>", "duty_pct": 60}
+             Sets a case fan to a manual duty (0–100%). Fan ids come from the
+             "case_fans" array in GET /status. See "Case fans" below.
 ```
 
 Example:
@@ -240,6 +245,9 @@ curl -X PUT -H 'Content-Type: application/json' \
            "power_limit_w": 250.0, "curve": [[60,40],...]}],
  "curves": {"0": [[60,40],...]}, "power_limits": {"0": 250.0},
  "fan_pct": 62, "gpu_name": "...", "num_fans": 2, "curve": [[60,40],...],
+ "case_fans": [{"id": "hwmon:nct6798:pwm2", "label": "Fractal front",
+                "backend": "hwmon", "kind": "fan", "rpm": 820,
+                "duty_pct": 50, "settable": true}],
  "updated_at": 1234.5,
  "wall_time": 1700000000.0, "dry_run": false}
 ```
@@ -252,6 +260,98 @@ it is `null` on cards/drivers that don't expose it.
 startup.
 `tdp_w` is NVML's default power-management limit, which comes from the card's
 firmware/driver power target and is the value the macOS app labels as TDP.
+
+`case_fans` is the current view of any case fans the controller found (empty if
+none / disabled). Each entry looks like:
+
+```json
+{"id": "hwmon:nct6798:pwm2", "label": "nct6798 pwm2", "backend": "hwmon",
+ "kind": "fan", "rpm": 820, "duty_pct": 50, "settable": true}
+```
+
+`duty_pct` is the last applied/observed duty (may be `null` for liquidctl fans,
+which don't report per-fan duty). `kind` is `fan` or `pump`. `settable` is
+`false` for pumps and for any channel an admin marks read-only in the config.
+
+## Case fans
+
+The GPU loop only drives the NVIDIA card's fans. Case fans (AIO radiator fans,
+chassis fans) hang off separate controllers that differ per host, so they're
+handled by two pluggable backends, both **optional** — if neither is present
+the rest of the controller works unchanged:
+
+- **liquidctl** — Corsair Commander Core / Commander Pro and the AIO pumps they
+  host (iCUE H100i Capellix, MSI Coreliquid, …). The controller shells out to
+  the `liquidctl` CLI (same subprocess pattern as `gddr6`).
+- **hwmon** — motherboard fan headers via the Linux hwmon sysfs (e.g. an Asus
+  ROG Strix B550-E's Nuvoton Super-I/O). Pure `/sys` reads/writes, no extra
+  dependency.
+
+This first cut **reads** fan speeds and applies a **manual duty %** — there are
+no temperature-driven case-fan curves yet.
+
+### Setup
+
+```bash
+# liquidctl (for Corsair/AIO fans) — pick one:
+sudo apt install liquidctl            # distro package, or
+pipx install liquidctl                # latest upstream
+
+# hwmon (for motherboard headers): load the Super-I/O driver and let
+# lm-sensors detect it. The module name depends on your board's chip.
+sudo apt install lm-sensors
+sudo sensors-detect                   # answer YES to load the right modules
+sudo modprobe nct6775                 # e.g. for Nuvoton NCT67xx (B550-E)
+sensors                               # confirm fanN / pwmN channels show up
+```
+
+The controller runs as root (it already needs root for NVML/`/dev/mem`), which
+also covers liquidctl's USB access and writing to `pwmN_enable`/`pwmN`.
+
+### How fans are discovered and addressed
+
+With no config, the controller auto-discovers everything both backends expose
+and assigns each a stable id:
+
+- hwmon: `hwmon:<chip>:pwm<N>` (e.g. `hwmon:nct6798:pwm2`)
+- liquidctl: `liquidctl:<device-slug>:fan<N>` and `…:pump`
+
+Read them from `GET /status`, then set one:
+
+```bash
+curl http://aipc1:8765/status | jq '.case_fans'
+curl -X PUT -H 'Content-Type: application/json' \
+     -d '{"fan":"hwmon:nct6798:pwm2","duty_pct":80}' \
+     http://aipc1:8765/case-fans
+```
+
+Manual duties are persisted to the state file and re-applied on restart. On a
+clean shutdown (SIGINT/SIGTERM/SIGHUP), hwmon headers are returned to their
+original BIOS/auto control mode; liquidctl fans keep running at their last
+manual duty (these controllers have no firmware auto-curve to fall back to).
+
+### Optional per-host config
+
+Hardware differs per host, so an optional JSON file lets you friendly-label
+fans, mark channels read-only (safety), and set the poll interval. Default path
+`/etc/nvidia-gddr6-fan-control/case-fans.json` (override with
+`--case-fan-config`); a missing file just means pure auto-discovery.
+
+```json
+{
+  "poll_interval_s": 5,
+  "fans": {
+    "hwmon:nct6798:pwm2": {"label": "Fractal front", "settable": true},
+    "hwmon:nct6798:pwm1": {"label": "CPU fan", "settable": false},
+    "liquidctl:corsair-commander-core:fan1": {"label": "Top intake"}
+  }
+}
+```
+
+> **Safety:** by default every discovered fan header is settable (pumps are
+> read-only). hwmon cannot tell a CPU-fan or pump header apart from a chassis
+> fan — driving the wrong header to a low duty can overheat the CPU/AIO. Mark
+> such channels `"settable": false` in the config once you've identified them.
 
 ## Configuration
 
@@ -269,6 +369,9 @@ Most options have sensible defaults; override via CLI flags or by editing the sy
 | `--vram-source-index` | GPU index | With `--gpu`, which gddr6 VRAM temp index to drive it from |
 | `--gddr6-bin` | `/usr/local/bin/gddr6` | Path to the gddr6 binary |
 | `--power-limit-w` | none | Set board power limit in watts at startup for every controlled GPU |
+| `--case-fans` / `--no-case-fans` | on | Enable or disable case-fan query/control (liquidctl + hwmon) |
+| `--case-fan-config` | `/etc/nvidia-gddr6-fan-control/case-fans.json` | Per-host case-fan config (labels, settable allowlist, poll interval); missing file = auto-discovery |
+| `--liquidctl-bin` | `liquidctl` | Path to the liquidctl binary for Corsair/AIO case fans |
 | `--observer` / `--no-observer` | on | Enable or disable the integrated observer dashboard |
 | `--observer-monitor-port` | `8020` | llama.cpp frontend port whose TCP connections are monitored |
 | `--observer-container` | `beellama-qwen36-27b` | Docker container whose llama.cpp logs are tailed |
@@ -329,8 +432,10 @@ python3 -m unittest discover -s tests
 ```
 fan_control.py                          # the Linux controller
 aipc_observer.py                        # integrated llama.cpp/GPU observer dashboard
+case_fans.py                            # case-fan backends (liquidctl + hwmon) + controller
 tests/test_power.py                     # power-draw plumbing tests
 tests/test_observer.py                  # observer request parser tests
+tests/test_case_fans.py                 # case-fan backend/controller tests
 systemd/nvidia-gddr6-fan-control.service
 install/install-linux.sh
 install/install-macos.sh

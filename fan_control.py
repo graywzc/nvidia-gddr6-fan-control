@@ -29,6 +29,7 @@ import threading
 import time
 
 import aipc_observer
+import case_fans
 
 # (vram_temp_C, fan_percent). Linear interpolation between points.
 # Clamped to first/last entry outside the range.
@@ -171,6 +172,8 @@ class State:
             "curves": {},           # per-GPU fan curves, keyed by str(gpu index)
             "power_limits": {},     # per-GPU applied power caps, keyed by str(index)
             "power_limit_supported": None,
+            "case_fans": [],        # current case-fan readings (liquidctl/hwmon)
+            "case_fan_duties": {},  # manually set case-fan duties, keyed by fan id
             "updated_at": 0.0,      # monotonic ts of last successful update
             "wall_time": 0.0,       # unix ts of last successful update
             "dry_run": False,
@@ -206,6 +209,22 @@ class State:
             curves = self._d.get("curves") or {}
             return curves.get(str(index)) or self._d.get("curve")
 
+    def set_case_fans(self, fans):
+        """Replace the current case-fan readings (called by the poll thread)."""
+        with self._lock:
+            self._d["case_fans"] = fans
+            self._d["updated_at"] = time.monotonic()
+            self._d["wall_time"] = time.time()
+
+    def record_case_fan_duty(self, fan_id, duty_pct):
+        """Remember a manually applied case-fan duty (read-modify-write)."""
+        with self._lock:
+            duties = dict(self._d.get("case_fan_duties") or {})
+            duties[str(fan_id)] = duty_pct
+            self._d["case_fan_duties"] = duties
+            self._d["updated_at"] = time.monotonic()
+            self._d["wall_time"] = time.time()
+
     def snapshot(self):
         with self._lock:
             return dict(self._d)
@@ -218,6 +237,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     token: "str | None" = None
     state_file: "str | None" = None
     apply_power_limit = None
+    set_case_fan_duty = None
 
     def log_message(self, fmt, *args):
         # Quieter default logging — control loop has its own prints.
@@ -273,7 +293,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(401)
             self.end_headers()
             return
-        if self.path not in ("/curve", "/power-limit"):
+        if self.path not in ("/curve", "/power-limit", "/case-fans"):
             self.send_response(404)
             self.end_headers()
             return
@@ -313,6 +333,29 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if gpu_index is not None:
                 payload["gpu_index"] = gpu_index
             self._write_json(200, payload)
+            return
+
+        if self.path == "/case-fans":
+            try:
+                fan_id, duty_pct = validate_case_fan_request(body)
+            except ValueError as e:
+                self._write_json(400, {"error": str(e)})
+                return
+            if self.set_case_fan_duty is None:
+                self._write_json(503, {"error": "case fan control unavailable"})
+                return
+            try:
+                applied = self.set_case_fan_duty(fan_id, duty_pct)
+            except ValueError as e:
+                self._write_json(400, {"error": str(e)})
+                return
+            except RuntimeError as e:
+                self._write_json(502, {"error": str(e)})
+                return
+            self.state.record_case_fan_duty(fan_id, applied)
+            if self.state_file:
+                save_persisted_state(self.state_file, self.state.snapshot())
+            self._write_json(200, {"fan": fan_id, "duty_pct": applied})
             return
 
         try:
@@ -367,7 +410,8 @@ class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
-def start_http_server(host, port, state, token, state_file, apply_power_limit=None):
+def start_http_server(host, port, state, token, state_file, apply_power_limit=None,
+                      set_case_fan_duty=None):
     handler = type(
         "BoundHandler",
         (_Handler,),
@@ -376,6 +420,7 @@ def start_http_server(host, port, state, token, state_file, apply_power_limit=No
             "token": token,
             "state_file": state_file,
             "apply_power_limit": staticmethod(apply_power_limit),
+            "set_case_fan_duty": staticmethod(set_case_fan_duty),
         },
     )
     server = _ThreadedHTTPServer((host, port), handler)
@@ -461,6 +506,37 @@ def validate_power_limit_w(value, min_w=None, max_w=None):
     if max_w is not None and watts > max_w:
         raise ValueError(f"power limit {watts:g}W is above maximum {max_w:g}W")
     return round(watts, 1)
+
+
+def validate_case_fan_request(value):
+    """Validate PUT /case-fans JSON: {"fan": "<id>", "duty_pct": 0..100}."""
+    if not isinstance(value, dict):
+        raise ValueError("body must be an object with fan and duty_pct")
+    fan_id = value.get("fan", value.get("id"))
+    if not isinstance(fan_id, str) or not fan_id.strip():
+        raise ValueError("fan must be a non-empty fan id string")
+    if "duty_pct" not in value and "duty" not in value:
+        raise ValueError("body must include duty_pct")
+    raw = value.get("duty_pct", value.get("duty"))
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("duty_pct must be a number between 0 and 100")
+    if not (0 <= raw <= 100):
+        raise ValueError("duty_pct must be between 0 and 100")
+    return fan_id.strip(), int(round(raw))
+
+
+def validate_case_fan_duties(raw):
+    """Validate a persisted {fan_id: duty_pct} map; drop invalid entries."""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if not (0 <= value <= 100):
+            continue
+        out[str(key)] = int(round(value))
+    return out
 
 
 def _power_limit_bounds(state_snapshot, gpu_index=None):
@@ -624,6 +700,10 @@ def load_persisted_state(path):
                       f"invalid ({e}); skipping", file=sys.stderr, flush=True)
         if limits:
             out["power_limits"] = limits
+    if isinstance(raw.get("case_fan_duties"), dict):
+        duties = validate_case_fan_duties(raw["case_fan_duties"])
+        if duties:
+            out["case_fan_duties"] = duties
     return out
 
 
@@ -634,6 +714,7 @@ def save_persisted_state(path, snapshot):
         "power_limit_w": snapshot.get("power_limit_w"),
         "curves": snapshot.get("curves") or {},
         "power_limits": snapshot.get("power_limits") or {},
+        "case_fan_duties": snapshot.get("case_fan_duties") or {},
     }
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -729,6 +810,32 @@ def main():
         "Use 'off' to disable persistence (curve lives in memory only).",
     )
     parser.add_argument(
+        "--case-fans",
+        dest="case_fans",
+        action="store_true",
+        default=True,
+        help="Enable case-fan query/control via liquidctl + hwmon (default: on)",
+    )
+    parser.add_argument(
+        "--no-case-fans",
+        dest="case_fans",
+        action="store_false",
+        help="Disable case-fan query/control entirely",
+    )
+    parser.add_argument(
+        "--case-fan-config",
+        default=case_fans.DEFAULT_CONFIG_FILE,
+        help="Per-host case-fan config (labels, settable allowlist, poll "
+        f"interval). Default: {case_fans.DEFAULT_CONFIG_FILE}; missing file is "
+        "fine (pure auto-discovery).",
+    )
+    parser.add_argument(
+        "--liquidctl-bin",
+        default=case_fans.DEFAULT_LIQUIDCTL_BIN,
+        help="Path to the liquidctl binary for Corsair/AIO case fans "
+        f"(default: {case_fans.DEFAULT_LIQUIDCTL_BIN})",
+    )
+    parser.add_argument(
         "--observer",
         dest="observer",
         action="store_true",
@@ -798,7 +905,11 @@ def main():
     persisted_power_limit_w = persisted_state.get("power_limit_w")
     if args.power_limit_w is not None:
         persisted_power_limit_w = validate_power_limit_w(args.power_limit_w)
-    state.update(curve=default_curve, dry_run=args.dry_run)
+    persisted_case_fan_duties = persisted_state.get("case_fan_duties") or {}
+    state.update(
+        curve=default_curve, dry_run=args.dry_run,
+        case_fan_duties=dict(persisted_case_fan_duties),
+    )
 
     token = None
     if args.token_file:
@@ -917,6 +1028,41 @@ def main():
             print(f"WARN: GPU {g['index']} failed to apply power limit: {e}",
                   file=sys.stderr)
 
+    # Case-fan controller (liquidctl + hwmon). Optional and isolated: any
+    # backend/config failure here must not affect GPU fan control.
+    case_fan_controller = None
+    set_case_fan_duty = None
+    if args.case_fans:
+        cf_config = case_fans.load_config(args.case_fan_config)
+        case_fan_controller = case_fans.CaseFanController(
+            config=cf_config,
+            liquidctl_bin=args.liquidctl_bin,
+            dry_run=args.dry_run,
+        )
+        if case_fan_controller.has_backends():
+            def set_case_fan_duty(fan_id, duty_pct):
+                return case_fan_controller.set_duty(fan_id, duty_pct)
+
+            def publish_case_fans(fans):
+                state.set_case_fans(fans)
+                if args.observer:
+                    # Mirror into the observer so the /observer dashboard can
+                    # render the Case Fans card.
+                    aipc_observer.state.set_case_fans(fans)
+
+            case_fan_controller.apply_persisted(persisted_case_fan_duties)
+            case_fan_controller.start(on_update=publish_case_fans)
+            print(
+                f"Case-fan control active "
+                f"({len(case_fan_controller.backends)} backend(s); "
+                f"poll {case_fan_controller.poll_interval_s}s)",
+                flush=True,
+            )
+        else:
+            print("No case-fan backends found; case-fan control disabled",
+                  flush=True)
+            case_fan_controller = None
+
     if args.observer:
         aipc_observer.start_observer(
             monitor_port=args.observer_monitor_port,
@@ -933,6 +1079,7 @@ def main():
                 token,
                 state_file,
                 apply_power_limit,
+                set_case_fan_duty,
             )
             auth_note = "with bearer-token auth" if token else "WITHOUT auth"
             print(
@@ -972,6 +1119,9 @@ def main():
                 gddr6_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 gddr6_proc.kill()
+        if case_fan_controller is not None:
+            case_fan_controller.stop()
+            case_fan_controller.restore_all()
         if not args.dry_run:
             restore_auto()
         nvml.shutdown()
@@ -985,6 +1135,8 @@ def main():
     # atexit catches normal Python exits and unhandled exceptions, but not
     # SIGKILL or power loss.
     atexit.register(restore_auto if not args.dry_run else lambda: None)
+    if case_fan_controller is not None:
+        atexit.register(case_fan_controller.restore_all)
 
     gddr6_proc = subprocess.Popen(
         [args.gddr6_bin],
