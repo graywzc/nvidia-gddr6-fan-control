@@ -81,6 +81,8 @@ class ObserverState:
         # GPU index -> real VRAM temp (°C) from the gddr6 reader, since
         # nvidia-smi reports temperature.memory as N/A on consumer cards.
         self.vram_temps = {}
+        # Case-fan readings (liquidctl/hwmon) pushed by the fan controller.
+        self.case_fans = []
         # docker-inspect view of the model container (image, flags, variant).
         self.model_info = {}
         # club-3090 checkout state (HEAD, commits behind upstream).
@@ -211,6 +213,10 @@ class ObserverState:
         with self.lock:
             self.vram_temps = dict(mapping)
 
+    def set_case_fans(self, fans):
+        with self.lock:
+            self.case_fans = list(fans)
+
     def set_model_info(self, info):
         with self.lock:
             self.model_info = dict(info)
@@ -315,6 +321,7 @@ class ObserverState:
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
+                "case_fans": list(self.case_fans),
                 "gpu_history": list(self.gpu_history)[-100:],
                 "active_connections": dict(self.active_connections),
                 "active_count": len(self.active_connections),
@@ -3152,6 +3159,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="header"><h1 id="title">Observer</h1><div class="meta"><span id="model" class="model">--</span> · Uptime <span id="uptime">0s</span> · <span id="updated">--</span></div></div>
 <div class="grid">
 <section class="card"><h2><span>GPU</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="gpuGrid" class="gpu-grid"></div></section>
+<section class="card" id="caseFanCard" style="display:none"><h2><span>Case Fans</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="caseFanGrid" class="gpu-grid"></div></section>
 <section class="card full" id="gpuHistoryCard" style="display:none"><h2><span>GPU History</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="gpuHistoryCharts"></div></section>
 <section class="card"><h2><span>Summary</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div class="summary">
 <div class="summary-item"><div id="active" class="summary-value">0</div><div class="summary-label">Active</div></div>
@@ -3223,7 +3231,7 @@ function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
 let lastBusy=false;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doInstallVariant('${esc(h.variant)}','${esc(h.preset||selectedPreset())}',${h.force?'true':'false'},true,'${esc(h.model||'')}','${esc(h.weight_key||'')}','${esc(h.model_dir||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
@@ -3413,6 +3421,10 @@ function renderGpu(gpus){document.getElementById('gpuGrid').innerHTML=gpus.map(g
 <div class="row"><span class="label">VRAM</span><span class="value">${(g.mem_used_mib/1024).toFixed(1)} / ${(g.mem_total_mib/1024).toFixed(1)} GB</span></div><div class="bar"><div class="fill mem" style="width:${g.mem_util_pct}%"></div></div>
 <div class="row"><span class="label">Fan</span><span class="value">${g.fan_pct}%</span></div><div class="bar"><div class="fill fan" style="width:${g.fan_pct}%"></div></div>
 <div class="row"><span class="label">Power</span><span class="value">${g.power_w} / ${g.power_limit_w} W</span></div><div class="bar"><div class="fill power" style="width:${pct(g.power_w,g.power_limit_w)}%"></div></div></div>`}).join('')}
+function renderCaseFans(fans){var card=document.getElementById('caseFanCard');if(!fans||!fans.length){card.style.display='none';return}card.style.display='';document.getElementById('caseFanGrid').innerHTML=fans.map(function(f){var pump=f.kind==='pump';var rpm=(f.rpm==null)?'N/A':f.rpm+' RPM';var duty=(f.duty_pct==null)?null:f.duty_pct;var src=esc(f.backend||'')+(pump?' · pump':(f.settable?'':' · read-only'));return '<div class="gpu-card"><div class="gpu-name">'+esc(f.label||f.id)+'</div>'+
+'<div class="row"><span class="label">'+(pump?'Pump':'Speed')+'</span><span class="value">'+rpm+'</span></div>'+
+(duty==null?'':'<div class="row"><span class="label">Duty</span><span class="value">'+duty+'%</span></div><div class="bar"><div class="fill fan" style="width:'+duty+'%"></div></div>')+
+'<div class="row"><span class="label">Source</span><span class="value" style="font-weight:500;color:var(--dim)">'+src+'</span></div></div>'}).join('')}
 function renderSummary(d){let m=d.metrics||{};let vllm=m.engine==='vllm';document.getElementById('active').textContent=vllm?(m.processing??0):d.active_count;document.getElementById('requests').textContent=vllm?Number(m.requests_total||0).toLocaleString():d.requests.length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTemp.textContent=`${g.temp_c}°C`;gpuTemp.className='summary-value '+cls(g.temp_c);memTemp.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTemp.className='summary-value '+cls(g.mem_temp_c)}let done=d.requests.filter(r=>r.status==='completed'&&r.gen_tps>0);avgTps.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):(vllm&&m.gen_tps_avg!=null?Number(m.gen_tps_avg).toFixed(1):'0')}
 function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getElementById('slotInfo').innerHTML=slots.length?slots.map(s=>{let hit=(s.cache_hit_pct==null)?'-':s.cache_hit_pct+'%';let badge=s.is_processing?'<span class="status processing">busy</span>':'<span class="status completed">idle</span>';return `<div class="gpu-card"><div class="gpu-name">Slot ${s.id} ${badge}</div>
 <div class="row"><span class="label">Context</span><span class="value ${cls(s.kv_pct)}">${(s.kv_used||0).toLocaleString()} / ${(s.n_ctx||nctx).toLocaleString()} (${s.kv_pct}%)</span></div><div class="bar"><div class="fill mem" style="width:${pct(s.kv_pct,100)}%"></div></div>
