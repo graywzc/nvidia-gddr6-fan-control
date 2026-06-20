@@ -264,5 +264,23 @@ class PersistenceTests(unittest.TestCase):
         )
 
 
+class ShippedConfigTests(unittest.TestCase):
+    """Guard the default overlay the installer seeds to /etc."""
+
+    def _config(self):
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return case_fans.load_config(os.path.join(repo, "install", "case-fans.json"))
+
+    def test_default_config_is_valid(self):
+        cfg = self._config()
+        self.assertIsInstance(cfg.get("fans"), dict)
+
+    def test_aio_pump_tach_is_read_only(self):
+        fans = self._config().get("fans") or {}
+        pump = fans.get("hwmon:nct6798:pwm2")
+        self.assertIsNotNone(pump, "pump tach overlay missing")
+        self.assertIs(pump.get("settable"), False)
+
+
 if __name__ == "__main__":
     unittest.main()

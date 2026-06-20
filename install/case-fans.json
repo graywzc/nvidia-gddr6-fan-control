@@ -1,0 +1,14 @@
+{
+  "_comment": "Per-host case-fan overlay, keyed by the auto-discovered fan id (see GET /status -> case_fans[].id). 'settable: false' makes a channel display-only (no slider, PUT /case-fans rejected). Entries for ids not present on a host are ignored, so this one file can describe every host.",
+
+  "fans": {
+    "hwmon:nct6798:pwm2": {
+      "label": "AIO pump tach",
+      "settable": false,
+      "_note": "aipc1: not a fan. This motherboard header only reads the H100i Capellix pump's tach (rpm tracks the Commander Core pump); the pump is driven by the Commander Core, so its duty must not be dialed here."
+    },
+    "hwmon:nct6798:pwm4": {
+      "label": "Fractal case fans (x3)"
+    }
+  }
+}

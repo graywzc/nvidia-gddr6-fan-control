@@ -6,7 +6,9 @@ on:
     paths:
       - "fan_control.py"
       - "aipc_observer.py"
+      - "case_fans.py"
       - "install/install-linux.sh"
+      - "install/case-fans.json"
       - "systemd/nvidia-gddr6-fan-control.service"
       - ".github/workflows/deploy-linux.yml"
   workflow_dispatch:

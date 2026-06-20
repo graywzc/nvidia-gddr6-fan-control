@@ -337,6 +337,13 @@ fans, mark channels read-only (safety), and set the poll interval. Default path
 `/etc/nvidia-gddr6-fan-control/case-fans.json` (override with
 `--case-fan-config`); a missing file just means pure auto-discovery.
 
+The installer seeds a starter overlay from [`install/case-fans.json`](install/case-fans.json)
+on **first install only** — it won't overwrite a host you've hand-tuned (delete
+the file and re-run to re-seed). Because entries are keyed by fan id and
+unmatched ids are ignored, one file in the repo can describe every host. The
+shipped default, for example, marks aipc1's `hwmon:nct6798:pwm2` read-only since
+that motherboard header only reads the AIO pump's tach (it isn't a fan).
+
 ```json
 {
   "poll_interval_s": 5,

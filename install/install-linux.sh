@@ -10,6 +10,8 @@ OBSERVER_DEST=/usr/local/bin/aipc_observer.py
 CASE_FANS_DEST=/usr/local/bin/case_fans.py
 UNIT_NAME=nvidia-gddr6-fan-control.service
 UNIT_DEST=/etc/systemd/system/$UNIT_NAME
+CONFIG_DIR=/etc/nvidia-gddr6-fan-control
+CASE_FAN_CONFIG_DEST=$CONFIG_DIR/case-fans.json
 
 if [[ $EUID -ne 0 ]]; then
     echo "This script needs root (writes to /usr/local/bin and /etc/systemd)."
@@ -40,6 +42,17 @@ install -m 644 "$REPO_ROOT/case_fans.py" "$CASE_FANS_DEST"
 
 echo "Installing $UNIT_DEST"
 install -m 644 "$REPO_ROOT/systemd/$UNIT_NAME" "$UNIT_DEST"
+
+# Case-fan overlay (labels + which channels are settable). Seed the default on
+# first install, but never clobber a host that's been hand-tuned. To re-apply
+# the repo default, delete the file and re-run.
+install -d -m 755 "$CONFIG_DIR"
+if [[ ! -e "$CASE_FAN_CONFIG_DEST" ]]; then
+    echo "Installing $CASE_FAN_CONFIG_DEST"
+    install -m 644 "$REPO_ROOT/install/case-fans.json" "$CASE_FAN_CONFIG_DEST"
+else
+    echo "Keeping existing $CASE_FAN_CONFIG_DEST (not overwriting)"
+fi
 
 # Ensure the state directory exists with sensible permissions.
 install -d -m 755 /var/lib/nvidia-gddr6-fan-control
