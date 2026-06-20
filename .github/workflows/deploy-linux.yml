@@ -15,14 +15,65 @@ permissions:
   contents: read
 
 jobs:
+  # A deploy job pinned to an offline self-hosted runner would otherwise sit
+  # queued for up to 24h waiting for that host to come back. Instead, ask the
+  # API which runners are online and build the deploy matrix from only those —
+  # offline hosts are silently skipped rather than left hanging.
+  select-hosts:
+    name: Select online hosts
+    runs-on: ubuntu-latest
+    permissions:
+      # Listing repository runners requires the Administration read permission.
+      # If org policy blocks granting it to GITHUB_TOKEN, swap GH_TOKEN below
+      # for a PAT secret with `administration:read`.
+      administration: read
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      any: ${{ steps.pick.outputs.any }}
+    steps:
+      - name: Pick online hosts
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Candidate hosts this workflow can deploy to.
+          candidates=(aipc aipc1)
+          # Label names carried by every runner that is currently connected.
+          online="$(gh api --paginate "repos/${REPO}/actions/runners" \
+            --jq '.runners[] | select(.status=="online") | .labels[].name' \
+            | sort -u)"
+
+          selected=()
+          for host in "${candidates[@]}"; do
+            if grep -qxF "$host" <<<"$online"; then
+              echo "✅ $host is online — will deploy"
+              selected+=("$host")
+            else
+              echo "⏭️  $host is offline — skipping"
+            fi
+          done
+
+          if [ ${#selected[@]} -eq 0 ]; then
+            echo "No candidate hosts are online; nothing to deploy."
+            echo "matrix={\"host\":[]}" >> "$GITHUB_OUTPUT"
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          else
+            hosts_json="$(printf '%s\n' "${selected[@]}" | jq -R . | jq -cs .)"
+            echo "matrix={\"host\":${hosts_json}}" >> "$GITHUB_OUTPUT"
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          fi
+
   deploy:
     name: Deploy ${{ matrix.host }}
+    needs: select-hosts
+    if: needs.select-hosts.outputs.any == 'true'
     runs-on: [self-hosted, linux, "${{ matrix.host }}"]
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      matrix:
-        host: [aipc, aipc1]
+      matrix: ${{ fromJSON(needs.select-hosts.outputs.matrix) }}
 
     concurrency:
       group: deploy-linux-${{ matrix.host }}
