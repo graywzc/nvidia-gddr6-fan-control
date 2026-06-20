@@ -15,14 +15,70 @@ permissions:
   contents: read
 
 jobs:
+  # A deploy job pinned to an offline self-hosted runner would otherwise sit
+  # queued for up to 24h waiting for that host to come back. Instead, run a
+  # preflight on whichever host *is* up and ask Tailscale which candidates are
+  # online, then build the deploy matrix from only those — offline hosts are
+  # silently skipped rather than left hanging. (GITHUB_TOKEN can't list runners,
+  # so we probe the tailnet instead, which needs no secret.) If every host is
+  # offline this preflight queues too, but then there is nothing to deploy.
+  select-hosts:
+    name: Select online hosts
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      any: ${{ steps.pick.outputs.any }}
+    steps:
+      - name: Pick online hosts
+        id: pick
+        env:
+          # Candidate hosts this workflow can deploy to.
+          CANDIDATES: aipc aipc1
+        run: |
+          set -euo pipefail
+          # `tailscale status` reports each tailnet node's online state. The
+          # host running this job is online by definition (Self); peers carry
+          # an explicit Online flag.
+          status_json="$(tailscale status --json)"
+          TS_STATUS="$status_json" python3 - <<'PY'
+          import json, os
+
+          cands = os.environ["CANDIDATES"].split()
+          data = json.loads(os.environ["TS_STATUS"])
+
+          def names(node):
+              out = []
+              if node.get("HostName"):
+                  out.append(node["HostName"])
+              if node.get("DNSName"):
+                  out.append(node["DNSName"].split(".")[0])
+              return out
+
+          online = set(names(data.get("Self") or {}))
+          for peer in (data.get("Peer") or {}).values():
+              if peer.get("Online"):
+                  online.update(names(peer))
+
+          selected = [h for h in cands if h in online]
+          for h in cands:
+              print(f"{'✅' if h in online else '⏭️ '} {h} "
+                    f"{'online — will deploy' if h in online else 'offline — skipping'}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f'matrix={{"host": {json.dumps(selected)}}}\n')
+              f.write(f'any={"true" if selected else "false"}\n')
+          PY
+
   deploy:
     name: Deploy ${{ matrix.host }}
+    needs: select-hosts
+    if: needs.select-hosts.outputs.any == 'true'
     runs-on: [self-hosted, linux, "${{ matrix.host }}"]
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      matrix:
-        host: [aipc, aipc1]
+      matrix: ${{ fromJSON(needs.select-hosts.outputs.matrix) }}
 
     concurrency:
       group: deploy-linux-${{ matrix.host }}
