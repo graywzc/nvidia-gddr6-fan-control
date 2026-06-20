@@ -426,6 +426,11 @@ class CaseFanController:
             for f in self._snapshot:
                 if f["id"] == fan_id:
                     f["duty_pct"] = applied
+            snapshot = list(self._snapshot)
+        # Push the new duty out immediately so readers (e.g. the observer
+        # dashboard) reflect it without waiting for the next poll tick.
+        if self._on_update:
+            self._on_update(snapshot)
         return applied
 
     def apply_persisted(self, duties):
