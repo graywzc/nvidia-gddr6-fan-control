@@ -294,11 +294,16 @@ class LiquidctlBackend(FanBackend):
         if ch is None:
             raise KeyError(fan_id)
         pct = _clamp_pct(pct)
+        # Select by description (--match), not --address. For HID devices the
+        # status "address" is a hidraw path (e.g. /dev/hidraw1), but liquidctl's
+        # --address parses its value as a hex USB address and chokes on the path
+        # ("invalid literal for int() with base 16: '/dev/hidraw1'"). --match is
+        # what works for these controllers; address stays a last-resort fallback.
         cmd = [self.binary]
-        if ch.get("address"):
-            cmd += ["--address", ch["address"]]
-        elif ch.get("match"):
+        if ch.get("match"):
             cmd += ["--match", ch["match"]]
+        elif ch.get("address"):
+            cmd += ["--address", ch["address"]]
         cmd += ["set", ch["channel"], "speed", str(pct)]
         try:
             self._run(cmd)
