@@ -124,7 +124,9 @@ class LiquidctlBackendTests(unittest.TestCase):
         self.assertFalse(pump["settable"])  # pumps never auto-throttled
         self.assertEqual(fans["liquidctl:corsair-commander-core:fan1"]["rpm"], 1100)
 
-    def test_set_duty_targets_device_by_address(self):
+    def test_set_duty_targets_device_by_match(self):
+        # Must select by --match (description), not --address: a HID device's
+        # status address is a hidraw path that liquidctl's --address can't parse.
         fake = FakeLiquidctl(COMMANDER_CORE_STATUS)
         be = case_fans.LiquidctlBackend(run=fake)
         be.list_fans()
@@ -132,8 +134,10 @@ class LiquidctlBackendTests(unittest.TestCase):
         self.assertEqual(applied, 65)
         self.assertEqual(len(fake.set_calls), 1)
         cmd = fake.set_calls[0]
-        self.assertIn("--address", cmd)
-        self.assertIn("/dev/hidraw3", cmd)
+        self.assertIn("--match", cmd)
+        self.assertIn("Corsair Commander Core", cmd)
+        self.assertNotIn("--address", cmd)
+        self.assertNotIn("/dev/hidraw3", cmd)
         self.assertIn("fan1", cmd)
         self.assertIn("65", cmd)
 
