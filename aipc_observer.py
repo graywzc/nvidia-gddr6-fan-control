@@ -1929,15 +1929,20 @@ def sample_resources():
 # load profile is active. Formats vary across engine versions, so these are
 # best-effort and tolerant; "weights load" is the disk->RAM/GPU read.
 ENGINE_LOAD_PATTERNS = [
-    # vLLM
+    # vLLM. These are non-overlapping milestones except engine_init, which is a
+    # rollup (profile + KV cache + torch.compile + CUDA graph capture + warmup).
+    (re.compile(r"Model loading took [\d.]+ ?[GM]i?B(?: memory)? and ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "weights_load"),
     (re.compile(r"[Ll]oading.*weights took ([\d.]+) ?(?:s\b|secs?|seconds)"),
      "weights_load"),
-    (re.compile(r"Model loading took [\d.]+ ?[GM]i?B and ([\d.]+) ?(?:s\b|secs?|seconds)"),
-     "model_load"),
-    (re.compile(r"init engine \([^)]*\) took ([\d.]+) ?(?:s\b|secs?|seconds)"),
-     "engine_init"),
+    (re.compile(r"Dynamo bytecode transform time: ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "compile"),
+    (re.compile(r"[Gg]raph capturing finished in ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "cuda_graphs"),
     (re.compile(r"[Cc]apturing CUDA graph[s]?.*?(?:in|took) ([\d.]+) ?(?:s\b|secs?|seconds)"),
      "cuda_graphs"),
+    (re.compile(r"init engine \([^)]*\) took ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "engine_init"),
     # llama.cpp family (reports ms)
     (re.compile(r"load time\s*=\s*([\d.]+) ?ms"),
      "llama_load_ms"),
@@ -1987,7 +1992,8 @@ class LoadProfile:
     @contextlib.contextmanager
     def phase(self, name):
         start = time.time()
-        rec = {"name": name, "start": start, "end": None, "duration": None}
+        rec = {"name": name, "start": start, "end": None, "duration": None,
+               "children": {}}
         with self.lock:
             self.phases.append(rec)
         try:
@@ -2004,6 +2010,15 @@ class LoadProfile:
             # Keep the largest sample if a marker repeats across the double load.
             if seconds > self.engine_phases.get(name, 0):
                 self.engine_phases[name] = seconds
+            # Nest under the observer phase open when the log line arrived
+            # (switch.sh for the 1st load, ready_wait for the preset re-up's
+            # 2nd load), which is what makes the dashboard view hierarchical.
+            parent = next((p for p in reversed(self.phases)
+                           if p.get("end") is None), None)
+            if parent is not None:
+                children = parent.setdefault("children", {})
+                if seconds > children.get(name, 0):
+                    children[name] = seconds
 
     def observe_vram(self):
         used = _current_vram_used_mib()
@@ -2059,6 +2074,7 @@ class LoadProfile:
             phases = []
             for p in self.phases:
                 d = dict(p)
+                d["children"] = dict(p.get("children") or {})
                 if d["end"] is None and d["duration"] is None:
                     d["duration"] = now - d["start"]
                     d["running"] = True
@@ -3732,7 +3748,7 @@ el.innerHTML=rows}
 function renderVllmTimeline(d){let card=document.getElementById('vllmTimelineCard');let el=document.getElementById('vllmTimeline');let m=d.metrics||{};if(m.engine!=='vllm'){card.style.display='none';return}card.style.display='';let h=d.vllm_history||[];if(!h.length){el.innerHTML='<div class="row"><span class="label">no samples yet</span></div>';return}
 let spark=(key,color,unit,dec)=>{let vals=h.map(s=>Number(s[key])||0);let max=Math.max(1,...vals);let bars=vals.map(v=>`<span style="display:inline-block;width:3px;margin-right:1px;background:${color};height:${Math.max(1,Math.round(30*v/max))}px;vertical-align:bottom" title="${v}${unit}"></span>`).join('');let last=vals[vals.length-1];let peak=Math.max(...vals);return `<div class="row" style="align-items:flex-end"><span class="label" style="min-width:130px">${key}</span><span style="height:32px;line-height:0;flex:1;overflow:hidden;white-space:nowrap">${bars}</span><span class="value" style="min-width:120px;text-align:right">${last.toFixed(dec||0)}${unit} <span class="label">(peak ${peak.toFixed(dec||0)})</span></span></div>`};
 let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
-let _loadAnchor=null,_loadTimer=null;
+let _loadAnchor=null,_loadTimer=null,_loadCollapsed=new Set();
 function renderLoadProfile(d){let card=document.getElementById('loadProfileCard');
 let active=d.active_load_profile;let ps=d.load_profiles||[];
 let p=active||(ps.length?ps[ps.length-1]:null);
@@ -3748,13 +3764,19 @@ function paintLoadProfile(extra){let a=_loadAnchor;if(!a)return;let el=document.
 let fs=s=>s==null?'-':(s>=60?Math.floor(s/60)+'m '+Math.round(s%60)+'s':s.toFixed(1)+'s');
 let mb=b=>b==null?'-':(Math.abs(b)>=1e9?(b/1e9).toFixed(2)+' GB':(b/1e6).toFixed(0)+' MB');
 let hdr=t=>`<div class="row"><span class="label" style="font-weight:600">${t}</span></div>`;
-let plabel={'switch.sh':'switch.sh (stop + boot + ready)','wait_model_info':'detect new container','restart_preset':'preset re-up (2nd load)','restart':'compose up','ready_wait':'wait until serving','install_assets':'download weights'};
+let plabel={'switch.sh':'switch.sh (stop + boot + 1st load)','wait_model_info':'detect new container','restart_preset':'preset re-up (compose up)','restart':'compose up','ready_wait':'wait until serving (2nd load)','install_assets':'download weights'};
+let clabel={weights_load:'weights load (SSD → GPU)',model_load:'model load (total)',compile:'torch.compile (Dynamo)',cuda_graphs:'CUDA graph capture',engine_init:'engine init: KV cache + compile + warmup'};
+let corder=['weights_load','model_load','compile','cuda_graphs','engine_init'];
 let phs=p.phases||[];let live=x=>(x.duration||0)+(x.running?extra:0);
 let liveTotal=(p.total||phs.reduce((s,x)=>s+(x.duration||0),0))+(a.active?extra:0);
 let denom=Math.max(liveTotal,phs.reduce((s,x)=>s+live(x),0),1);
-let bars=phs.map(x=>{let dur=live(x);let w=Math.max(1,Math.round(100*dur/denom));let col=x.running?'var(--yellow)':'var(--accent)';return `<div class="row" style="align-items:center"><span class="label" style="min-width:210px">${x.running?'⏳ ':''}${esc(plabel[x.name]||x.name)}</span><span style="flex:1"><span style="display:inline-block;height:14px;width:${w}%;background:${col};border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right">${fs(dur)}</span></div>`}).join('');
-let eng=p.engine_phases||{};let elab={weights_load:'weights load (SSD → GPU)',model_load:'model load',engine_init:'engine init (KV cache + warmup)',cuda_graphs:'CUDA graph capture'};
-let engRows=Object.keys(eng).map(k=>infoRow(elab[k]||k,fs(eng[k]),'parsed from container startup logs')).join('');
+let bars=phs.map(x=>{let dur=live(x);let w=Math.max(1,Math.round(100*dur/denom));let col=x.running?'var(--yellow)':'var(--accent)';
+let kids=x.children||{};let kk=corder.filter(k=>kids[k]!=null).concat(Object.keys(kids).filter(k=>corder.indexOf(k)<0));
+let key=esc((p.trigger||'')+'|'+x.name);let collapsed=_loadCollapsed.has(key);
+let tog=kk.length?`<span style="cursor:pointer;display:inline-block;width:14px;color:var(--label,#9aa)" onclick="toggleLoadPhase('${key}')">${collapsed?'▶':'▼'}</span>`:'<span style="display:inline-block;width:14px"></span>';
+let row=`<div class="row" style="align-items:center">${tog}<span class="label" style="min-width:196px">${x.running?'⏳ ':''}${esc(plabel[x.name]||x.name)}</span><span style="flex:1"><span style="display:inline-block;height:14px;width:${w}%;background:${col};border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right">${fs(dur)}</span></div>`;
+if(kk.length&&!collapsed)row+=kk.map(k=>{let cd=kids[k];let cw=Math.max(1,Math.round(100*cd/Math.max(dur,cd,0.001)));return `<div class="row" style="align-items:center;opacity:.85"><span style="display:inline-block;width:30px"></span><span class="label" style="min-width:180px;font-size:11px">${esc(clabel[k]||k)}</span><span style="flex:1"><span style="display:inline-block;height:9px;width:${cw}%;background:var(--purple);border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right;font-size:11px">${fs(cd)}</span></div>`}).join('');
+return row}).join('');
 let r=p.resources||{};let resRows='';
 if(r.disk_read_bytes!=null)resRows+=infoRow('Disk read',mb(r.disk_read_bytes)+(r.peak_disk_read_bps?` <span class="label">(peak ${(r.peak_disk_read_bps/1e6).toFixed(0)} MB/s)</span>`:''),'/proc/diskstats read delta over the load window');
 if(r.vram_delta_mib!=null){let gib=v=>Math.abs(v)>=1024?(v/1024).toFixed(2)+' GiB':Number(v).toFixed(0)+' MiB';resRows+=infoRow('VRAM filled',(r.vram_delta_mib>=0?'+':'')+gib(r.vram_delta_mib)+(r.vram_peak_mib!=null?` <span class="label">(peak ${gib(r.vram_peak_mib)})</span>`:''),'peak minus trough VRAM over the load — survives a switch where the old model was still resident at start (nvidia-smi)');}
@@ -3763,7 +3785,8 @@ let status=a.active?`<span class="value" style="color:var(--yellow)">⏳ loading
 let head=`<div class="row"><span class="label">${esc(p.trigger)}${p.variant?' · '+esc(p.variant):''}${p.preset?' · '+esc(p.preset):''} <span class="label">${esc(p.started_at_str||'')}</span></span>${status}</div>`;
 if(!a.active&&!p.ok&&p.error)head+=`<div class="row"><span class="value critical">${esc(p.error)}</span></div>`;
 let hist=(a.history||[]).map(x=>infoRow((esc(x.started_at_str||'')+' · '+esc(x.trigger)),`<span class="${x.ok?'good':'critical'}">${x.ok?'✓':'✗'}</span> ${fs(x.total)}`)).join('');
-el.innerHTML=head+'<div style="margin-top:8px">'+bars+'</div>'+(engRows?hdr('In-container breakdown')+engRows:'')+(resRows?hdr('Resource attribution')+resRows:'')+(hist?hdr('Recent loads')+hist:'')}
+el.innerHTML=head+'<div style="margin-top:8px">'+bars+'</div>'+(resRows?hdr('Resource attribution')+resRows:'')+(hist?hdr('Recent loads')+hist:'')}
+function toggleLoadPhase(key){if(_loadCollapsed.has(key))_loadCollapsed.delete(key);else _loadCollapsed.add(key);paintLoadProfile(0)}
 async function ctlPost(path,body){console.log('[observer] ctlPost:',path,JSON.stringify(body));let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});console.log('[observer] ctlPost response:',r.status,r.ok);let j=await r.json().catch(()=>({}));if(!r.ok){console.error('[observer] ctlPost error:',j.error||'HTTP '+r.status);throw new Error(j.error||('HTTP '+r.status))}console.log('[observer] ctlPost result:',JSON.stringify(j));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
