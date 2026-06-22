@@ -2329,6 +2329,27 @@ class LoadProfileTests(unittest.TestCase):
         self.assertTrue(rec["ok"])
         self.assertIsNotNone(rec["total"])
 
+    def test_open_phase_reports_live_duration(self):
+        prof = aipc_observer.LoadProfile("switch")
+        with prof.phase("switch.sh"):
+            rec = prof.as_dict()
+            ph = rec["phases"][0]
+            self.assertTrue(ph.get("running"))
+            self.assertIsNotNone(ph["duration"])
+            self.assertTrue(rec["running"])
+            self.assertIsNotNone(rec["total"])
+
+    def test_active_profile_appears_in_snapshot(self):
+        prof = aipc_observer.LoadProfile("switch", variant="eng/prod")
+        aipc_observer._set_active_profile(prof)
+        try:
+            snap = aipc_observer.state.snapshot()
+            self.assertIsNotNone(snap["active_load_profile"])
+            self.assertEqual(snap["active_load_profile"]["variant"], "eng/prod")
+        finally:
+            aipc_observer._set_active_profile(None)
+        self.assertIsNone(aipc_observer.state.snapshot()["active_load_profile"])
+
     def test_fail_marks_not_ok(self):
         prof = aipc_observer.LoadProfile("restart")
         prof.fail("boom")
