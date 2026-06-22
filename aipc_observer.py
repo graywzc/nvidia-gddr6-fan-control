@@ -7,6 +7,7 @@ GPU stats, then serves a small dashboard at /observer with SSE updates.
 """
 
 import ast
+import contextlib
 import json
 import hashlib
 import os
@@ -52,6 +53,14 @@ LOG_ROTATE_MAX_SIZE = "100m"
 LOG_ROTATE_MAX_FILE = "5"
 OBSERVER_PRESET_LABEL = "aipc.observer.preset"
 OBSERVER_CACHE_RAM_LABEL = "aipc.observer.cache_ram"
+# How many recent model-load profiles to retain for the dashboard/history.
+LOAD_PROFILE_HISTORY = 20
+# Readiness gate: how long to wait for the model to answer /v1/models after a
+# (re)start before giving up, and how often to poll for it.
+SERVING_READY_TIMEOUT = 900.0
+SERVING_POLL_INTERVAL = 2.0
+# /proc/diskstats reports I/O in 512-byte sectors regardless of device geometry.
+DISK_SECTOR_BYTES = 512
 
 HOSTNAME = socket.gethostname().split(".")[0]
 
@@ -100,6 +109,8 @@ class ObserverState:
         self.control_status = {}
         # Recent raw docker log lines for the Docker Logs card.
         self.docker_logs = deque(maxlen=500)
+        # Recent end-to-end model-load profiles (button click -> serving).
+        self.load_profiles = deque(maxlen=LOAD_PROFILE_HISTORY)
 
     def add_request(self, req):
         with self.lock:
@@ -252,6 +263,10 @@ class ObserverState:
         with self.lock:
             self.docker_logs.append(line.rstrip())
 
+    def add_load_profile(self, record):
+        with self.lock:
+            self.load_profiles.append(record)
+
     def incr_cancelled(self):
         with self.lock:
             self.cancelled_count += 1
@@ -317,6 +332,7 @@ class ObserverState:
                 "vllm_history": list(self.vllm_history),
                 "control_status": dict(self.control_status),
                 "control_busy": _control_lock.locked(),
+                "load_profiles": list(self.load_profiles),
                 "docker_logs": list(self.docker_logs)[-100:],
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
@@ -1803,6 +1819,311 @@ def update_repo(repo):
     }
 
 
+# --- model-load profiling ---------------------------------------------------
+#
+# Times one end-to-end model load: from the control request (the dashboard
+# button click) until the model actually answers on /v1/models. Each control
+# path drives a LoadProfile through named phases; host resource counters (disk
+# read, page cache, GPU VRAM) are diffed across the load window so the slow part
+# is attributable, and the engine's own startup log lines add an in-container
+# breakdown. All parsing/math is in pure functions so it is testable without a
+# GPU or docker.
+
+# Whole physical disks in /proc/diskstats (skip partitions and loop/dm/ram/sr,
+# which would double-count or add noise to the read total).
+WHOLE_DISK_RE = re.compile(r"^(nvme\d+n\d+|mmcblk\d+|(?:sd|vd|hd|xvd)[a-z]+)$")
+
+
+def read_disk_read_bytes(text):
+    """Total bytes read across whole disks from /proc/diskstats text.
+
+    Columns are: major minor name reads merged sectors_read ... — so field 5
+    (0-indexed) is sectors read; multiply by the 512-byte sector unit.
+    """
+    total = 0
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 6 or not WHOLE_DISK_RE.match(parts[2]):
+            continue
+        try:
+            total += int(parts[5]) * DISK_SECTOR_BYTES
+        except ValueError:
+            continue
+    return total
+
+
+def parse_meminfo(text):
+    """Parse /proc/meminfo (kB fields) into a {name: bytes} dict."""
+    out = {}
+    for line in (text or "").splitlines():
+        m = re.match(r"(\w+):\s+(\d+)", line)
+        if m:
+            out[m.group(1)] = int(m.group(2)) * 1024
+    return out
+
+
+def _current_vram_used_mib():
+    """Sum VRAM used across GPUs from the latest nvidia-smi sample, or None."""
+    with state.lock:
+        gpus = list(state.gpu_stats)
+    if not gpus:
+        return None
+    return sum(g.get("mem_used_mib") or 0 for g in gpus)
+
+
+def sample_resources():
+    """Snapshot host counters used for load attribution; missing -> None.
+
+    Linux-only files degrade to None elsewhere (e.g. the macOS test box), so the
+    profiler still records phases and timings without resource attribution.
+    """
+    snap = {"t": time.time(), "disk_read_bytes": None,
+            "mem_cached": None, "mem_available": None}
+    try:
+        with open("/proc/diskstats") as f:
+            snap["disk_read_bytes"] = read_disk_read_bytes(f.read())
+    except OSError:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            mem = parse_meminfo(f.read())
+        snap["mem_cached"] = mem.get("Cached")
+        snap["mem_available"] = mem.get("MemAvailable")
+    except OSError:
+        pass
+    snap["vram_used_mib"] = _current_vram_used_mib()
+    return snap
+
+
+# Engine startup log markers -> (sub-phase label, seconds). Matched only while a
+# load profile is active. Formats vary across engine versions, so these are
+# best-effort and tolerant; "weights load" is the disk->RAM/GPU read.
+ENGINE_LOAD_PATTERNS = [
+    # vLLM
+    (re.compile(r"[Ll]oading.*weights took ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "weights_load"),
+    (re.compile(r"Model loading took [\d.]+ ?[GM]i?B and ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "model_load"),
+    (re.compile(r"init engine \([^)]*\) took ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "engine_init"),
+    (re.compile(r"[Cc]apturing CUDA graph[s]?.*?(?:in|took) ([\d.]+) ?(?:s\b|secs?|seconds)"),
+     "cuda_graphs"),
+    # llama.cpp family (reports ms)
+    (re.compile(r"load time\s*=\s*([\d.]+) ?ms"),
+     "llama_load_ms"),
+]
+
+
+def parse_engine_load_line(line):
+    """Return (sub_phase, seconds) if a startup line reports a load duration."""
+    for rx, name in ENGINE_LOAD_PATTERNS:
+        m = rx.search(line)
+        if not m:
+            continue
+        try:
+            secs = float(m.group(1))
+        except (ValueError, IndexError):
+            return None
+        if name == "llama_load_ms":
+            return "weights_load", secs / 1000.0
+        return name, secs
+    return None
+
+
+class LoadProfile:
+    """Times one end-to-end model load and attributes it to phases/resources."""
+
+    def __init__(self, trigger, variant=None, preset=None, started_at=None):
+        self.lock = threading.Lock()
+        self.trigger = trigger
+        self.variant = variant
+        self.preset = preset
+        self.started_at = started_at or time.time()
+        self.phases = []            # [{name, start, end, duration}]
+        self.engine_phases = {}     # sub_phase -> seconds (from container logs)
+        self.start_resources = sample_resources()
+        self.end_resources = None
+        self.peak_vram_mib = self.start_resources.get("vram_used_mib")
+        self.peak_disk_read_bps = 0.0
+        self.total = None
+        self.ok = None
+        self.error = None
+
+    @contextlib.contextmanager
+    def phase(self, name):
+        start = time.time()
+        rec = {"name": name, "start": start, "end": None, "duration": None}
+        with self.lock:
+            self.phases.append(rec)
+        try:
+            yield self
+        finally:
+            end = time.time()
+            with self.lock:
+                rec["end"] = end
+                rec["duration"] = end - start
+            self.observe_vram()
+
+    def add_engine_phase(self, name, seconds):
+        with self.lock:
+            # Keep the largest sample if a marker repeats across the double load.
+            if seconds > self.engine_phases.get(name, 0):
+                self.engine_phases[name] = seconds
+
+    def observe_vram(self):
+        used = _current_vram_used_mib()
+        if used is None:
+            return
+        with self.lock:
+            if self.peak_vram_mib is None or used > self.peak_vram_mib:
+                self.peak_vram_mib = used
+
+    def observe_disk_rate(self, bps):
+        with self.lock:
+            if bps > self.peak_disk_read_bps:
+                self.peak_disk_read_bps = bps
+
+    def fail(self, msg):
+        with self.lock:
+            self.ok = False
+            self.error = str(msg)[-300:]
+
+    def finalize(self):
+        self.observe_vram()
+        with self.lock:
+            if self.ok is None:
+                self.ok = True
+            self.total = time.time() - self.started_at
+        self.end_resources = sample_resources()
+        return self.as_dict()
+
+    def _resource_summary(self):
+        s = self.start_resources
+        e = self.end_resources or sample_resources()
+        out = {}
+        if s.get("disk_read_bytes") is not None and e.get("disk_read_bytes") is not None:
+            out["disk_read_bytes"] = max(0, e["disk_read_bytes"] - s["disk_read_bytes"])
+            out["peak_disk_read_bps"] = self.peak_disk_read_bps
+        if s.get("mem_cached") is not None and e.get("mem_cached") is not None:
+            out["page_cache_delta_bytes"] = e["mem_cached"] - s["mem_cached"]
+        start_vram = s.get("vram_used_mib")
+        if start_vram is not None and self.peak_vram_mib is not None:
+            out["vram_delta_mib"] = self.peak_vram_mib - start_vram
+        return out
+
+    def as_dict(self):
+        with self.lock:
+            return {
+                "trigger": self.trigger,
+                "variant": self.variant,
+                "preset": self.preset,
+                "started_at": self.started_at,
+                "started_at_str": local_time_str(self.started_at),
+                "phases": [dict(p) for p in self.phases],
+                "engine_phases": dict(self.engine_phases),
+                "resources": self._resource_summary(),
+                "total": self.total,
+                "ok": self.ok,
+                "error": self.error,
+            }
+
+
+# The profile currently capturing engine startup log lines, if any.
+_active_profile = None
+_active_profile_lock = threading.Lock()
+
+
+def get_active_profile():
+    with _active_profile_lock:
+        return _active_profile
+
+
+def _set_active_profile(profile):
+    global _active_profile
+    with _active_profile_lock:
+        _active_profile = profile
+
+
+def _profile_sampler(profile, stop):
+    """Track peak VRAM and disk-read rate for the duration of a load."""
+    last = profile.start_resources
+    while not stop.wait(SERVING_POLL_INTERVAL):
+        profile.observe_vram()
+        cur = sample_resources()
+        lb, cb = last.get("disk_read_bytes"), cur.get("disk_read_bytes")
+        dt = cur["t"] - last["t"]
+        if lb is not None and cb is not None and dt > 0:
+            profile.observe_disk_rate((cb - lb) / dt)
+        last = cur
+
+
+def _profile_audit_line(record):
+    phases = " ".join(
+        f"{p['name']}={p['duration']:.1f}s"
+        for p in record.get("phases", []) if p.get("duration") is not None
+    )
+    res = record.get("resources") or {}
+    bits = []
+    if res.get("disk_read_bytes") is not None:
+        bits.append(f"disk_read={res['disk_read_bytes'] / 1e6:.0f}MB")
+    if res.get("vram_delta_mib") is not None:
+        bits.append(f"vram+={res['vram_delta_mib']:.0f}MiB")
+    total = record.get("total")
+    return (f"trigger={record.get('trigger')} variant={record.get('variant')} "
+            f"ok={record.get('ok')} total={total:.1f}s "
+            f"[{phases}]" + (f" {' '.join(bits)}" if bits else "")
+            ) if total is not None else f"trigger={record.get('trigger')} (incomplete)"
+
+
+@contextlib.contextmanager
+def profiled_load(trigger, variant=None, preset=None, started_at=None):
+    """Wrap a control action so it records an end-to-end LoadProfile.
+
+    The caller marks failure via profile.fail(); an exception that escapes the
+    block is also recorded as a failure. On exit the profile is finalized, pushed
+    into state history, audited, and subscribers are notified.
+    """
+    profile = LoadProfile(trigger, variant=variant, preset=preset,
+                          started_at=started_at)
+    _set_active_profile(profile)
+    stop = threading.Event()
+    sampler = threading.Thread(target=_profile_sampler, args=(profile, stop),
+                               name="observer-load-sampler", daemon=True)
+    sampler.start()
+    try:
+        yield profile
+    except BaseException as e:
+        profile.fail(e)
+        raise
+    finally:
+        stop.set()
+        record = profile.finalize()
+        _set_active_profile(None)
+        state.add_load_profile(record)
+        audit("load-profile", _profile_audit_line(record))
+        state.notify_subscribers()
+
+
+def wait_until_serving(monitor_port, timeout=SERVING_READY_TIMEOUT,
+                       interval=SERVING_POLL_INTERVAL, fetch=None):
+    """Block until the model answers on /v1/models. Returns seconds waited.
+
+    This is the gate that defines "available for use": restart_model only runs
+    `docker compose up -d` and returns before the weights finish loading, so the
+    end-to-end profile needs this to find the true ready moment.
+    """
+    fetch = fetch or fetch_json
+    start = time.time()
+    deadline = start + timeout
+    url = f"http://127.0.0.1:{monitor_port}/v1/models"
+    while time.time() < deadline:
+        data = fetch(url)
+        if data and (data.get("data") or []):
+            return time.time() - start
+        time.sleep(interval)
+    raise RuntimeError(f"model did not start serving within {timeout:.0f}s")
+
+
 # --- model switching (variant change via club-3090's switch.sh) -------------
 
 # switch.sh waits for readiness itself (READY_TIMEOUT defaults to 600 s),
@@ -1961,130 +2282,201 @@ def _wait_for_model_info(monitor_port, timeout=120):
 
 def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                    info_getter=None, override_path=OVERRIDE_FILE,
-                   cache_ram=False):
+                   cache_ram=False, started_at=None, ready_waiter=None):
     """Background body of a model switch; releases the control lock when done.
 
     switch.sh always boots the variant verbatim; the preset re-up afterwards
     runs for every preset — baseline included — because the override is also
-    what applies log rotation and the image pin.
+    what applies log rotation and the image pin. The whole sequence is timed as
+    a LoadProfile: switch.sh, wait-for-info, the preset re-up (a second model
+    load), and the final ready-wait that marks the model actually serving.
     """
+    ready_waiter = ready_waiter or wait_until_serving
     try:
-        print(f"[observer] _switch_worker: START variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
-        _set_control_status(
-            "switch", f"switching to {variant} — old model stopping, "
-                      "new model loading (takes a few minutes)…"
-        )
-        print(f"[observer] _switch_worker: calling switch_model()", flush=True)
-        switch_model(repo, variant, monitor_port, force=force, runner=runner)
-        print(f"[observer] _switch_worker: switch_model() returned OK", flush=True)
-        _set_control_status(
-            "switch", f"{variant} is up; applying mode {preset} + cache "
-                      f"{'on' if cache_ram else 'off'} + log rotation "
-                      "(one more model reload)…"
-        )
-        print(f"[observer] _switch_worker: calling _wait_for_model_info()", flush=True)
-        info = (info_getter or _wait_for_model_info)(monitor_port)
-        print(f"[observer] _switch_worker: model_info returned, calling restart_model()", flush=True)
-        result = restart_model(preset, model_info=info, runner=runner,
-                               cache_ram=cache_ram,
-                               override_path=override_path)
-        dropped = result.get("dropped_capabilities") or []
-        note = (f" — this build can't do {', '.join(dropped)}"
-                if dropped else "")
-        _set_control_status(
-            "switch", f"switched to {variant} (mode {result['preset']}, "
-                      f"cache {'on' if result.get('cache_ram') else 'off'}){note}",
-            done=True, ok=True
-        )
-        print(f"[observer] _switch_worker: DONE variant={variant!r}", flush=True)
-        audit("switch-done", f"variant={variant} preset={preset} "
-                             f"cache_ram={cache_ram}")
-    except Exception as e:
-        print(f"[observer] _switch_worker: FAILED variant={variant!r} error={e!r}", flush=True)
-        audit("switch-failed", f"variant={variant}: {e}")
-        setup = parse_setup_hint(str(e))
-        if setup:
-            setup.update({"variant": variant, "preset": preset, "force": force,
-                          "cache_ram": cache_ram})
-        _set_control_status(
-            "switch", f"switch to {variant} failed: {e}", done=True, ok=False,
-            install_hint=setup or None,
-        )
+        with profiled_load("switch", variant=variant, preset=preset,
+                           started_at=started_at) as profile:
+            try:
+                print(f"[observer] _switch_worker: START variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
+                _set_control_status(
+                    "switch", f"switching to {variant} — old model stopping, "
+                              "new model loading (takes a few minutes)…"
+                )
+                print(f"[observer] _switch_worker: calling switch_model()", flush=True)
+                with profile.phase("switch.sh"):
+                    switch_model(repo, variant, monitor_port, force=force,
+                                 runner=runner)
+                print(f"[observer] _switch_worker: switch_model() returned OK", flush=True)
+                _set_control_status(
+                    "switch", f"{variant} is up; applying mode {preset} + cache "
+                              f"{'on' if cache_ram else 'off'} + log rotation "
+                              "(one more model reload)…"
+                )
+                print(f"[observer] _switch_worker: calling _wait_for_model_info()", flush=True)
+                with profile.phase("wait_model_info"):
+                    info = (info_getter or _wait_for_model_info)(monitor_port)
+                print(f"[observer] _switch_worker: model_info returned, calling restart_model()", flush=True)
+                with profile.phase("restart_preset"):
+                    result = restart_model(preset, model_info=info, runner=runner,
+                                           cache_ram=cache_ram,
+                                           override_path=override_path)
+                with profile.phase("ready_wait"):
+                    ready_waiter(monitor_port)
+                dropped = result.get("dropped_capabilities") or []
+                note = (f" — this build can't do {', '.join(dropped)}"
+                        if dropped else "")
+                _set_control_status(
+                    "switch", f"switched to {variant} (mode {result['preset']}, "
+                              f"cache {'on' if result.get('cache_ram') else 'off'}){note}",
+                    done=True, ok=True
+                )
+                print(f"[observer] _switch_worker: DONE variant={variant!r}", flush=True)
+                audit("switch-done", f"variant={variant} preset={preset} "
+                                     f"cache_ram={cache_ram}")
+            except Exception as e:
+                profile.fail(e)
+                print(f"[observer] _switch_worker: FAILED variant={variant!r} error={e!r}", flush=True)
+                audit("switch-failed", f"variant={variant}: {e}")
+                setup = parse_setup_hint(str(e))
+                if setup:
+                    setup.update({"variant": variant, "preset": preset,
+                                  "force": force, "cache_ram": cache_ram})
+                _set_control_status(
+                    "switch", f"switch to {variant} failed: {e}", done=True,
+                    ok=False, install_hint=setup or None,
+                )
     finally:
         _control_lock.release()
 
 
 def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     setup, runner=_run, info_getter=None,
-                    override_path=OVERRIDE_FILE, cache_ram=False):
+                    override_path=OVERRIDE_FILE, cache_ram=False,
+                    started_at=None, ready_waiter=None):
+    ready_waiter = ready_waiter or wait_until_serving
     try:
-        print(f"[observer] _install_worker: START variant={variant!r} preset={preset!r} retry={retry}", flush=True)
-        _set_control_status(
-            "install", f"installing assets for {variant} (can take a while)…"
-        )
-        last_progress_at = [0.0]
+        with profiled_load("install", variant=variant, preset=preset,
+                           started_at=started_at) as profile:
+            try:
+                print(f"[observer] _install_worker: START variant={variant!r} preset={preset!r} retry={retry}", flush=True)
+                _set_control_status(
+                    "install", f"installing assets for {variant} (can take a while)…"
+                )
+                last_progress_at = [0.0]
 
-        def progress(line):
-            now = time.monotonic()
-            if now - last_progress_at[0] < 0.75:
-                return
-            last_progress_at[0] = now
-            clean = re.sub(r"\s+", " ", str(line or "")).strip()
-            _set_control_status(
-                "install", _install_progress_detail(variant, clean),
-                progress_line=clean[-500:],
-            )
+                def progress(line):
+                    now = time.monotonic()
+                    if now - last_progress_at[0] < 0.75:
+                        return
+                    last_progress_at[0] = now
+                    clean = re.sub(r"\s+", " ", str(line or "")).strip()
+                    _set_control_status(
+                        "install", _install_progress_detail(variant, clean),
+                        progress_line=clean[-500:],
+                    )
 
-        result = install_variant_assets(
-            repo, variant, state.catalog, setup=setup, runner=runner,
-            progress=progress)
-        print(f"[observer] _install_worker: install_variant_assets() returned OK", flush=True)
-        state.mark_assets_installed(variant, {
-            k: v for k, v in result.items()
-            if k in ("model", "model_dir", "weight_key")
-        })
-        state.notify_subscribers()
-        if not retry:
-            _set_control_status(
-                "install", f"installed assets for {variant}",
-                done=True, ok=True, installed_variant=variant,
-            )
-            audit("install-done", f"variant={variant}")
-            print(f"[observer] _install_worker: DONE (no retry) variant={variant!r}", flush=True)
-            return
-        print(f"[observer] _install_worker: assets installed, calling switch_model() for retry", flush=True)
-        _set_control_status(
-            "install", f"installed assets for {variant}; retrying switch…",
-            installed_variant=variant,
-        )
-        switch_model(repo, variant, monitor_port, force=force, runner=runner)
-        print(f"[observer] _install_worker: switch_model() returned OK after install", flush=True)
-        _set_control_status(
-            "switch", f"{variant} is up; applying mode {preset} + cache "
-                      f"{'on' if cache_ram else 'off'} + log rotation "
-                      "(one more model reload)…"
-        )
-        print(f"[observer] _install_worker: calling _wait_for_model_info() after switch", flush=True)
-        info = (info_getter or _wait_for_model_info)(monitor_port)
-        print(f"[observer] _install_worker: calling restart_model() after switch", flush=True)
-        restart_model(preset, model_info=info, runner=runner,
-                      cache_ram=cache_ram,
-                      override_path=override_path)
-        _set_control_status(
-            "switch", f"switched to {variant} (mode {preset}, "
-                      f"cache {'on' if cache_ram else 'off'})",
-            done=True, ok=True
-        )
-        print(f"[observer] _install_worker: DONE (with retry) variant={variant!r}", flush=True)
-        audit("install-switch-done", f"variant={variant} preset={preset} "
-                                     f"cache_ram={cache_ram}")
-    except Exception as e:
-        print(f"[observer] _install_worker: FAILED variant={variant!r} error={e!r}", flush=True)
-        audit("install-failed", f"variant={variant}: {e}")
-        _set_control_status(
-            "install", f"install for {variant} failed: {e}",
-            done=True, ok=False,
-        )
+                with profile.phase("install_assets"):
+                    result = install_variant_assets(
+                        repo, variant, state.catalog, setup=setup, runner=runner,
+                        progress=progress)
+                print(f"[observer] _install_worker: install_variant_assets() returned OK", flush=True)
+                state.mark_assets_installed(variant, {
+                    k: v for k, v in result.items()
+                    if k in ("model", "model_dir", "weight_key")
+                })
+                state.notify_subscribers()
+                if not retry:
+                    _set_control_status(
+                        "install", f"installed assets for {variant}",
+                        done=True, ok=True, installed_variant=variant,
+                    )
+                    audit("install-done", f"variant={variant}")
+                    print(f"[observer] _install_worker: DONE (no retry) variant={variant!r}", flush=True)
+                    return
+                print(f"[observer] _install_worker: assets installed, calling switch_model() for retry", flush=True)
+                _set_control_status(
+                    "install", f"installed assets for {variant}; retrying switch…",
+                    installed_variant=variant,
+                )
+                with profile.phase("switch.sh"):
+                    switch_model(repo, variant, monitor_port, force=force,
+                                 runner=runner)
+                print(f"[observer] _install_worker: switch_model() returned OK after install", flush=True)
+                _set_control_status(
+                    "switch", f"{variant} is up; applying mode {preset} + cache "
+                              f"{'on' if cache_ram else 'off'} + log rotation "
+                              "(one more model reload)…"
+                )
+                print(f"[observer] _install_worker: calling _wait_for_model_info() after switch", flush=True)
+                with profile.phase("wait_model_info"):
+                    info = (info_getter or _wait_for_model_info)(monitor_port)
+                print(f"[observer] _install_worker: calling restart_model() after switch", flush=True)
+                with profile.phase("restart_preset"):
+                    restart_model(preset, model_info=info, runner=runner,
+                                  cache_ram=cache_ram,
+                                  override_path=override_path)
+                with profile.phase("ready_wait"):
+                    ready_waiter(monitor_port)
+                _set_control_status(
+                    "switch", f"switched to {variant} (mode {preset}, "
+                              f"cache {'on' if cache_ram else 'off'})",
+                    done=True, ok=True
+                )
+                print(f"[observer] _install_worker: DONE (with retry) variant={variant!r}", flush=True)
+                audit("install-switch-done", f"variant={variant} preset={preset} "
+                                             f"cache_ram={cache_ram}")
+            except Exception as e:
+                profile.fail(e)
+                print(f"[observer] _install_worker: FAILED variant={variant!r} error={e!r}", flush=True)
+                audit("install-failed", f"variant={variant}: {e}")
+                _set_control_status(
+                    "install", f"install for {variant} failed: {e}",
+                    done=True, ok=False,
+                )
+    finally:
+        _control_lock.release()
+
+
+def _restart_worker(preset, monitor_port, cache_ram=None, runner=_run,
+                    override_path=OVERRIDE_FILE, started_at=None,
+                    ready_waiter=None):
+    """Background body of an in-place restart; releases the control lock.
+
+    restart_model only re-ups the compose project (returns once the container is
+    recreated), so the readiness wait is what actually marks the model serving
+    again — and what makes the profile's total a true end-to-end measurement.
+    """
+    ready_waiter = ready_waiter or wait_until_serving
+    variant = (state.model_info or {}).get("variant")
+    try:
+        with profiled_load("restart", variant=variant, preset=preset,
+                           started_at=started_at) as profile:
+            try:
+                _set_control_status(
+                    "restart", f"restarting with mode {preset} "
+                               "(model reloading)…"
+                )
+                with profile.phase("restart"):
+                    result = restart_model(preset, runner=runner,
+                                           cache_ram=cache_ram,
+                                           override_path=override_path)
+                with profile.phase("ready_wait"):
+                    ready_waiter(monitor_port)
+                dropped = result.get("dropped_capabilities") or []
+                note = (f" — this build can't do {', '.join(dropped)}"
+                        if dropped else "")
+                _set_control_status(
+                    "restart", f"restarted with mode {result['preset']}, cache "
+                               f"{'on' if result.get('cache_ram') else 'off'}{note}",
+                    done=True, ok=True
+                )
+                audit("restart-done", f"preset={result['preset']} "
+                                      f"cache_ram={result.get('cache_ram')}")
+            except Exception as e:
+                profile.fail(e)
+                audit("restart-failed", f"preset={preset}: {e}")
+                _set_control_status(
+                    "restart", f"restart failed: {e}", done=True, ok=False,
+                )
     finally:
         _control_lock.release()
 
@@ -3117,6 +3509,13 @@ def tail_docker_logs(container, monitor_port):
             print(f"Observer tailing docker logs for {target}", file=sys.stderr)
             for line in proc.stdout:
                 state.add_docker_log(line)
+                # During a load, mine the engine's own startup lines for an
+                # in-container breakdown (weights load, KV cache, warmup).
+                profile = get_active_profile()
+                if profile is not None:
+                    hit = parse_engine_load_line(line)
+                    if hit:
+                        profile.add_engine_phase(*hit)
                 # Pick the parser per line: model_info often isn't populated yet
                 # when the stream starts, so choosing once would wrongly pin the
                 # llama.cpp tracker until the next container restart. The check is
@@ -3177,6 +3576,7 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2><span>club-3090 Catalog</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="catalogInfo"></div></section>
 <section class="card"><h2><span>Server Metrics</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="metricsInfo"></div></section>
 <section class="card full" id="vllmTimelineCard"><h2><span>vLLM Activity (live)</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="vllmTimeline"></div></section>
+<section class="card full" id="loadProfileCard" style="display:none"><h2><span>Model Load Profile</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div id="loadProfile"></div></section>
 <section class="card"><h2><span>Inference Health</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn" title="Toggle size">⊞ size</button></div></h2><div class="summary">
 <div class="summary-item"><div id="truncRate" class="summary-value">0%</div><div class="summary-label">Truncated</div></div>
 <div class="summary-item"><div id="cancelled" class="summary-value">0</div><div class="summary-label">Cancelled</div></div>
@@ -3231,7 +3631,7 @@ function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
 let lastBusy=false;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doInstallVariant('${esc(h.variant)}','${esc(h.preset||selectedPreset())}',${h.force?'true':'false'},true,'${esc(h.model||'')}','${esc(h.weight_key||'')}','${esc(h.model_dir||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
@@ -3279,10 +3679,28 @@ el.innerHTML=rows}
 function renderVllmTimeline(d){let card=document.getElementById('vllmTimelineCard');let el=document.getElementById('vllmTimeline');let m=d.metrics||{};if(m.engine!=='vllm'){card.style.display='none';return}card.style.display='';let h=d.vllm_history||[];if(!h.length){el.innerHTML='<div class="row"><span class="label">no samples yet</span></div>';return}
 let spark=(key,color,unit,dec)=>{let vals=h.map(s=>Number(s[key])||0);let max=Math.max(1,...vals);let bars=vals.map(v=>`<span style="display:inline-block;width:3px;margin-right:1px;background:${color};height:${Math.max(1,Math.round(30*v/max))}px;vertical-align:bottom" title="${v}${unit}"></span>`).join('');let last=vals[vals.length-1];let peak=Math.max(...vals);return `<div class="row" style="align-items:flex-end"><span class="label" style="min-width:130px">${key}</span><span style="height:32px;line-height:0;flex:1;overflow:hidden;white-space:nowrap">${bars}</span><span class="value" style="min-width:120px;text-align:right">${last.toFixed(dec||0)}${unit} <span class="label">(peak ${peak.toFixed(dec||0)})</span></span></div>`};
 let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
+function renderLoadProfile(d){let card=document.getElementById('loadProfileCard');let el=document.getElementById('loadProfile');let ps=d.load_profiles||[];if(!ps.length){card.style.display='none';return}card.style.display='';
+let p=ps[ps.length-1];
+let fs=s=>s==null?'-':(s>=60?Math.floor(s/60)+'m '+Math.round(s%60)+'s':s.toFixed(1)+'s');
+let mb=b=>b==null?'-':(Math.abs(b)>=1e9?(b/1e9).toFixed(2)+' GB':(b/1e6).toFixed(0)+' MB');
+let hdr=t=>`<div class="row"><span class="label" style="font-weight:600">${t}</span></div>`;
+let plabel={'switch.sh':'switch.sh (stop + boot + ready)','wait_model_info':'detect new container','restart_preset':'preset re-up (2nd load)','restart':'compose up','ready_wait':'wait until serving','install_assets':'download weights'};
+let phs=p.phases||[];let tot=p.total||phs.reduce((a,x)=>a+(x.duration||0),0)||1;
+let bars=phs.map(x=>{let w=Math.max(1,Math.round(100*(x.duration||0)/tot));return `<div class="row" style="align-items:center"><span class="label" style="min-width:210px">${esc(plabel[x.name]||x.name)}</span><span style="flex:1"><span style="display:inline-block;height:14px;width:${w}%;background:var(--accent);border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right">${fs(x.duration)}</span></div>`}).join('');
+let eng=p.engine_phases||{};let elab={weights_load:'weights load (SSD → GPU)',model_load:'model load',engine_init:'engine init (KV cache + warmup)',cuda_graphs:'CUDA graph capture'};
+let engRows=Object.keys(eng).map(k=>infoRow(elab[k]||k,fs(eng[k]),'parsed from container startup logs')).join('');
+let r=p.resources||{};let resRows='';
+if(r.disk_read_bytes!=null)resRows+=infoRow('Disk read',mb(r.disk_read_bytes)+(r.peak_disk_read_bps?` <span class="label">(peak ${(r.peak_disk_read_bps/1e6).toFixed(0)} MB/s)</span>`:''),'/proc/diskstats read delta over the load window');
+if(r.vram_delta_mib!=null)resRows+=infoRow('VRAM filled',(r.vram_delta_mib>=0?'+':'')+Number(r.vram_delta_mib).toFixed(0)+' MiB','peak GPU VRAM growth vs start (nvidia-smi)');
+if(r.page_cache_delta_bytes!=null)resRows+=infoRow('Page cache',(r.page_cache_delta_bytes>=0?'+':'-')+mb(Math.abs(r.page_cache_delta_bytes)),'/proc/meminfo Cached delta (host RAM)');
+let head=`<div class="row"><span class="label">${esc(p.trigger)}${p.variant?' · '+esc(p.variant):''}${p.preset?' · '+esc(p.preset):''} <span class="label">${esc(p.started_at_str||'')}</span></span><span class="value ${p.ok?'good':'critical'}">${p.ok?'✓':'✗'} ${fs(p.total)} total</span></div>`;
+if(!p.ok&&p.error)head+=`<div class="row"><span class="value critical">${esc(p.error)}</span></div>`;
+let hist=ps.slice(0,-1).slice(-6).reverse().map(x=>infoRow((esc(x.started_at_str||'')+' · '+esc(x.trigger)),`<span class="${x.ok?'good':'critical'}">${x.ok?'✓':'✗'}</span> ${fs(x.total)}`)).join('');
+el.innerHTML=head+'<div style="margin-top:8px">'+bars+'</div>'+(engRows?hdr('In-container breakdown')+engRows:'')+(resRows?hdr('Resource attribution')+resRows:'')+(hist?hdr('Recent loads')+hist:'')}
 async function ctlPost(path,body){console.log('[observer] ctlPost:',path,JSON.stringify(body));let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});console.log('[observer] ctlPost response:',r.status,r.ok);let j=await r.json().catch(()=>({}));if(!r.ok){console.error('[observer] ctlPost error:',j.error||'HTTP '+r.status);throw new Error(j.error||('HTTP '+r.status))}console.log('[observer] ctlPost result:',JSON.stringify(j));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
 function doUpdate(){ctlRun(this,'git pull club-3090 (fast-forward only)?',async()=>{let r=await ctlPost('/observer/api/update');return r.updated?`updated ${r.from} → ${r.to} (${(r.commits||[]).length} commits)`:(r.detail||'already up to date')})}
-function doRestart(){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Restart the model with mode '${p}' and cache ${cache?'on':'off'}?${warn}`,async()=>{let r=await ctlPost('/observer/api/restart',{preset:p,cache_ram:cache,force:lastActive>0});let dr=(r.dropped_capabilities||[]).length?` (this build can't do ${r.dropped_capabilities.join(', ')})`:'';return `restarted with ${r.preset}, cache ${r.cache_ram?'on':'off'}${dr} (model reloading…)`})}
+function doRestart(){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';if(!confirm(`Restart the model with mode '${p}' and cache ${cache?'on':'off'}?${warn}`))return;ctlPost('/observer/api/restart',{preset:p,cache_ram:cache,force:lastActive>0}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ restart started…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function doStop(){let warn=lastActive?` ⚠ ${lastActive} request(s) in flight will be killed!`:'';ctlRun(this,`Stop model serving on this host?${warn}`,async()=>{let r=await ctlPost('/observer/api/stop',{force:lastActive>0});return r.stopped?`stopped ${r.container||'model'}`:(r.detail||'already stopped')})}
 function statusSpan(s){let c=s==='production'?'good':(s==='caveats'?'hot':'critical');return `<span class="${c}">${esc(s||'?')}</span>`}
 function variantDoc(v){return v.doc||{}}
@@ -3703,6 +4121,9 @@ def handle_observer_post(handler):
         _send_json(handler, 409, {"error": "another control action is running"})
         return True
     release = True
+    # Stamp the moment the action was triggered (button click) so the load
+    # profile measures true end-to-end wall-clock, not just the worker runtime.
+    started_at = time.time()
     try:
         if path == "/observer/api/update":
             repo = _config.get("model_repo")
@@ -3737,7 +4158,7 @@ def handle_observer_post(handler):
             threading.Thread(
                 target=_switch_worker,
                 args=(repo, variant, preset, _config["monitor_port"], force),
-                kwargs={"cache_ram": cache_ram},
+                kwargs={"cache_ram": cache_ram, "started_at": started_at},
                 name="observer-switch",
                 daemon=True,
             ).start()
@@ -3773,7 +4194,7 @@ def handle_observer_post(handler):
                     repo, variant, preset, _config["monitor_port"], force,
                     retry, setup,
                 ),
-                kwargs={"cache_ram": cache_ram},
+                kwargs={"cache_ram": cache_ram, "started_at": started_at},
                 name="observer-install",
                 daemon=True,
             ).start()
@@ -3783,10 +4204,20 @@ def handle_observer_post(handler):
         else:
             check_restart_allowed(state, force=bool(body.get("force")))
             preset, cache_ram = observer_control_options(body, "debug")
-            result = restart_model(preset, cache_ram=cache_ram)
+            # Hand off like switch/install so the profile captures the reload +
+            # readiness wait end-to-end instead of returning before it loads.
+            threading.Thread(
+                target=_restart_worker,
+                args=(preset, _config["monitor_port"]),
+                kwargs={"cache_ram": cache_ram, "started_at": started_at},
+                name="observer-restart",
+                daemon=True,
+            ).start()
+            release = False
+            result = {"started": True, "preset": preset, "cache_ram": cache_ram}
         _send_json(
             handler,
-            202 if path.endswith(("/switch", "/install")) else 200,
+            202 if path.endswith(("/switch", "/install", "/restart")) else 200,
             result,
         )
     except ValueError as e:

@@ -2179,6 +2179,7 @@ class SwitchWorkerTests(unittest.TestCase):
             "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
             info_getter=lambda port: dict(MODEL_INFO),
             override_path=self.override_path,
+            ready_waiter=lambda port: 0.0,
         )
         status = aipc_observer.state.control_status
         self.assertTrue(status["done"])
@@ -2198,6 +2199,7 @@ class SwitchWorkerTests(unittest.TestCase):
             "/repo", "eng/prod", "insight", 8020, False, runner=runner,
             info_getter=lambda port: dict(MODEL_INFO),
             override_path=self.override_path,
+            ready_waiter=lambda port: 0.0,
         )
         self.assertTrue(aipc_observer.state.control_status["ok"])
         # switch.sh + compose config + compose up.
@@ -2246,6 +2248,131 @@ class SwitchWorkerTests(unittest.TestCase):
         snap = st.snapshot()
         self.assertEqual(snap["control_status"]["action"], "switch")
         self.assertTrue(snap["control_busy"])
+
+
+class DiskstatsParseTests(unittest.TestCase):
+    SAMPLE = (
+        "   8       0 sda 100 0 2048 50 0 0 0 0 0 0 0\n"
+        "   8       1 sda1 10 0 512 5 0 0 0 0 0 0 0\n"  # partition: skipped
+        " 259       0 nvme0n1 200 0 4096 60 0 0 0 0 0 0 0\n"
+        " 259       1 nvme0n1p1 20 0 1024 6 0 0 0 0 0 0 0\n"  # partition: skipped
+        "   7       0 loop0 1 0 8 0 0 0 0 0 0 0 0\n"  # loop: skipped
+    )
+
+    def test_sums_only_whole_disks(self):
+        # (2048 + 4096) sectors * 512 bytes.
+        self.assertEqual(
+            aipc_observer.read_disk_read_bytes(self.SAMPLE),
+            (2048 + 4096) * 512,
+        )
+
+    def test_empty_input(self):
+        self.assertEqual(aipc_observer.read_disk_read_bytes(""), 0)
+        self.assertEqual(aipc_observer.read_disk_read_bytes(None), 0)
+
+    def test_meminfo_to_bytes(self):
+        mem = aipc_observer.parse_meminfo(
+            "MemTotal:       32000 kB\nCached:          1024 kB\n"
+            "MemAvailable:    8000 kB\n"
+        )
+        self.assertEqual(mem["Cached"], 1024 * 1024)
+        self.assertEqual(mem["MemAvailable"], 8000 * 1024)
+
+
+class EngineLoadLineTests(unittest.TestCase):
+    def test_vllm_weights_load(self):
+        self.assertEqual(
+            aipc_observer.parse_engine_load_line(
+                "INFO ... Loading model weights took 12.34 seconds"),
+            ("weights_load", 12.34),
+        )
+
+    def test_vllm_model_loading_gib(self):
+        self.assertEqual(
+            aipc_observer.parse_engine_load_line(
+                "Model loading took 8.50 GiB and 20.0 seconds"),
+            ("model_load", 20.0),
+        )
+
+    def test_vllm_init_engine(self):
+        self.assertEqual(
+            aipc_observer.parse_engine_load_line(
+                "init engine (profile, create kv cache, warmup model) "
+                "took 15.5 seconds"),
+            ("engine_init", 15.5),
+        )
+
+    def test_llama_load_time_ms_maps_to_weights_seconds(self):
+        self.assertEqual(
+            aipc_observer.parse_engine_load_line("load time =  4200.00 ms"),
+            ("weights_load", 4.2),
+        )
+
+    def test_non_load_line_is_ignored(self):
+        self.assertIsNone(
+            aipc_observer.parse_engine_load_line("GET /v1/models 200 OK"))
+
+
+class LoadProfileTests(unittest.TestCase):
+    def test_phases_and_total_recorded(self):
+        prof = aipc_observer.LoadProfile("switch", variant="eng/prod",
+                                         preset="baseline")
+        with prof.phase("switch.sh"):
+            pass
+        with prof.phase("ready_wait"):
+            pass
+        rec = prof.finalize()
+        self.assertEqual(rec["trigger"], "switch")
+        self.assertEqual([p["name"] for p in rec["phases"]],
+                         ["switch.sh", "ready_wait"])
+        self.assertTrue(all(p["duration"] is not None for p in rec["phases"]))
+        self.assertTrue(rec["ok"])
+        self.assertIsNotNone(rec["total"])
+
+    def test_fail_marks_not_ok(self):
+        prof = aipc_observer.LoadProfile("restart")
+        prof.fail("boom")
+        rec = prof.finalize()
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["error"], "boom")
+
+    def test_engine_phase_keeps_largest(self):
+        prof = aipc_observer.LoadProfile("switch")
+        prof.add_engine_phase("weights_load", 5.0)
+        prof.add_engine_phase("weights_load", 12.0)
+        prof.add_engine_phase("weights_load", 8.0)
+        self.assertEqual(prof.as_dict()["engine_phases"]["weights_load"], 12.0)
+
+    def test_resource_summary_diffs_disk_and_vram(self):
+        prof = aipc_observer.LoadProfile("switch")
+        prof.start_resources = {"t": 0.0, "disk_read_bytes": 1000,
+                                "mem_cached": 2000, "vram_used_mib": 100}
+        prof.peak_vram_mib = 4096
+        prof.end_resources = {"t": 1.0, "disk_read_bytes": 5000,
+                              "mem_cached": 3000, "vram_used_mib": 4096}
+        res = prof._resource_summary()
+        self.assertEqual(res["disk_read_bytes"], 4000)
+        self.assertEqual(res["page_cache_delta_bytes"], 1000)
+        self.assertEqual(res["vram_delta_mib"], 3996)
+
+
+class WaitUntilServingTests(unittest.TestCase):
+    def test_returns_once_models_listed(self):
+        calls = {"n": 0}
+
+        def fake_fetch(url):
+            calls["n"] += 1
+            return {"data": [{"id": "m"}]} if calls["n"] >= 2 else {"data": []}
+
+        waited = aipc_observer.wait_until_serving(
+            8020, timeout=5, interval=0.01, fetch=fake_fetch)
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertIsNotNone(waited)
+
+    def test_times_out_when_never_ready(self):
+        with self.assertRaises(RuntimeError):
+            aipc_observer.wait_until_serving(
+                8020, timeout=0.05, interval=0.01, fetch=lambda url: {"data": []})
 
 
 if __name__ == "__main__":
