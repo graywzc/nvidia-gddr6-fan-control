@@ -2288,18 +2288,33 @@ class EngineLoadLineTests(unittest.TestCase):
         )
 
     def test_vllm_model_loading_gib(self):
+        # Real v0.22 line: "Model loading took 13.32 GiB memory and 31.48 seconds".
         self.assertEqual(
             aipc_observer.parse_engine_load_line(
-                "Model loading took 8.50 GiB and 20.0 seconds"),
-            ("model_load", 20.0),
+                "Model loading took 13.32 GiB memory and 31.48 seconds"),
+            ("weights_load", 31.48),
+        )
+
+    def test_vllm_dynamo_compile(self):
+        self.assertEqual(
+            aipc_observer.parse_engine_load_line(
+                "Dynamo bytecode transform time: 3.47 s"),
+            ("compile", 3.47),
+        )
+
+    def test_vllm_graph_capture(self):
+        self.assertEqual(
+            aipc_observer.parse_engine_load_line(
+                "Graph capturing finished in 2 secs, took 0.06 GiB"),
+            ("cuda_graphs", 2.0),
         )
 
     def test_vllm_init_engine(self):
         self.assertEqual(
             aipc_observer.parse_engine_load_line(
                 "init engine (profile, create kv cache, warmup model) "
-                "took 15.5 seconds"),
-            ("engine_init", 15.5),
+                "took 87.47 s (compilation: 10.64 s)"),
+            ("engine_init", 87.47),
         )
 
     def test_llama_load_time_ms_maps_to_weights_seconds(self):
@@ -2363,6 +2378,21 @@ class LoadProfileTests(unittest.TestCase):
         prof.add_engine_phase("weights_load", 12.0)
         prof.add_engine_phase("weights_load", 8.0)
         self.assertEqual(prof.as_dict()["engine_phases"]["weights_load"], 12.0)
+
+    def test_engine_phases_nest_under_open_phase(self):
+        # Each load's in-container markers nest under whichever observer phase
+        # was open when they arrived — the hierarchy the dashboard renders.
+        prof = aipc_observer.LoadProfile("switch")
+        with prof.phase("switch.sh"):
+            prof.add_engine_phase("weights_load", 17.0)  # 1st load
+            prof.add_engine_phase("engine_init", 40.0)
+        with prof.phase("ready_wait"):
+            prof.add_engine_phase("weights_load", 31.0)  # 2nd load
+            prof.add_engine_phase("engine_init", 87.0)
+        phases = {p["name"]: p for p in prof.as_dict()["phases"]}
+        self.assertEqual(phases["switch.sh"]["children"]["engine_init"], 40.0)
+        self.assertEqual(phases["ready_wait"]["children"]["engine_init"], 87.0)
+        self.assertEqual(phases["ready_wait"]["children"]["weights_load"], 31.0)
 
     def test_resource_summary_diffs_disk_and_vram(self):
         prof = aipc_observer.LoadProfile("switch")
