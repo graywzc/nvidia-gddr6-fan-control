@@ -309,6 +309,10 @@ class ObserverState:
                 pass
 
     def snapshot(self):
+        # Serialize any in-flight load before taking self.lock: as_dict() samples
+        # VRAM, which itself grabs self.lock — doing it inside would deadlock.
+        active = get_active_profile()
+        active_profile = active.as_dict() if active is not None else None
         with self.lock:
             uptime = time.time() - self.start_time
             return {
@@ -333,6 +337,7 @@ class ObserverState:
                 "control_status": dict(self.control_status),
                 "control_busy": _control_lock.locked(),
                 "load_profiles": list(self.load_profiles),
+                "active_load_profile": active_profile,
                 "docker_logs": list(self.docker_logs)[-100:],
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
@@ -2012,17 +2017,31 @@ class LoadProfile:
         return out
 
     def as_dict(self):
+        # While the load is still running the open phase has no end yet, so
+        # report its live elapsed time (and a live total) so the dashboard can
+        # tick through each step as it happens.
+        now = time.time()
         with self.lock:
+            phases = []
+            for p in self.phases:
+                d = dict(p)
+                if d["end"] is None and d["duration"] is None:
+                    d["duration"] = now - d["start"]
+                    d["running"] = True
+                phases.append(d)
+            running = self.total is None
+            total = self.total if self.total is not None else now - self.started_at
             return {
                 "trigger": self.trigger,
                 "variant": self.variant,
                 "preset": self.preset,
                 "started_at": self.started_at,
                 "started_at_str": local_time_str(self.started_at),
-                "phases": [dict(p) for p in self.phases],
+                "phases": phases,
                 "engine_phases": dict(self.engine_phases),
                 "resources": self._resource_summary(),
-                "total": self.total,
+                "total": total,
+                "running": running,
                 "ok": self.ok,
                 "error": self.error,
             }
@@ -3679,23 +3698,37 @@ el.innerHTML=rows}
 function renderVllmTimeline(d){let card=document.getElementById('vllmTimelineCard');let el=document.getElementById('vllmTimeline');let m=d.metrics||{};if(m.engine!=='vllm'){card.style.display='none';return}card.style.display='';let h=d.vllm_history||[];if(!h.length){el.innerHTML='<div class="row"><span class="label">no samples yet</span></div>';return}
 let spark=(key,color,unit,dec)=>{let vals=h.map(s=>Number(s[key])||0);let max=Math.max(1,...vals);let bars=vals.map(v=>`<span style="display:inline-block;width:3px;margin-right:1px;background:${color};height:${Math.max(1,Math.round(30*v/max))}px;vertical-align:bottom" title="${v}${unit}"></span>`).join('');let last=vals[vals.length-1];let peak=Math.max(...vals);return `<div class="row" style="align-items:flex-end"><span class="label" style="min-width:130px">${key}</span><span style="height:32px;line-height:0;flex:1;overflow:hidden;white-space:nowrap">${bars}</span><span class="value" style="min-width:120px;text-align:right">${last.toFixed(dec||0)}${unit} <span class="label">(peak ${peak.toFixed(dec||0)})</span></span></div>`};
 let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
-function renderLoadProfile(d){let card=document.getElementById('loadProfileCard');let el=document.getElementById('loadProfile');let ps=d.load_profiles||[];if(!ps.length){card.style.display='none';return}card.style.display='';
-let p=ps[ps.length-1];
+let _loadAnchor=null,_loadTimer=null;
+function renderLoadProfile(d){let card=document.getElementById('loadProfileCard');
+let active=d.active_load_profile;let ps=d.load_profiles||[];
+let p=active||(ps.length?ps[ps.length-1]:null);
+if(!p){card.style.display='none';_loadAnchor=null;if(_loadTimer){clearInterval(_loadTimer);_loadTimer=null}return}
+card.style.display='';
+// During a live load, re-anchor to now so the ticker can extrapolate the open
+// phase between snapshots (which only arrive every ~2s).
+_loadAnchor={p:p,active:!!active,at:Date.now(),history:active?ps.slice(-6).reverse():ps.slice(0,-1).slice(-6).reverse()};
+paintLoadProfile(0);
+if(active){if(!_loadTimer)_loadTimer=setInterval(()=>paintLoadProfile(_loadAnchor?(Date.now()-_loadAnchor.at)/1000:0),250)}
+else if(_loadTimer){clearInterval(_loadTimer);_loadTimer=null}}
+function paintLoadProfile(extra){let a=_loadAnchor;if(!a)return;let el=document.getElementById('loadProfile');if(!el)return;let p=a.p;
 let fs=s=>s==null?'-':(s>=60?Math.floor(s/60)+'m '+Math.round(s%60)+'s':s.toFixed(1)+'s');
 let mb=b=>b==null?'-':(Math.abs(b)>=1e9?(b/1e9).toFixed(2)+' GB':(b/1e6).toFixed(0)+' MB');
 let hdr=t=>`<div class="row"><span class="label" style="font-weight:600">${t}</span></div>`;
 let plabel={'switch.sh':'switch.sh (stop + boot + ready)','wait_model_info':'detect new container','restart_preset':'preset re-up (2nd load)','restart':'compose up','ready_wait':'wait until serving','install_assets':'download weights'};
-let phs=p.phases||[];let tot=p.total||phs.reduce((a,x)=>a+(x.duration||0),0)||1;
-let bars=phs.map(x=>{let w=Math.max(1,Math.round(100*(x.duration||0)/tot));return `<div class="row" style="align-items:center"><span class="label" style="min-width:210px">${esc(plabel[x.name]||x.name)}</span><span style="flex:1"><span style="display:inline-block;height:14px;width:${w}%;background:var(--accent);border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right">${fs(x.duration)}</span></div>`}).join('');
+let phs=p.phases||[];let live=x=>(x.duration||0)+(x.running?extra:0);
+let liveTotal=(p.total||phs.reduce((s,x)=>s+(x.duration||0),0))+(a.active?extra:0);
+let denom=Math.max(liveTotal,phs.reduce((s,x)=>s+live(x),0),1);
+let bars=phs.map(x=>{let dur=live(x);let w=Math.max(1,Math.round(100*dur/denom));let col=x.running?'var(--yellow)':'var(--accent)';return `<div class="row" style="align-items:center"><span class="label" style="min-width:210px">${x.running?'⏳ ':''}${esc(plabel[x.name]||x.name)}</span><span style="flex:1"><span style="display:inline-block;height:14px;width:${w}%;background:${col};border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right">${fs(dur)}</span></div>`}).join('');
 let eng=p.engine_phases||{};let elab={weights_load:'weights load (SSD → GPU)',model_load:'model load',engine_init:'engine init (KV cache + warmup)',cuda_graphs:'CUDA graph capture'};
 let engRows=Object.keys(eng).map(k=>infoRow(elab[k]||k,fs(eng[k]),'parsed from container startup logs')).join('');
 let r=p.resources||{};let resRows='';
 if(r.disk_read_bytes!=null)resRows+=infoRow('Disk read',mb(r.disk_read_bytes)+(r.peak_disk_read_bps?` <span class="label">(peak ${(r.peak_disk_read_bps/1e6).toFixed(0)} MB/s)</span>`:''),'/proc/diskstats read delta over the load window');
 if(r.vram_delta_mib!=null)resRows+=infoRow('VRAM filled',(r.vram_delta_mib>=0?'+':'')+Number(r.vram_delta_mib).toFixed(0)+' MiB','peak GPU VRAM growth vs start (nvidia-smi)');
 if(r.page_cache_delta_bytes!=null)resRows+=infoRow('Page cache',(r.page_cache_delta_bytes>=0?'+':'-')+mb(Math.abs(r.page_cache_delta_bytes)),'/proc/meminfo Cached delta (host RAM)');
-let head=`<div class="row"><span class="label">${esc(p.trigger)}${p.variant?' · '+esc(p.variant):''}${p.preset?' · '+esc(p.preset):''} <span class="label">${esc(p.started_at_str||'')}</span></span><span class="value ${p.ok?'good':'critical'}">${p.ok?'✓':'✗'} ${fs(p.total)} total</span></div>`;
-if(!p.ok&&p.error)head+=`<div class="row"><span class="value critical">${esc(p.error)}</span></div>`;
-let hist=ps.slice(0,-1).slice(-6).reverse().map(x=>infoRow((esc(x.started_at_str||'')+' · '+esc(x.trigger)),`<span class="${x.ok?'good':'critical'}">${x.ok?'✓':'✗'}</span> ${fs(x.total)}`)).join('');
+let status=a.active?`<span class="value" style="color:var(--yellow)">⏳ loading… ${fs(liveTotal)}</span>`:`<span class="value ${p.ok?'good':'critical'}">${p.ok?'✓':'✗'} ${fs(liveTotal)} total</span>`;
+let head=`<div class="row"><span class="label">${esc(p.trigger)}${p.variant?' · '+esc(p.variant):''}${p.preset?' · '+esc(p.preset):''} <span class="label">${esc(p.started_at_str||'')}</span></span>${status}</div>`;
+if(!a.active&&!p.ok&&p.error)head+=`<div class="row"><span class="value critical">${esc(p.error)}</span></div>`;
+let hist=(a.history||[]).map(x=>infoRow((esc(x.started_at_str||'')+' · '+esc(x.trigger)),`<span class="${x.ok?'good':'critical'}">${x.ok?'✓':'✗'}</span> ${fs(x.total)}`)).join('');
 el.innerHTML=head+'<div style="margin-top:8px">'+bars+'</div>'+(engRows?hdr('In-container breakdown')+engRows:'')+(resRows?hdr('Resource attribution')+resRows:'')+(hist?hdr('Recent loads')+hist:'')}
 async function ctlPost(path,body){console.log('[observer] ctlPost:',path,JSON.stringify(body));let r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});console.log('[observer] ctlPost response:',r.status,r.ok);let j=await r.json().catch(()=>({}));if(!r.ok){console.error('[observer] ctlPost error:',j.error||'HTTP '+r.status);throw new Error(j.error||('HTTP '+r.status))}console.log('[observer] ctlPost result:',JSON.stringify(j));return j}
 async function ctlRun(btn,msg,fn){if(!confirm(msg))return;let st=document.getElementById('ctlStatus');document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=true);st.textContent='working…';try{st.textContent=await fn()}catch(e){st.textContent='failed: '+e.message}finally{document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=false)}}
