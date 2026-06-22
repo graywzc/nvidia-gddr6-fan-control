@@ -2396,5 +2396,43 @@ class WaitUntilServingTests(unittest.TestCase):
                 8020, timeout=0.05, interval=0.01, fetch=lambda url: {"data": []})
 
 
+class RunningInstalledSeedTests(unittest.TestCase):
+    CATALOG = {"variants": {
+        "eng/prod": {"compose_path": "models/m/vllm/compose/single/prod/x.yml"},
+        "eng/exp": {"compose_path": "models/m/vllm/compose/single/exp/x.yml"},
+    }}
+
+    def test_running_variant_marked_installed(self):
+        st = aipc_observer.ObserverState()
+        st.set_catalog(self.CATALOG)
+        # No model running yet -> nothing seeded.
+        self.assertEqual(st.snapshot()["installed_assets"], {})
+        st.set_model_info({
+            "compose_file": "/repo/models/m/vllm/compose/single/prod/x.yml",
+        })
+        installed = st.snapshot()["installed_assets"]
+        self.assertIn("eng/prod", installed)
+        self.assertEqual(installed["eng/prod"]["source"], "running")
+        self.assertNotIn("eng/exp", installed)
+
+    def test_seed_is_additive_across_switches(self):
+        st = aipc_observer.ObserverState()
+        st.set_catalog(self.CATALOG)
+        st.set_model_info(
+            {"compose_file": "/repo/models/m/vllm/compose/single/prod/x.yml"})
+        # Switch to the other variant; the prior one stays marked (still on disk).
+        st.set_model_info(
+            {"compose_file": "/repo/models/m/vllm/compose/single/exp/x.yml"})
+        installed = st.snapshot()["installed_assets"]
+        self.assertIn("eng/prod", installed)
+        self.assertIn("eng/exp", installed)
+
+    def test_no_compose_file_seeds_nothing(self):
+        st = aipc_observer.ObserverState()
+        st.set_catalog(self.CATALOG)
+        st.set_model_info({})
+        self.assertEqual(st.snapshot()["installed_assets"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -231,6 +231,7 @@ class ObserverState:
     def set_model_info(self, info):
         with self.lock:
             self.model_info = dict(info)
+            self._seed_running_installed_locked()
 
     def set_repo_info(self, info):
         with self.lock:
@@ -239,6 +240,30 @@ class ObserverState:
     def set_catalog(self, catalog):
         with self.lock:
             self.catalog = dict(catalog)
+            self._seed_running_installed_locked()
+
+    def _seed_running_installed_locked(self):
+        """Mark the running variant's assets as installed; caller holds the lock.
+
+        The container that's actually serving necessarily has its weights on
+        disk, but installed_assets otherwise only records observer-driven
+        installs — so without this the running model wrongly shows an "install"
+        button. Matches the catalog key the dashboard uses (compose_path is a
+        substring of the running container's compose_file). Additive only:
+        switching away leaves the prior variant marked, since it's still on disk.
+        """
+        compose_file = (self.model_info or {}).get("compose_file") or ""
+        if not compose_file:
+            return
+        variants = (self.catalog or {}).get("variants") or {}
+        for key, entry in variants.items():
+            cp = (entry or {}).get("compose_path")
+            if cp and cp in compose_file and key not in self.installed_assets:
+                self.installed_assets[key] = {
+                    "installed_at": time.time(),
+                    "source": "running",
+                }
+                return
 
     def set_catalog_diff(self, diff):
         with self.lock:
@@ -3751,7 +3776,7 @@ function renderVariantListModal(d,fits,runKey,running,topo){let c=d.catalog||{};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let visible=new Set(fits);compareSelections.forEach(k=>{if(!visible.has(k))compareSelections.delete(k)});
 let rows='<div class="compare-toolbar"><button id="btnCompareVariants" class="btn" onclick="compareSelectedVariants()">Compare commands</button><span id="compareCount" class="label">0 selected</span><span class="label">select 2-4 variants</span></div><div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let install=installingVariant?`<span class="hot">installing…</span>`:(installed[k]?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`);let checked=compareSelections.has(k)?' checked':'';
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let install=installingVariant?`<span class="hot">installing…</span>`:((k===runKey||installed[k])?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`);let checked=compareSelections.has(k)?' checked':'';
 return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${install}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;
