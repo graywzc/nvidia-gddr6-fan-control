@@ -1974,6 +1974,11 @@ class LoadProfile:
         self.start_resources = sample_resources()
         self.end_resources = None
         self.peak_vram_mib = self.start_resources.get("vram_used_mib")
+        # Track the trough too: on a switch the start sample still includes the
+        # outgoing model, so VRAM dips when it stops and rises as the new one
+        # loads. "Filled" is peak - trough, which captures the new model even
+        # when start was already high.
+        self.min_vram_mib = self.start_resources.get("vram_used_mib")
         self.peak_disk_read_bps = 0.0
         self.total = None
         self.ok = None
@@ -2007,6 +2012,8 @@ class LoadProfile:
         with self.lock:
             if self.peak_vram_mib is None or used > self.peak_vram_mib:
                 self.peak_vram_mib = used
+            if self.min_vram_mib is None or used < self.min_vram_mib:
+                self.min_vram_mib = used
 
     def observe_disk_rate(self, bps):
         with self.lock:
@@ -2036,9 +2043,11 @@ class LoadProfile:
             out["peak_disk_read_bps"] = self.peak_disk_read_bps
         if s.get("mem_cached") is not None and e.get("mem_cached") is not None:
             out["page_cache_delta_bytes"] = e["mem_cached"] - s["mem_cached"]
-        start_vram = s.get("vram_used_mib")
-        if start_vram is not None and self.peak_vram_mib is not None:
-            out["vram_delta_mib"] = self.peak_vram_mib - start_vram
+        if self.peak_vram_mib is not None and self.min_vram_mib is not None:
+            # Fill = peak minus trough, so a switch (which starts with the old
+            # model still resident) still shows the new model's footprint.
+            out["vram_delta_mib"] = self.peak_vram_mib - self.min_vram_mib
+            out["vram_peak_mib"] = self.peak_vram_mib
         return out
 
     def as_dict(self):
@@ -3748,7 +3757,7 @@ let eng=p.engine_phases||{};let elab={weights_load:'weights load (SSD → GPU)',
 let engRows=Object.keys(eng).map(k=>infoRow(elab[k]||k,fs(eng[k]),'parsed from container startup logs')).join('');
 let r=p.resources||{};let resRows='';
 if(r.disk_read_bytes!=null)resRows+=infoRow('Disk read',mb(r.disk_read_bytes)+(r.peak_disk_read_bps?` <span class="label">(peak ${(r.peak_disk_read_bps/1e6).toFixed(0)} MB/s)</span>`:''),'/proc/diskstats read delta over the load window');
-if(r.vram_delta_mib!=null)resRows+=infoRow('VRAM filled',(r.vram_delta_mib>=0?'+':'')+Number(r.vram_delta_mib).toFixed(0)+' MiB','peak GPU VRAM growth vs start (nvidia-smi)');
+if(r.vram_delta_mib!=null){let gib=v=>Math.abs(v)>=1024?(v/1024).toFixed(2)+' GiB':Number(v).toFixed(0)+' MiB';resRows+=infoRow('VRAM filled',(r.vram_delta_mib>=0?'+':'')+gib(r.vram_delta_mib)+(r.vram_peak_mib!=null?` <span class="label">(peak ${gib(r.vram_peak_mib)})</span>`:''),'peak minus trough VRAM over the load — survives a switch where the old model was still resident at start (nvidia-smi)');}
 if(r.page_cache_delta_bytes!=null)resRows+=infoRow('Page cache',(r.page_cache_delta_bytes>=0?'+':'-')+mb(Math.abs(r.page_cache_delta_bytes)),'/proc/meminfo Cached delta (host RAM)');
 let status=a.active?`<span class="value" style="color:var(--yellow)">⏳ loading… ${fs(liveTotal)}</span>`:`<span class="value ${p.ok?'good':'critical'}">${p.ok?'✓':'✗'} ${fs(liveTotal)} total</span>`;
 let head=`<div class="row"><span class="label">${esc(p.trigger)}${p.variant?' · '+esc(p.variant):''}${p.preset?' · '+esc(p.preset):''} <span class="label">${esc(p.started_at_str||'')}</span></span>${status}</div>`;

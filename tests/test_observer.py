@@ -2367,14 +2367,19 @@ class LoadProfileTests(unittest.TestCase):
     def test_resource_summary_diffs_disk_and_vram(self):
         prof = aipc_observer.LoadProfile("switch")
         prof.start_resources = {"t": 0.0, "disk_read_bytes": 1000,
-                                "mem_cached": 2000, "vram_used_mib": 100}
-        prof.peak_vram_mib = 4096
+                                "mem_cached": 2000, "vram_used_mib": 45000}
+        # Switch: started with the old model resident (45000), dipped to 29000
+        # when it stopped, peaked at 45400 once the new model loaded.
+        prof.min_vram_mib = 29000
+        prof.peak_vram_mib = 45400
         prof.end_resources = {"t": 1.0, "disk_read_bytes": 5000,
-                              "mem_cached": 3000, "vram_used_mib": 4096}
+                              "mem_cached": 3000, "vram_used_mib": 45400}
         res = prof._resource_summary()
         self.assertEqual(res["disk_read_bytes"], 4000)
         self.assertEqual(res["page_cache_delta_bytes"], 1000)
-        self.assertEqual(res["vram_delta_mib"], 3996)
+        # peak - trough, not peak - start (which would be ~0).
+        self.assertEqual(res["vram_delta_mib"], 16400)
+        self.assertEqual(res["vram_peak_mib"], 45400)
 
 
 class WaitUntilServingTests(unittest.TestCase):
