@@ -2109,6 +2109,73 @@ class SwitchModelTests(unittest.TestCase):
         self.assertEqual(call["cwd"], "/repo")
         self.assertEqual(call["env"]["WEIGHT_KEY"], "m1:autoround-int4")
 
+    def test_variant_is_gguf_for_llamacpp_family(self):
+        self.assertTrue(
+            aipc_observer.variant_is_gguf({"engine": "ik-llama"})
+        )
+        self.assertTrue(
+            aipc_observer.variant_is_gguf({"engine": "llamacpp"})
+        )
+        self.assertTrue(
+            aipc_observer.variant_is_gguf({"engine": "beellama"})
+        )
+        self.assertTrue(
+            aipc_observer.variant_is_gguf(
+                {"compose_path": "models/m/beellama/compose/x.yml"}
+            )
+        )
+
+    def test_variant_is_gguf_false_for_vllm_sglang_empty(self):
+        self.assertFalse(
+            aipc_observer.variant_is_gguf({"engine": "vllm"})
+        )
+        self.assertFalse(
+            aipc_observer.variant_is_gguf({"engine": "sglang"})
+        )
+        self.assertFalse(
+            aipc_observer.variant_is_gguf({})
+        )
+
+    def test_install_gguf_sets_verify_glob(self):
+        catalog = {
+            "variants": {
+                "ik-llama/iq4ks-mtp": {
+                    "status": "caveats",
+                    "model": "qwen3.6-27b",
+                    "engine": "ik-llama",
+                    "compose_path": "models/qwen3.6-27b/ik-llama/compose/single/iq4ks-mtp/mtp.yml",
+                },
+            },
+            "defaults": {},
+        }
+        runner = FakeRunner()
+        aipc_observer.install_variant_assets(
+            "/repo", "ik-llama/iq4ks-mtp", catalog, runner=runner
+        )
+        env = runner.calls[0]["env"]
+        self.assertEqual(env["VERIFY_GLOB_OVERRIDE"], "*.gguf")
+        self.assertEqual(env["WEIGHT_VERIFY_GLOB"], "*.gguf")
+
+    def test_install_vllm_does_not_set_verify_glob(self):
+        catalog = {
+            "variants": {
+                "vllm/fp8": {
+                    "status": "production",
+                    "model": "m1",
+                    "engine": "vllm",
+                    "compose_path": "models/m1/vllm/compose/dual/fp8.yml",
+                },
+            },
+            "defaults": {},
+        }
+        runner = FakeRunner()
+        aipc_observer.install_variant_assets(
+            "/repo", "vllm/fp8", catalog, runner=runner
+        )
+        env = runner.calls[0]["env"]
+        self.assertNotIn("VERIFY_GLOB_OVERRIDE", env)
+        self.assertNotIn("WEIGHT_VERIFY_GLOB", env)
+
     def test_run_with_progress_reports_output_lines(self):
         lines = []
         output = aipc_observer._run_with_progress(
