@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from datetime import datetime
@@ -61,6 +62,31 @@ SERVING_READY_TIMEOUT = 900.0
 SERVING_POLL_INTERVAL = 2.0
 # /proc/diskstats reports I/O in 512-byte sectors regardless of device geometry.
 DISK_SECTOR_BYTES = 512
+
+# Oncall watchdog: detect a crashed/OOM'd model, alert ntfy, and auto-revive.
+# All overridable via env so a deploy can retarget the alert without a code edit.
+NTFY_SERVER = os.environ.get("AIPC_OBSERVER_NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+NTFY_TOPIC = os.environ.get("AIPC_OBSERVER_NTFY_TOPIC", "oncall-alert")
+# Optional bearer token for protected ntfy topics; the public ntfy.sh topic
+# needs none.
+NTFY_TOKEN = os.environ.get("AIPC_OBSERVER_NTFY_TOKEN") or None
+WATCHDOG_ENABLED = os.environ.get("AIPC_OBSERVER_WATCHDOG", "1") != "0"
+WATCHDOG_INTERVAL = 5.0
+# How long /v1/models must stay unreachable (after the model was healthy)
+# before we call it a crash. Long enough to ride out a stray failed poll.
+WATCHDOG_DOWN_GRACE = 30.0
+# Auto-revive attempts per crash episode before we give up and stay quiet
+# (avoids hammering a GPU that OOMs on every boot).
+MAX_REVIVE_ATTEMPTS = 3
+# Backoff between revive attempts: REVIVE_BACKOFF_BASE * 2**attempt seconds.
+REVIVE_BACKOFF_BASE = 30.0
+# Docker log substrings that mark a crash as an out-of-memory kill.
+OOM_LOG_SIGNATURES = (
+    "cuda out of memory",
+    "torch.outofmemoryerror",
+    "cuda error: out of memory",
+    "out of memory",
+)
 
 HOSTNAME = socket.gethostname().split(".")[0]
 
@@ -363,6 +389,7 @@ class ObserverState:
                 "control_busy": _control_lock.locked(),
                 "load_profiles": list(self.load_profiles),
                 "active_load_profile": active_profile,
+                "watchdog": _watchdog.summary(),
                 "docker_logs": list(self.docker_logs)[-100:],
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
@@ -2568,6 +2595,49 @@ def fetch_text(url, timeout=5):
         return None
 
 
+def http_status(url, timeout=5):
+    """GET a URL and return its HTTP status code, or None if unreachable.
+
+    Unlike fetch_json/fetch_text, this distinguishes a server that *answers*
+    (even with a 5xx) from a dead/refused port — needed to tell "loading" (503)
+    apart from "process gone" (connection refused).
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return None
+
+
+def send_ntfy(message, *, title=None, priority="high", tags=None, timeout=5):
+    """Best-effort push to the oncall ntfy topic. Never raises.
+
+    Notifications are advisory: a failed POST must not wedge the watchdog, so
+    every error is swallowed (logged to stderr) like the read-only fetch_*
+    helpers above. Returns True only on a confirmed 2xx.
+    """
+    url = f"{NTFY_SERVER}/{NTFY_TOPIC}"
+    headers = {"Priority": str(priority)}
+    if title:
+        # ntfy headers must be latin-1 safe; emoji in titles would 400.
+        headers["Title"] = title.encode("ascii", "ignore").decode() or "alert"
+    if tags:
+        headers["Tags"] = ",".join(tags)
+    if NTFY_TOKEN:
+        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
+    try:
+        req = urllib.request.Request(
+            url, data=message.encode("utf-8"), headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:
+        print(f"WARNING: ntfy notify failed: {e}", file=sys.stderr)
+        return False
+
+
 def parse_prometheus(text):
     """Parse Prometheus exposition text into {metric_name: float}.
 
@@ -2796,6 +2866,27 @@ def detect_model(monitor_port):
     model_id = models[0].get("id") or ""
     # llama.cpp often reports a filesystem path; show just the model file/name.
     return model_id.rsplit("/", 1)[-1] or None
+
+
+def probe_model_state(monitor_port):
+    """Liveness probe for the watchdog, combining both health signals.
+
+    /health is the engine-blessed endpoint (llama.cpp and vLLM both expose it)
+    and uniquely flags the *loading* state — llama.cpp returns 503 while weights
+    load — which must NOT be mistaken for a crash. /v1/models is the fallback
+    for builds/engines without /health and a corroborating second opinion, so
+    one flaky endpoint can't fake a crash. Returns "ready" | "loading" | "down".
+    """
+    code = http_status(f"http://127.0.0.1:{monitor_port}/health")
+    if code == 200:
+        return "ready"
+    if code == 503:
+        return "loading"
+    # /health refused, timed out, or unexpected (e.g. a build without it):
+    # defer to the OpenAI endpoint before concluding the process is gone.
+    if detect_model(monitor_port):
+        return "ready"
+    return "down"
 
 
 def detect_n_ctx(monitor_port):
@@ -4327,6 +4418,195 @@ def handle_observer_post(handler):
     return True
 
 
+def classify_crash(container_name, logs, runner=_run):
+    """Best-effort label for why the model died: OOM, a crash, or unresponsive.
+
+    The alert/revive fire regardless of cause (OOM is just the common one); this
+    only decorates the notification. Scans the tail of the docker logs for an
+    OOM signature first, then falls back to the exited container's state
+    (OOMKilled / exit 137 both mean the kernel reaped it).
+    """
+    text = "\n".join(logs[-80:]).lower() if logs else ""
+    for sig in OOM_LOG_SIGNATURES:
+        if sig in text:
+            return f"OOM ({sig})"
+    if container_name:
+        try:
+            out = runner(
+                ["docker", "inspect", "--format",
+                 "{{.State.OOMKilled}} {{.State.ExitCode}}", container_name]
+            ).strip().split()
+            oom = bool(out) and out[0].lower() == "true"
+            code = out[1] if len(out) > 1 else ""
+            if oom:
+                return "OOM (killed)"
+            if code == "137":
+                return "OOM (exit 137)"
+            if code and code != "0":
+                return f"crash (exit {code})"
+        except Exception:
+            pass
+    return "unresponsive"
+
+
+def _classify_crash_now():
+    return classify_crash(state.container_name, list(state.docker_logs))
+
+
+def _revive_model():
+    """Recreate the crashed model container via the same path as the dashboard
+    "Restart model" button. Returns (ok, detail). Never raises."""
+    if not _control_lock.acquire(blocking=False):
+        return False, "another control action is running"
+    try:
+        mi = state.model_info
+        preset = mi.get("preset") or "baseline"
+        cache_ram = mi.get("cache_ram_enabled")
+        restart_model(preset, cache_ram=cache_ram)
+        return True, f"preset={preset}"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        _control_lock.release()
+
+
+def _watchdog_notify(event, **info):
+    """Format and push an oncall ntfy alert for a watchdog event."""
+    host = HOSTNAME
+    if event == "down":
+        reason = info.get("reason", "")
+        tags = ["rotating_light"] + (["warning"] if reason.startswith("OOM") else [])
+        send_ntfy(
+            f"Model on {host} is DOWN: {reason}. "
+            f"model={info.get('model') or '?'}. Attempting auto-revive.",
+            title=f"{host} model down", priority="urgent", tags=tags,
+        )
+    elif event == "revived":
+        send_ntfy(
+            f"Auto-revive attempt {info.get('attempt')} on {host} triggered "
+            f"({info.get('detail')}). Watching for recovery.",
+            title=f"{host} model revive", priority="default", tags=["recycle"],
+        )
+    elif event == "revive_failed":
+        send_ntfy(
+            f"Auto-revive attempt {info.get('attempt')} on {host} FAILED: "
+            f"{info.get('detail')}.",
+            title=f"{host} revive failed", priority="high", tags=["warning"],
+        )
+    elif event == "gave_up":
+        send_ntfy(
+            f"Gave up auto-reviving model on {host} after "
+            f"{MAX_REVIVE_ATTEMPTS} attempts. Manual intervention needed.",
+            title=f"{host} revive gave up", priority="urgent",
+            tags=["rotating_light", "sos"],
+        )
+
+
+class WatchdogState:
+    """State machine that turns a stream of (healthy?) probes into alerts and
+    bounded auto-revive attempts. Kept side-effect-injectable so the transition
+    logic is unit-testable without threads, sleeps, docker, or the network."""
+
+    def __init__(self):
+        # The model has come up at least once this episode. Until it does we
+        # never alarm — a never-healthy probe is first boot, not a crash.
+        self.seen_healthy = False
+        # Ready to fire the "down" alert for the current crash episode.
+        self.armed = True
+        self.attempts = 0
+        self.down_since = None       # monotonic time the probe first failed
+        self.next_attempt_at = 0.0   # backoff gate for the next revive
+        self.gave_up = False
+        self.last_reason = None
+
+    def summary(self, now=None):
+        now = time.monotonic() if now is None else now
+        return {
+            "armed": self.armed,
+            "attempts": self.attempts,
+            "max_attempts": MAX_REVIVE_ATTEMPTS,
+            "down_seconds": (now - self.down_since) if self.down_since else 0,
+            "gave_up": self.gave_up,
+            "last_reason": self.last_reason,
+        }
+
+    def _reset(self):
+        self.armed = True
+        self.attempts = 0
+        self.down_since = None
+        self.next_attempt_at = 0.0
+        self.gave_up = False
+
+    def tick(self, now, status, control_busy, *,
+             classify=None, revive=None, notify=None, model=None):
+        """Advance the machine one probe. `status` is "ready"|"loading"|"down"."""
+        classify = classify or _classify_crash_now
+        revive = revive or _revive_model
+        notify = notify or _watchdog_notify
+
+        if control_busy or status == "loading":
+            # A switch/install/restart — or a model still loading its weights —
+            # is legitimately not serving; don't count that as a crash. Pause
+            # the down clock and wait.
+            self.down_since = None
+            return
+        if status == "ready":
+            self.seen_healthy = True
+            if not self.armed or self.attempts or self.down_since is not None:
+                self._reset()
+            return
+        # status == "down": the model is unreachable.
+        if not self.seen_healthy:
+            return
+        if self.down_since is None:
+            self.down_since = now
+            return
+        if now - self.down_since < WATCHDOG_DOWN_GRACE:
+            return  # ride out a transient blip before declaring a crash
+        # Crash confirmed.
+        if self.armed:
+            self.armed = False
+            reason = classify()
+            self.last_reason = reason
+            audit("watchdog", f"model down: {reason}")
+            notify("down", reason=reason, model=model)
+        if self.attempts >= MAX_REVIVE_ATTEMPTS:
+            if not self.gave_up:
+                self.gave_up = True
+                audit("watchdog", f"giving up after {self.attempts} revive attempts")
+                notify("gave_up")
+            return
+        if now < self.next_attempt_at:
+            return  # backing off between attempts
+        self.attempts += 1
+        ok, detail = revive()
+        audit("watchdog",
+              f"revive attempt {self.attempts}: {'ok' if ok else 'failed'} {detail}")
+        notify("revived" if ok else "revive_failed",
+               attempt=self.attempts, detail=detail)
+        # Restart the grace + backoff clocks so the model gets time to boot
+        # before we count it down again or retry.
+        self.down_since = now
+        self.next_attempt_at = now + REVIVE_BACKOFF_BASE * (2 ** self.attempts)
+
+
+_watchdog = WatchdogState()
+
+
+def watch_model_health(monitor_port):
+    """Daemon loop: probe the model and drive the crash/alert/revive machine."""
+    while True:
+        try:
+            status = probe_model_state(monitor_port)
+            _watchdog.tick(
+                time.monotonic(), status, _control_lock.locked(),
+                model=state.model_name,
+            )
+        except Exception as e:
+            print(f"WARNING: watchdog tick error: {e}", file=sys.stderr)
+        time.sleep(WATCHDOG_INTERVAL)
+
+
 def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINER,
                    model_repo=DEFAULT_MODEL_REPO):
     global _started
@@ -4378,6 +4658,13 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
             target=poll_repo,
             args=(model_repo,),
             name="observer-repo",
+            daemon=True,
+        ).start()
+    if WATCHDOG_ENABLED:
+        threading.Thread(
+            target=watch_model_health,
+            args=(monitor_port,),
+            name="observer-watchdog",
             daemon=True,
         ).start()
     print(

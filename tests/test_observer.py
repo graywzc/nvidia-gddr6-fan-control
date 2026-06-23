@@ -2467,6 +2467,205 @@ class RunningInstalledSeedTests(unittest.TestCase):
         st.set_catalog(self.CATALOG)
         st.set_model_info({})
         self.assertEqual(st.snapshot()["installed_assets"], {})
+class SendNtfyTests(unittest.TestCase):
+    def test_posts_to_topic_with_headers(self):
+        captured = {}
+
+        class Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=5):
+            captured["url"] = req.full_url
+            captured["data"] = req.data
+            captured["method"] = req.get_method()
+            captured["headers"] = dict(req.header_items())
+            return Resp()
+
+        with mock.patch.object(aipc_observer.urllib.request, "urlopen", fake_urlopen):
+            ok = aipc_observer.send_ntfy(
+                "boom", title="host model down", priority="urgent",
+                tags=["rotating_light", "warning"],
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            captured["url"],
+            f"{aipc_observer.NTFY_SERVER}/{aipc_observer.NTFY_TOPIC}",
+        )
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["data"], b"boom")
+        # urllib title-cases header keys.
+        self.assertEqual(captured["headers"]["Priority"], "urgent")
+        self.assertEqual(captured["headers"]["Title"], "host model down")
+        self.assertEqual(
+            captured["headers"]["Tags"], "rotating_light,warning"
+        )
+
+    def test_network_error_returns_false_without_raising(self):
+        def boom(req, timeout=5):
+            raise OSError("no route to host")
+
+        with mock.patch.object(aipc_observer.urllib.request, "urlopen", boom):
+            self.assertFalse(aipc_observer.send_ntfy("x", title="t"))
+
+
+class ClassifyCrashTests(unittest.TestCase):
+    def test_oom_log_signature_wins(self):
+        logs = ["loading model", "ggml_cuda: CUDA out of memory trying to allocate"]
+        reason = aipc_observer.classify_crash("c", logs, runner=lambda *a, **k: "")
+        self.assertTrue(reason.startswith("OOM"))
+
+    def test_oom_killed_from_inspect(self):
+        reason = aipc_observer.classify_crash(
+            "c", ["plain log"], runner=lambda *a, **k: "true 137"
+        )
+        self.assertEqual(reason, "OOM (killed)")
+
+    def test_exit_137_from_inspect(self):
+        reason = aipc_observer.classify_crash(
+            "c", [], runner=lambda *a, **k: "false 137"
+        )
+        self.assertEqual(reason, "OOM (exit 137)")
+
+    def test_nonzero_exit_is_crash(self):
+        reason = aipc_observer.classify_crash(
+            "c", [], runner=lambda *a, **k: "false 1"
+        )
+        self.assertEqual(reason, "crash (exit 1)")
+
+    def test_clean_state_is_unresponsive(self):
+        reason = aipc_observer.classify_crash(
+            "c", ["all good"], runner=lambda *a, **k: "false 0"
+        )
+        self.assertEqual(reason, "unresponsive")
+
+    def test_inspect_failure_falls_back_to_unresponsive(self):
+        def boom(*a, **k):
+            raise RuntimeError("No such container")
+
+        self.assertEqual(
+            aipc_observer.classify_crash("gone", [], runner=boom), "unresponsive"
+        )
+
+
+class ProbeModelStateTests(unittest.TestCase):
+    def _probe(self, status_code, model):
+        with mock.patch.object(aipc_observer, "http_status",
+                               return_value=status_code), \
+             mock.patch.object(aipc_observer, "detect_model",
+                               return_value=model):
+            return aipc_observer.probe_model_state(8020)
+
+    def test_health_200_is_ready(self):
+        # Even if /v1/models is momentarily empty, a 200 /health means ready.
+        self.assertEqual(self._probe(200, None), "ready")
+
+    def test_health_503_is_loading(self):
+        self.assertEqual(self._probe(503, None), "loading")
+
+    def test_health_unreachable_falls_back_to_models(self):
+        # No /health (e.g. a build without it): /v1/models still answers.
+        self.assertEqual(self._probe(None, "qwen.gguf"), "ready")
+
+    def test_both_unreachable_is_down(self):
+        self.assertEqual(self._probe(None, None), "down")
+
+
+class WatchdogStateTests(unittest.TestCase):
+    def setUp(self):
+        self.wd = aipc_observer.WatchdogState()
+        self.events = []
+        self.revives = 0
+        self.revive_result = (True, "preset=baseline")
+
+    def _notify(self, event, **info):
+        self.events.append((event, info))
+
+    def _classify(self):
+        return "OOM (test)"
+
+    def _revive(self):
+        self.revives += 1
+        return self.revive_result
+
+    def tick(self, now, status, control_busy=False):
+        self.wd.tick(
+            now, status, control_busy,
+            classify=self._classify, revive=self._revive, notify=self._notify,
+        )
+
+    def test_never_healthy_never_alarms(self):
+        # Probes fail from the start (e.g. first boot) — no crash declared.
+        for now in range(0, 200, 5):
+            self.tick(now, "down")
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.revives, 0)
+
+    def test_healthy_then_crash_alerts_and_revives_once(self):
+        self.tick(0, "ready")               # establish health
+        self.tick(5, "down")                # down starts, within grace
+        self.tick(10, "down")               # still grace
+        # Cross the grace window: confirmed crash.
+        self.tick(5 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        names = [e for e, _ in self.events]
+        self.assertEqual(names.count("down"), 1)
+        self.assertEqual(names.count("revived"), 1)
+        self.assertEqual(self.revives, 1)
+        down_info = next(i for e, i in self.events if e == "down")
+        self.assertEqual(down_info["reason"], "OOM (test)")
+
+    def test_control_busy_suppresses_alarm(self):
+        self.tick(0, "ready")
+        # A switch is intentionally taking the model down across the window.
+        for now in range(5, 5 + int(aipc_observer.WATCHDOG_DOWN_GRACE) + 20, 5):
+            self.tick(now, "down", control_busy=True)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.revives, 0)
+
+    def test_loading_status_suppresses_alarm(self):
+        # A model still loading its weights (llama.cpp /health 503) is not a
+        # crash, even past the grace window.
+        self.tick(0, "ready")
+        for now in range(5, 5 + int(aipc_observer.WATCHDOG_DOWN_GRACE) + 20, 5):
+            self.tick(now, "loading")
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.revives, 0)
+
+    def test_crash_loop_gives_up_after_max_attempts(self):
+        self.revive_result = (False, "still OOM")
+        self.tick(0, "ready")
+        now = 5
+        # Drive enough failing-down ticks to exhaust retries + backoff.
+        for _ in range(400):
+            now += 5
+            self.tick(now, "down")
+            if any(e == "gave_up" for e, _ in self.events):
+                break
+        self.assertEqual(self.revives, aipc_observer.MAX_REVIVE_ATTEMPTS)
+        names = [e for e, _ in self.events]
+        self.assertEqual(names.count("down"), 1)
+        self.assertEqual(names.count("gave_up"), 1)
+        self.assertEqual(names.count("revive_failed"),
+                         aipc_observer.MAX_REVIVE_ATTEMPTS)
+
+    def test_recovery_rearms_for_next_episode(self):
+        self.tick(0, "ready")
+        self.tick(5, "down")                # down-clock starts
+        self.tick(5 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        self.assertEqual([e for e, _ in self.events].count("down"), 1)
+        # Model recovers, then crashes again later — should alert a second time.
+        self.tick(1000, "ready")
+        self.assertEqual(self.wd.attempts, 0)
+        self.assertTrue(self.wd.armed)
+        self.tick(2000, "down")             # down-clock starts again
+        self.tick(2000 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        self.assertEqual([e for e, _ in self.events].count("down"), 2)
 
 
 if __name__ == "__main__":
