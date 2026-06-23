@@ -137,6 +137,9 @@ class ObserverState:
         self.docker_logs = deque(maxlen=500)
         # Recent end-to-end model-load profiles (button click -> serving).
         self.load_profiles = deque(maxlen=LOAD_PROFILE_HISTORY)
+        # Most recent model start action (merged install+start/switch).
+        self.last_start = {}
+        self.last_start_log = deque(maxlen=400)
 
     def add_request(self, req):
         with self.lock:
@@ -359,6 +362,33 @@ class ObserverState:
             except ValueError:
                 pass
 
+    def start_run(self, action, variant, preset, cache_ram):
+        """Begin tracking a model start/switch run."""
+        with self.lock:
+            self.last_start_log.clear()
+            self.last_start = {
+                "action": action,
+                "variant": variant,
+                "preset": preset,
+                "cache_ram": cache_ram,
+                "started_at": time.time(),
+                "finished_at": None,
+                "ok": None,
+                "detail": "",
+            }
+
+    def append_start_log(self, line):
+        """Append a raw log line to the start log buffer."""
+        with self.lock:
+            self.last_start_log.append(str(line).rstrip())
+
+    def finish_run(self, ok, detail):
+        """Mark the current start run as completed."""
+        with self.lock:
+            self.last_start["finished_at"] = time.time()
+            self.last_start["ok"] = ok
+            self.last_start["detail"] = str(detail)
+
     def snapshot(self):
         # Serialize any in-flight load before taking self.lock: as_dict() samples
         # VRAM, which itself grabs self.lock — doing it inside would deadlock.
@@ -406,6 +436,10 @@ class ObserverState:
                         key=lambda r: r.get("start_time", 0),
                     )
                 ],
+                "last_start": {
+                    **self.last_start,
+                    "log": list(self.last_start_log),
+                },
             }
 
 
@@ -2362,6 +2396,12 @@ def _set_control_status(action, detail, done=False, ok=None, **extra):
     state.notify_subscribers()
 
 
+def _start_step(action, detail, **extra):
+    """Log a step to both the start log and the control status."""
+    state.append_start_log(detail)
+    _set_control_status(action, detail, **extra)
+
+
 def _wait_for_model_info(monitor_port, timeout=120):
     """Wait for the freshly booted container to become inspectable."""
     deadline = time.time() + timeout
@@ -2388,12 +2428,13 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
     load), and the final ready-wait that marks the model actually serving.
     """
     ready_waiter = ready_waiter or wait_until_serving
+    state.start_run("start", variant, preset, cache_ram)
     try:
         with profiled_load("switch", variant=variant, preset=preset,
                            started_at=started_at) as profile:
             try:
                 print(f"[observer] _switch_worker: START variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
-                _set_control_status(
+                _start_step(
                     "switch", f"switching to {variant} — old model stopping, "
                               "new model loading (takes a few minutes)…"
                 )
@@ -2402,7 +2443,7 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                     switch_model(repo, variant, monitor_port, force=force,
                                  runner=runner)
                 print(f"[observer] _switch_worker: switch_model() returned OK", flush=True)
-                _set_control_status(
+                _start_step(
                     "switch", f"{variant} is up; applying mode {preset} + cache "
                               f"{'on' if cache_ram else 'off'} + log rotation "
                               "(one more model reload)…"
@@ -2420,11 +2461,13 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                 dropped = result.get("dropped_capabilities") or []
                 note = (f" — this build can't do {', '.join(dropped)}"
                         if dropped else "")
-                _set_control_status(
-                    "switch", f"switched to {variant} (mode {result['preset']}, "
-                              f"cache {'on' if result.get('cache_ram') else 'off'}){note}",
+                detail = f"switched to {variant} (mode {result['preset']}, " \
+                         f"cache {'on' if result.get('cache_ram') else 'off'}){note}"
+                _start_step(
+                    "switch", detail,
                     done=True, ok=True
                 )
+                state.finish_run(True, detail)
                 print(f"[observer] _switch_worker: DONE variant={variant!r}", flush=True)
                 audit("switch-done", f"variant={variant} preset={preset} "
                                      f"cache_ram={cache_ram}")
@@ -2436,6 +2479,7 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                 if setup:
                     setup.update({"variant": variant, "preset": preset,
                                   "force": force, "cache_ram": cache_ram})
+                state.finish_run(False, str(e))
                 _set_control_status(
                     "switch", f"switch to {variant} failed: {e}", done=True,
                     ok=False, install_hint=setup or None,
@@ -2449,23 +2493,26 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     override_path=OVERRIDE_FILE, cache_ram=False,
                     started_at=None, ready_waiter=None):
     ready_waiter = ready_waiter or wait_until_serving
+    state.start_run("start", variant, preset, cache_ram)
     try:
         with profiled_load("install", variant=variant, preset=preset,
                            started_at=started_at) as profile:
             try:
                 print(f"[observer] _install_worker: START variant={variant!r} preset={preset!r} retry={retry}", flush=True)
-                _set_control_status(
+                _start_step(
                     "install", f"installing assets for {variant} (can take a while)…"
                 )
                 last_progress_at = [0.0]
 
                 def progress(line):
+                    # Append every raw line to the start log immediately.
+                    state.append_start_log(line)
                     now = time.monotonic()
                     if now - last_progress_at[0] < 0.75:
                         return
                     last_progress_at[0] = now
                     clean = re.sub(r"\s+", " ", str(line or "")).strip()
-                    _set_control_status(
+                    _start_step(
                         "install", _install_progress_detail(variant, clean),
                         progress_line=clean[-500:],
                     )
@@ -2481,15 +2528,17 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 })
                 state.notify_subscribers()
                 if not retry:
-                    _set_control_status(
-                        "install", f"installed assets for {variant}",
+                    detail = f"installed assets for {variant}"
+                    _start_step(
+                        "install", detail,
                         done=True, ok=True, installed_variant=variant,
                     )
+                    state.finish_run(True, detail)
                     audit("install-done", f"variant={variant}")
                     print(f"[observer] _install_worker: DONE (no retry) variant={variant!r}", flush=True)
                     return
                 print(f"[observer] _install_worker: assets installed, calling switch_model() for retry", flush=True)
-                _set_control_status(
+                _start_step(
                     "install", f"installed assets for {variant}; retrying switch…",
                     installed_variant=variant,
                 )
@@ -2497,7 +2546,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     switch_model(repo, variant, monitor_port, force=force,
                                  runner=runner)
                 print(f"[observer] _install_worker: switch_model() returned OK after install", flush=True)
-                _set_control_status(
+                _start_step(
                     "switch", f"{variant} is up; applying mode {preset} + cache "
                               f"{'on' if cache_ram else 'off'} + log rotation "
                               "(one more model reload)…"
@@ -2512,11 +2561,13 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                                   override_path=override_path)
                 with profile.phase("ready_wait"):
                     ready_waiter(monitor_port)
-                _set_control_status(
-                    "switch", f"switched to {variant} (mode {preset}, "
-                              f"cache {'on' if cache_ram else 'off'})",
+                detail = f"switched to {variant} (mode {preset}, " \
+                         f"cache {'on' if cache_ram else 'off'})"
+                _start_step(
+                    "switch", detail,
                     done=True, ok=True
                 )
+                state.finish_run(True, detail)
                 print(f"[observer] _install_worker: DONE (with retry) variant={variant!r}", flush=True)
                 audit("install-switch-done", f"variant={variant} preset={preset} "
                                              f"cache_ram={cache_ram}")
@@ -2524,6 +2575,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 profile.fail(e)
                 print(f"[observer] _install_worker: FAILED variant={variant!r} error={e!r}", flush=True)
                 audit("install-failed", f"variant={variant}: {e}")
+                state.finish_run(False, str(e))
                 _set_control_status(
                     "install", f"install for {variant} failed: {e}",
                     done=True, ok=False,
@@ -3734,7 +3786,10 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2><span>Model Config</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="modelInfo"></div>
 <div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · debug: add engine-specific observability/debug flags">
 <option value="baseline">baseline</option><option value="debug" selected>debug</option>
-</select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div></section>
+</select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div>
+<div id="lastStartSummary" style="padding:8px 0;font-size:12px"></div>
+<div id="lastStartLog" class="docker-logs" style="max-height:180px;min-height:24px;border-top:1px solid var(--border);padding:4px 0"></div>
+</section>
 <section class="card"><h2><span>club-3090 Catalog</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="catalogInfo"></div></section>
 <section class="card"><h2><span>Server Metrics</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="metricsInfo"></div></section>
 <section class="card full" id="vllmTimelineCard"><h2><span>vLLM Activity (live)</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="vllmTimeline"></div></section>
@@ -3793,26 +3848,21 @@ function cls(t){return t>85?'critical':t>75?'hot':''}
 function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
 let lastActive=0;
 let lastBusy=false;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderLastStart(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
-if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doInstallVariant('${esc(h.variant)}','${esc(h.preset||selectedPreset())}',${h.force?'true':'false'},true,'${esc(h.model||'')}','${esc(h.weight_key||'')}','${esc(h.model_dir||'')}')">Install + retry</button>`}st.innerHTML=msg}
+if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doStartOrSwitch('${esc(h.variant)}','${esc(h.status||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
 // Restart/Stop act on a running container; when nothing is up they 409 or
 // no-op, so disable them and point at the catalog's Start buttons instead.
 let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
 if(rb){rb.disabled=lastBusy||!running;rb.title=running?'':'no model running — use Start in the Catalog below'}
 if(sb){sb.disabled=lastBusy||!running;sb.title=running?'':'no model running'}}
-function doSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();console.log('[observer] doSwitch called:',{variant:v,status:p,cache,lastActive,lastBusy:!!lastBusy});let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
-let confirmMsg=`Switch model to '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThe current model stops, then the new one loads — takes a few minutes.${exp}${warn}`;
-console.log('[observer] doSwitch confirm:',confirmMsg);
-if(!confirm(confirmMsg)){console.log('[observer] doSwitch cancelled by user');return;}
-let body={variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats')};
-console.log('[observer] doSwitch posting:',JSON.stringify(body));
-ctlPost('/observer/api/switch',body).then(r=>{console.log('[observer] doSwitch success:',JSON.stringify(r));document.getElementById('ctlStatus').textContent='⏳ switch started…'}).catch(e=>{console.error('[observer] doSwitch failed:',e);document.getElementById('ctlStatus').textContent='✗ '+e.message})}
-function doStart(v,status){let p=selectedPreset(),cache=selectedCacheRam();let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
-if(!confirm(`Start model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nNo model is running — this boots the variant and waits for it to load, which takes a few minutes.${exp}`))return;
-ctlPost('/observer/api/switch',{variant:v,preset:p,cache_ram:cache,force:(status!=='production'&&status!=='caveats')}).then(()=>{document.getElementById('ctlStatus').textContent='⏳ starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
-function doInstallVariant(v,preset,force,retry,model,weightKey,modelDir){let msg=retry?`Install missing assets for '${v}' and retry switch?`:`Install assets for '${v}'?`;if(!confirm(msg))return;let body={variant:v,preset:preset||selectedPreset(),cache_ram:selectedCacheRam(),force:!!force,retry:!!retry};if(model)body.model=model;if(weightKey)body.weight_key=weightKey;if(modelDir)body.model_dir=modelDir;ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent=retry?'⏳ installing, then retrying switch…':'⏳ installing…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function doStartOrSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
+let confirmMsg=`Start/switch model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThis downloads any missing files, then boots — takes a few minutes.${exp}${warn}`;
+if(!confirm(confirmMsg))return;
+let body={variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats'),retry:true};
+ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent='⏳ preparing & starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+function renderLastStart(d){let ls=d.last_start||{};let sumEl=document.getElementById('lastStartSummary');let logEl=document.getElementById('lastStartLog');if(!sumEl||!logEl)return;if(!ls.started_at){sumEl.innerHTML='<span class="label">No model start recorded yet.</span>';logEl.innerHTML='';return}let icon=ls.ok===true?'✓':(ls.ok===false?'✗':'⏳');let variant=ls.variant||'?';let preset=ls.preset||'?';let cacheLabel=ls.cache_ram?'on':'off';let endAt=ls.finished_at||Date.now()/1000;let dur=endAt-ls.started_at;let dm=Math.floor(dur/60);let ds=Math.floor(dur%60);let durStr=dm>0?`${dm}m ${ds}s`:`${ds}s`;let cls=ls.ok===true?'good':(ls.ok===false?'critical':'hot');sumEl.innerHTML=`<span class="${cls}">${icon} ${esc(variant)} · mode ${esc(preset)} · cache ${cacheLabel} · ${durStr}</span>`;let lines=ls.log||[];if(!lines.length){logEl.innerHTML='<div class="label" style="padding:4px 0">No log captured yet.</div>';return}let html=lines.map(l=>`<div class="log-line">${esc(l)}</div>`).join('');logEl.innerHTML=html;logEl.scrollTop=logEl.scrollHeight}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
 let vllm=m.engine==='vllm';
@@ -3901,8 +3951,8 @@ function renderVariantListModal(d,fits,runKey,running,topo){let c=d.catalog||{};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let visible=new Set(fits);compareSelections.forEach(k=>{if(!visible.has(k))compareSelections.delete(k)});
 let rows='<div class="compare-toolbar"><button id="btnCompareVariants" class="btn" onclick="compareSelectedVariants()">Compare commands</button><span id="compareCount" class="label">0 selected</span><span class="label">select 2-4 variants</span></div><div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="${running?'doSwitch':'doStart'}('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let install=installingVariant?`<span class="hot">installing…</span>`:((k===runKey||installed[k])?'<span class="good">installed</span>':`<button class="btn" style="padding:2px 8px;font-size:11px" onclick="doInstallVariant('${esc(k)}',selectedPreset(),false,false,'','','')"${lastBusy?' disabled':''}>install</button>`);let checked=compareSelections.has(k)?' checked':'';
-return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${install}${action}</span></div>`}).join('');
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let installedLabel=installed[k]?'<span class="good">installed</span>':'<span class="label">needs download</span>';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStartOrSwitch('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let installing=installingVariant?`<span class="hot">installing…</span>`:'';let checked=compareSelections.has(k)?' checked':'';
+return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${installing}${k!==runKey?installedLabel:''}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;
 document.getElementById('variantModalBody').innerHTML=rows;
