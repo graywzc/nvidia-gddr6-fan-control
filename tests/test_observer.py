@@ -2250,6 +2250,144 @@ class SwitchWorkerTests(unittest.TestCase):
         self.assertTrue(snap["control_busy"])
 
 
+class LastStartTests(unittest.TestCase):
+    """Tests for the merged install+start last_start tracking."""
+
+    def test_start_run_clears_log_and_sets_metadata(self):
+        st = aipc_observer.ObserverState()
+        st.append_start_log("stale line")
+        st.start_run("start", "eng/prod", "debug", True)
+        self.assertEqual(st.last_start["action"], "start")
+        self.assertEqual(st.last_start["variant"], "eng/prod")
+        self.assertEqual(st.last_start["preset"], "debug")
+        self.assertTrue(st.last_start["cache_ram"])
+        self.assertIsNotNone(st.last_start["started_at"])
+        self.assertIsNone(st.last_start["finished_at"])
+        self.assertIsNone(st.last_start["ok"])
+        # Log was cleared.
+        self.assertEqual(list(st.last_start_log), [])
+
+    def test_append_start_log_adds_lines(self):
+        st = aipc_observer.ObserverState()
+        st.append_start_log("line one")
+        st.append_start_log("line two  ")
+        self.assertEqual(list(st.last_start_log), ["line one", "line two"])
+
+    def test_finish_run_sets_completion_fields(self):
+        st = aipc_observer.ObserverState()
+        st.start_run("start", "eng/prod", "debug", False)
+        st.finish_run(True, "all good")
+        self.assertIsNotNone(st.last_start["finished_at"])
+        self.assertTrue(st.last_start["ok"])
+        self.assertEqual(st.last_start["detail"], "all good")
+
+    def test_snapshot_includes_last_start_with_log(self):
+        st = aipc_observer.ObserverState()
+        st.start_run("start", "eng/prod", "baseline", False)
+        st.append_start_log("step 1")
+        st.append_start_log("step 2")
+        st.finish_run(True, "done")
+        snap = st.snapshot()
+        ls = snap["last_start"]
+        self.assertEqual(ls["variant"], "eng/prod")
+        self.assertEqual(ls["preset"], "baseline")
+        self.assertEqual(ls["ok"], True)
+        self.assertEqual(ls["log"], ["step 1", "step 2"])
+
+    def test_snapshot_empty_last_start(self):
+        st = aipc_observer.ObserverState()
+        snap = st.snapshot()
+        self.assertIn("last_start", snap)
+        self.assertEqual(snap["last_start"]["log"], [])
+
+    def test_install_worker_retry_populates_last_start(self):
+        import tempfile
+
+        self.assertTrue(aipc_observer._control_lock.acquire(blocking=False))
+        tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
+        tmp.close()
+        try:
+            runner = FakeRunner()
+            aipc_observer.state.set_catalog(SWITCH_CATALOG)
+            aipc_observer._install_worker(
+                "/repo", "eng/prod", "baseline", 8020, False, True,
+                {}, runner=runner,
+                info_getter=lambda port: dict(MODEL_INFO),
+                override_path=tmp.name,
+                ready_waiter=lambda port: 0.0,
+            )
+            ls = aipc_observer.state.last_start
+            self.assertIsNotNone(ls["started_at"])
+            self.assertTrue(ls["ok"])
+            self.assertEqual(ls["variant"], "eng/prod")
+            self.assertEqual(ls["preset"], "baseline")
+            self.assertGreater(len(list(aipc_observer.state.last_start_log)), 0)
+        finally:
+            import os
+
+            if aipc_observer._control_lock.locked():
+                aipc_observer._control_lock.release()
+            os.unlink(tmp.name)
+
+    def test_switch_worker_failure_sets_last_start_ok_false(self):
+        self.assertTrue(aipc_observer._control_lock.acquire(blocking=False))
+        try:
+            def failing_runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
+                raise RuntimeError("switch failed: no such variant")
+
+            aipc_observer._switch_worker(
+                "/repo", "eng/prod", "debug", 8020, False,
+                runner=failing_runner,
+            )
+            ls = aipc_observer.state.last_start
+            self.assertFalse(ls["ok"])
+            self.assertIn("no such variant", ls["detail"])
+        finally:
+            if aipc_observer._control_lock.locked():
+                aipc_observer._control_lock.release()
+
+    def test_install_progress_callback_logs_every_line(self):
+        """Lines inside the throttle window must still appear in last_start_log.
+
+        The progress callback appends every raw line to last_start_log BEFORE
+        the 0.75s throttle check. This test fires several lines in rapid
+        succession (all within the throttle window) and verifies none are
+        dropped from the log.
+        """
+        self.assertTrue(aipc_observer._control_lock.acquire(blocking=False))
+        try:
+            aipc_observer.state.set_catalog(SWITCH_CATALOG)
+
+            def fake_rwp(cmd, env=None, cwd=None, timeout=None, on_line=None):
+                for i in range(5):
+                    on_line(f"download line {i}")
+                return ""
+
+            with mock.patch.object(
+                aipc_observer, "_run_with_progress", fake_rwp
+            ):
+                aipc_observer._install_worker(
+                    "/repo", "eng/prod", "baseline", 8020, False, False,
+                    {}, runner=aipc_observer._run,
+                )
+
+            log = list(aipc_observer.state.last_start_log)
+            # All 5 rapid lines must be present — throttling only gates
+            # _set_control_status, not the log append.
+            for i in range(5):
+                self.assertIn(f"download line {i}", log)
+        finally:
+            if aipc_observer._control_lock.locked():
+                aipc_observer._control_lock.release()
+
+    def test_snapshot_log_is_a_list_not_deque(self):
+        st = aipc_observer.ObserverState()
+        st.start_run("start", "v", "baseline", False)
+        st.append_start_log("x")
+        snap = st.snapshot()
+        self.assertIsInstance(snap["last_start"]["log"], list)
+
+
 class DiskstatsParseTests(unittest.TestCase):
     SAMPLE = (
         "   8       0 sda 100 0 2048 50 0 0 0 0 0 0 0\n"
