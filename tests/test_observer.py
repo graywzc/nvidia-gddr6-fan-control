@@ -2469,5 +2469,76 @@ class RunningInstalledSeedTests(unittest.TestCase):
         self.assertEqual(st.snapshot()["installed_assets"], {})
 
 
+class InstallDownloadProgressTests(unittest.TestCase):
+    REAL_LINE = ("[model] qwen3.6-27b:ex0bit-prism-pro-dq -> "
+                 "Ex0bit/Qwen3.6-27B-PRISM-PRO-DQ Qwen3.6-27B-PRISM-PRO-DQ.gguf "
+                 "-> qwen3.6-27b-gguf/ex0bit-prism-pro-dq")
+
+    def test_parse_download_target(self):
+        t = aipc_observer.parse_install_download_target(self.REAL_LINE)
+        self.assertEqual(t["repo"], "Ex0bit/Qwen3.6-27B-PRISM-PRO-DQ")
+        self.assertEqual(t["file"], "Qwen3.6-27B-PRISM-PRO-DQ.gguf")
+        self.assertEqual(t["subdir"], "qwen3.6-27b-gguf/ex0bit-prism-pro-dq")
+
+    def test_parse_ignores_unrelated_line(self):
+        self.assertIsNone(
+            aipc_observer.parse_install_download_target("Fetching 3 files..."))
+
+    def test_scan_incomplete_bytes(self):
+        import tempfile, os
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "a.incomplete"), "wb") as f:
+            f.write(b"x" * 1000)
+        with open(os.path.join(d, "b.incomplete"), "wb") as f:
+            f.write(b"y" * 500)
+        with open(os.path.join(d, "done.gguf"), "wb") as f:
+            f.write(b"z" * 9999)  # not .incomplete -> ignored
+        self.assertEqual(aipc_observer.scan_incomplete_bytes(d), 1500)
+        self.assertEqual(aipc_observer.scan_incomplete_bytes("/no/such/dir"), 0)
+
+    def test_download_dir_resolves_via_model_dir_env(self):
+        import tempfile, os
+        from unittest import mock
+        root = tempfile.mkdtemp()
+        sub = "qwen3.6-27b-gguf/ex0bit-prism-pro-dq"
+        ddir = os.path.join(root, sub, ".cache", "huggingface", "download")
+        os.makedirs(ddir)
+        with mock.patch.dict(os.environ, {"MODEL_DIR": root}):
+            self.assertEqual(aipc_observer._download_dir("/repo", sub), ddir)
+
+    def test_hf_remote_size_uses_injected_fetch_and_caches(self):
+        aipc_observer._hf_size_cache.pop(("org/m", "f.gguf", "main"), None)
+        calls = []
+
+        def fake(url):
+            calls.append(url)
+            return 12345
+
+        self.assertEqual(aipc_observer.hf_remote_size("org/m", "f.gguf", fetch=fake), 12345)
+        # second call is served from cache (fetch not invoked again)
+        self.assertEqual(aipc_observer.hf_remote_size("org/m", "f.gguf"), 12345)
+        self.assertEqual(len(calls), 1)
+
+    def test_sample_download_sets_live_progress(self):
+        import tempfile, os
+        from unittest import mock
+        root = tempfile.mkdtemp()
+        sub = "gguf/x"
+        ddir = os.path.join(root, sub, ".cache", "huggingface", "download")
+        os.makedirs(ddir)
+        with open(os.path.join(ddir, "w.incomplete"), "wb") as f:
+            f.write(b"x" * 4_000_000)
+        aipc_observer._hf_size_cache[("org/m", "w.gguf", "main")] = 10_000_000
+        prof = aipc_observer.LoadProfile("install", variant="v")
+        prof.set_download_target({"repo": "org/m", "file": "w.gguf", "subdir": sub})
+        with mock.patch.dict(os.environ, {"MODEL_DIR": root}):
+            aipc_observer._sample_download(prof, "/repo", 100.0, (90.0, 0))
+        dl = prof.as_dict()["download"]
+        self.assertEqual(dl["downloaded_bytes"], 4_000_000)
+        self.assertEqual(dl["total_bytes"], 10_000_000)
+        self.assertEqual(dl["pct"], 40.0)
+        self.assertGreater(dl["speed_bps"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

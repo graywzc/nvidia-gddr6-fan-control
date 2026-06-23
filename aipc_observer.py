@@ -1965,6 +1965,105 @@ def parse_engine_load_line(line):
     return None
 
 
+# --- install download progress ----------------------------------------------
+#
+# hf/huggingface_hub hides its progress bar when stdout is a pipe, so a large
+# weights download looks frozen on the dashboard even though it's flowing.
+# setup.sh prints one line naming the repo/file/subdir just before the (silent)
+# download, so we capture that, then sample the on-disk *.incomplete file the hf
+# downloader writes to compute live bytes + speed, and HEAD the HF CDN once for
+# the total so we can show a percentage.
+
+INSTALL_DOWNLOAD_RE = re.compile(
+    r"->\s+(?P<repo>[\w.\-]+/[\w.\-]+)\s+(?P<file>\S+)\s+->\s+(?P<subdir>\S+)")
+
+
+def parse_install_download_target(line):
+    """Pull (repo, file, subdir) from a setup.sh '[model] … -> repo file -> dir' line."""
+    m = INSTALL_DOWNLOAD_RE.search(line or "")
+    if not m:
+        return None
+    return {"repo": m.group("repo"), "file": m.group("file"),
+            "subdir": m.group("subdir")}
+
+
+def _read_env_model_dir(repo):
+    """MODEL_DIR pinned in the club-3090 checkout's .env, if any."""
+    try:
+        with open(os.path.join(repo, ".env")) as f:
+            for ln in f:
+                m = re.match(r"\s*(?:export\s+)?MODEL_DIR=(.+)", ln)
+                if m:
+                    return m.group(1).strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def _download_dir(repo, subdir):
+    """Locate hf's in-progress download dir for a target subdir, or None.
+
+    setup.sh resolves MODEL_DIR as shell env → repo/.env → repo/models-cache; hf
+    writes `<root>/<subdir>/.cache/huggingface/download/*.incomplete`.
+    """
+    roots = [os.environ.get("MODEL_DIR"), _read_env_model_dir(repo)]
+    if repo:
+        roots.append(os.path.join(repo, "models-cache"))
+    for root in roots:
+        if not root:
+            continue
+        d = os.path.join(root, subdir, ".cache", "huggingface", "download")
+        if os.path.isdir(d):
+            return d
+    return None
+
+
+def scan_incomplete_bytes(download_dir):
+    """Sum the sizes of hf's *.incomplete files in a download dir."""
+    total = 0
+    try:
+        for name in os.listdir(download_dir):
+            if name.endswith(".incomplete"):
+                try:
+                    total += os.path.getsize(os.path.join(download_dir, name))
+                except OSError:
+                    pass
+    except OSError:
+        return 0
+    return total
+
+
+_hf_size_cache = {}
+
+
+def hf_remote_size(repo, filename, fetch=None, revision="main"):
+    """Content-Length of an HF file for the % readout. Best-effort, cached."""
+    key = (repo, filename, revision)
+    if key in _hf_size_cache:
+        return _hf_size_cache[key]
+    size = None
+    url = f"https://huggingface.co/{repo}/resolve/{revision}/{filename}"
+    try:
+        if fetch is not None:
+            size = fetch(url)
+        else:
+            req = urllib.request.Request(url, method="HEAD")
+            tok = (os.environ.get("HF_TOKEN")
+                   or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+            if tok:
+                req.add_header("Authorization", f"Bearer {tok}")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                # LFS files expose the real size as X-Linked-Size on the resolve
+                # response; Content-Length covers the redirected CDN response.
+                cl = (resp.headers.get("X-Linked-Size")
+                      or resp.headers.get("Content-Length"))
+                size = int(cl) if cl else None
+    except Exception:
+        size = None
+    _hf_size_cache[key] = size
+    return size
+
+
 class LoadProfile:
     """Times one end-to-end model load and attributes it to phases/resources."""
 
@@ -1974,6 +2073,11 @@ class LoadProfile:
         self.variant = variant
         self.preset = preset
         self.started_at = started_at or time.time()
+        # Set from setup.sh output during an install so the sampler knows which
+        # on-disk download to watch; `download` is the live bytes/speed readout.
+        self.download_target = None
+        self.download = None
+        self._dl_done = False
         self.phases = []            # [{name, start, end, duration}]
         self.engine_phases = {}     # sub_phase -> seconds (from container logs)
         self.start_resources = sample_resources()
@@ -2035,6 +2139,15 @@ class LoadProfile:
             if bps > self.peak_disk_read_bps:
                 self.peak_disk_read_bps = bps
 
+    def set_download_target(self, target):
+        with self.lock:
+            self.download_target = dict(target) if target else None
+            self._dl_done = False
+
+    def set_download(self, info):
+        with self.lock:
+            self.download = dict(info) if info else None
+
     def fail(self, msg):
         with self.lock:
             self.ok = False
@@ -2090,6 +2203,7 @@ class LoadProfile:
                 "phases": phases,
                 "engine_phases": dict(self.engine_phases),
                 "resources": self._resource_summary(),
+                "download": dict(self.download) if self.download else None,
                 "total": total,
                 "running": running,
                 "ok": self.ok,
@@ -2114,8 +2228,10 @@ def _set_active_profile(profile):
 
 
 def _profile_sampler(profile, stop):
-    """Track peak VRAM and disk-read rate for the duration of a load."""
+    """Track peak VRAM, disk-read rate, and (for installs) download progress."""
     last = profile.start_resources
+    prev_dl = None  # (t, bytes) of the last download sample
+    repo = _config.get("model_repo")
     while not stop.wait(SERVING_POLL_INTERVAL):
         profile.observe_vram()
         cur = sample_resources()
@@ -2124,6 +2240,38 @@ def _profile_sampler(profile, stop):
         if lb is not None and cb is not None and dt > 0:
             profile.observe_disk_rate((cb - lb) / dt)
         last = cur
+        prev_dl = _sample_download(profile, repo, cur["t"], prev_dl)
+
+
+def _sample_download(profile, repo, now, prev_dl):
+    """Update profile.download from the on-disk hf *.incomplete file. Returns
+    the (t, bytes) sample to carry forward for the next speed delta."""
+    tgt = profile.download_target
+    if not tgt:
+        return prev_dl
+    ddir = _download_dir(repo, tgt.get("subdir", ""))
+    downloaded = scan_incomplete_bytes(ddir) if ddir else 0
+    total = hf_remote_size(tgt["repo"], tgt["file"])
+    if downloaded > 0:
+        bps = 0.0
+        if prev_dl and downloaded >= prev_dl[1] and now > prev_dl[0]:
+            bps = (downloaded - prev_dl[1]) / (now - prev_dl[0])
+        profile.set_download({
+            "repo": tgt["repo"], "file": tgt["file"],
+            "downloaded_bytes": downloaded, "total_bytes": total,
+            "pct": round(100.0 * downloaded / total, 1) if total else None,
+            "speed_bps": bps,
+        })
+        return (now, downloaded)
+    # .incomplete gone after we'd seen bytes → hf renamed it to the final file.
+    if prev_dl and prev_dl[1] > 0 and not profile._dl_done:
+        profile._dl_done = True
+        profile.set_download({
+            "repo": tgt["repo"], "file": tgt["file"],
+            "downloaded_bytes": total or prev_dl[1], "total_bytes": total,
+            "pct": 100.0 if total else None, "speed_bps": 0.0,
+        })
+    return prev_dl
 
 
 def _profile_audit_line(record):
@@ -2433,6 +2581,11 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 last_progress_at = [0.0]
 
                 def progress(line):
+                    # Always capture the download target (it's printed once,
+                    # just before hf goes silent) so the sampler can watch disk.
+                    tgt = parse_install_download_target(line)
+                    if tgt:
+                        profile.set_download_target(tgt)
                     now = time.monotonic()
                     if now - last_progress_at[0] < 0.75:
                         return
@@ -3778,6 +3931,7 @@ let key=esc((p.trigger||'')+'|'+x.name);let collapsed=_loadCollapsed.has(key);
 let tog=kk.length?`<span style="cursor:pointer;display:inline-block;width:14px;color:var(--label,#9aa)" onclick="toggleLoadPhase('${key}')">${collapsed?'▶':'▼'}</span>`:'<span style="display:inline-block;width:14px"></span>';
 let row=`<div class="row" style="align-items:center">${tog}<span class="label" style="min-width:196px">${x.running?'⏳ ':''}${esc(plabel[x.name]||x.name)}</span><span style="flex:1"><span style="display:inline-block;height:14px;width:${w}%;background:${col};border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right">${fs(dur)}</span></div>`;
 if(kk.length&&!collapsed)row+=kk.map(k=>{let cd=kids[k];let cw=Math.max(1,Math.round(100*cd/Math.max(dur,cd,0.001)));return `<div class="row" style="align-items:center;opacity:.85"><span style="display:inline-block;width:30px"></span><span class="label" style="min-width:180px;font-size:11px">${esc(clabel[k]||k)}</span><span style="flex:1"><span style="display:inline-block;height:9px;width:${cw}%;background:var(--purple);border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:80px;text-align:right;font-size:11px">${fs(cd)}</span></div>`}).join('');
+if(x.name==='install_assets'&&p.download){let dl=p.download;let gb=b=>b==null?'?':(b>=1e9?(b/1e9).toFixed(2)+' GB':(b/1e6).toFixed(0)+' MB');let pct=dl.pct!=null?dl.pct:(dl.total_bytes?100*dl.downloaded_bytes/dl.total_bytes:null);let dw=pct!=null?Math.max(1,Math.min(100,Math.round(pct))):100;let spd=dl.speed_bps?' @ '+(dl.speed_bps/1e6).toFixed(0)+' MB/s':'';let txt=gb(dl.downloaded_bytes)+(dl.total_bytes?' / '+gb(dl.total_bytes):'')+(pct!=null?' ('+pct.toFixed(0)+'%)':'')+spd;row+=`<div class="row" style="align-items:center;opacity:.95"><span style="display:inline-block;width:30px"></span><span class="label mono" style="min-width:180px;font-size:11px" title="${esc((dl.repo||'')+'/'+(dl.file||''))}">⬇ ${esc(dl.file||'download')}</span><span style="flex:1"><span style="display:inline-block;height:9px;width:${dw}%;background:var(--green);border-radius:3px;vertical-align:middle"></span></span><span class="value" style="min-width:150px;text-align:right;font-size:11px">${esc(txt)}</span></div>`}
 return row}).join('');
 let r=p.resources||{};let resRows='';
 if(r.disk_read_bytes!=null)resRows+=infoRow('Disk read',mb(r.disk_read_bytes)+(r.peak_disk_read_bps?` <span class="label">(peak ${(r.peak_disk_read_bps/1e6).toFixed(0)} MB/s)</span>`:''),'/proc/diskstats read delta over the load window');
