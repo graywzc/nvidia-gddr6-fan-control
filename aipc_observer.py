@@ -2368,9 +2368,14 @@ def install_variant_assets(repo, variant, catalog, setup=None, runner=_run,
         env["MODEL_DIR"] = hint["model_dir"]
     if hint.get("weight_key"):
         env["WEIGHT_KEY"] = hint["weight_key"]
+    if variant_is_gguf(entry):
+        env["VERIFY_GLOB_OVERRIDE"] = "*.gguf"
+        env["WEIGHT_VERIFY_GLOB"] = "*.gguf"
     detail = f"variant={variant} model={model}"
     if hint.get("weight_key"):
         detail += f" weight_key={hint['weight_key']}"
+    if variant_is_gguf(entry):
+        detail += " verify_glob=*.gguf"
     audit("install", detail)
     cmd = _repo_owner_cmd(repo, ["bash", "scripts/setup.sh", model])
     if runner is _run:
@@ -2761,6 +2766,20 @@ def infer_engine(info):
     if any(s in blob for s in ("llamacpp", "llama.cpp", "ik-llama", "ik_llama")):
         return "llamacpp"
     return None
+
+
+def variant_is_gguf(entry):
+    """Return True when a catalog variant entry is a llama.cpp-family (GGUF) engine.
+
+    Uses the same marker vocabulary as infer_engine but operates on a catalog
+    entry dict (engine/compose_path/model fields) rather than model_info.
+    Returns False for vLLM, SGLang, or empty/unknown entries.
+    """
+    blob = " ".join(
+        str((entry or {}).get(k) or "")
+        for k in ("engine", "compose_path", "model")
+    ).lower()
+    return any(s in blob for s in ("llamacpp", "llama.cpp", "ik-llama", "ik_llama", "beellama"))
 
 
 # request_success_total carries a finished_reason label, so parse_prometheus
