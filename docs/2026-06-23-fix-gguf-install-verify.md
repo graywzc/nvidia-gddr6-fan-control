@@ -24,9 +24,14 @@ when installing a GGUF variant. vLLM/safetensors and SGLang variants are untouch
 Add `variant_is_gguf(entry)` that classifies a catalog variant by engine, reusing
 the marker vocabulary already in `infer_engine`. Build a lowercase blob from the
 entry's `engine` + `compose_path` (+ `model`) and return True when it matches a
-llama.cpp-family marker: `("llamacpp", "llama.cpp", "ik-llama", "ik_llama",
-"beellama")`. Catalog entries carry `engine`/`compose_path`, so the failing
-`ik-llama/iq4ks-mtp` entry matches; `vllm` and `sglang` do not.
+llama.cpp-family marker: `("llama-cpp", "llamacpp", "llama.cpp", "ik-llama",
+"ik_llama", "beellama")`. Catalog entries carry `engine`/`compose_path`, so the
+failing `ik-llama/iq4ks-mtp` entry matches; `vllm` and `sglang` do not.
+
+**Correction:** The real catalog uses engine values like `llama-cpp-local` (dashed)
+and compose paths like `.../llama-cpp/compose/...`, so `"llama-cpp"` is the critical
+marker for `llamacpp/*` variants. Without it, those variants were not detected as
+GGUF and still hit the safetensors-verify bug.
 
 ### 2. Set the verify-glob override in `install_variant_assets`
 After the existing `env` is built (where `MODEL_DIR`/`WEIGHT_KEY` are set), add:

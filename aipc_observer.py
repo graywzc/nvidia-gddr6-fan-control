@@ -2779,7 +2779,7 @@ def variant_is_gguf(entry):
         str((entry or {}).get(k) or "")
         for k in ("engine", "compose_path", "model")
     ).lower()
-    return any(s in blob for s in ("llamacpp", "llama.cpp", "ik-llama", "ik_llama", "beellama"))
+    return any(s in blob for s in ("llama-cpp", "llamacpp", "llama.cpp", "ik-llama", "ik_llama", "beellama"))
 
 
 # request_success_total carries a finished_reason label, so parse_prometheus
