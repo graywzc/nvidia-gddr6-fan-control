@@ -2110,6 +2110,28 @@ class SwitchModelTests(unittest.TestCase):
         self.assertEqual(call["env"]["WEIGHT_KEY"], "m1:autoround-int4")
 
     def test_variant_is_gguf_for_llamacpp_family(self):
+        # Real catalog: engine="llama-cpp-local", compose_path=".../llama-cpp/..."
+        self.assertTrue(
+            aipc_observer.variant_is_gguf({
+                "engine": "llama-cpp-local",
+                "compose_path": "models/m/llama-cpp/compose/x/mtp.yml",
+            })
+        )
+        # Real catalog: engine="llama-cpp-local", compose_path=".../ik-llama/..."
+        self.assertTrue(
+            aipc_observer.variant_is_gguf({
+                "engine": "llama-cpp-local",
+                "compose_path": "models/m/ik-llama/compose/x/mtp.yml",
+            })
+        )
+        # Real catalog: engine="beellama-local", compose_path=".../beellama/..."
+        self.assertTrue(
+            aipc_observer.variant_is_gguf({
+                "engine": "beellama-local",
+                "compose_path": "models/m/beellama/compose/x/mtp.yml",
+            })
+        )
+        # Legacy short engine names still match
         self.assertTrue(
             aipc_observer.variant_is_gguf({"engine": "ik-llama"})
         )
@@ -2118,11 +2140,6 @@ class SwitchModelTests(unittest.TestCase):
         )
         self.assertTrue(
             aipc_observer.variant_is_gguf({"engine": "beellama"})
-        )
-        self.assertTrue(
-            aipc_observer.variant_is_gguf(
-                {"compose_path": "models/m/beellama/compose/x.yml"}
-            )
         )
 
     def test_variant_is_gguf_false_for_vllm_sglang_empty(self):
@@ -2135,14 +2152,43 @@ class SwitchModelTests(unittest.TestCase):
         self.assertFalse(
             aipc_observer.variant_is_gguf({})
         )
+        # Real vLLM catalog entry must NOT match
+        self.assertFalse(
+            aipc_observer.variant_is_gguf({
+                "engine": "vllm-gemma-stable",
+                "compose_path": "models/m/vllm/compose/x/y.yml",
+            })
+        )
 
     def test_install_gguf_sets_verify_glob(self):
+        # Test with llama-cpp-local engine (real catalog shape for llamacpp/* variants)
+        catalog = {
+            "variants": {
+                "llamacpp/mtp": {
+                    "status": "caveats",
+                    "model": "qwen3.6-27b",
+                    "engine": "llama-cpp-local",
+                    "compose_path": "models/qwen3.6-27b/llama-cpp/compose/single/mtp/mtp.yml",
+                },
+            },
+            "defaults": {},
+        }
+        runner = FakeRunner()
+        aipc_observer.install_variant_assets(
+            "/repo", "llamacpp/mtp", catalog, runner=runner
+        )
+        env = runner.calls[0]["env"]
+        self.assertEqual(env["VERIFY_GLOB_OVERRIDE"], "*.gguf")
+        self.assertEqual(env["WEIGHT_VERIFY_GLOB"], "*.gguf")
+
+    def test_install_gguf_ik_llama_sets_verify_glob(self):
+        # Test with ik-llama (real catalog shape)
         catalog = {
             "variants": {
                 "ik-llama/iq4ks-mtp": {
                     "status": "caveats",
                     "model": "qwen3.6-27b",
-                    "engine": "ik-llama",
+                    "engine": "llama-cpp-local",
                     "compose_path": "models/qwen3.6-27b/ik-llama/compose/single/iq4ks-mtp/mtp.yml",
                 },
             },
@@ -2162,7 +2208,7 @@ class SwitchModelTests(unittest.TestCase):
                 "vllm/fp8": {
                     "status": "production",
                     "model": "m1",
-                    "engine": "vllm",
+                    "engine": "vllm-gemma-stable",
                     "compose_path": "models/m1/vllm/compose/dual/fp8.yml",
                 },
             },
