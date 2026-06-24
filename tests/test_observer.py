@@ -1463,6 +1463,34 @@ class StopModelTests(unittest.TestCase):
         self.assertTrue(aipc_observer._watchdog.deliberately_stopped)
         self.assertEqual(len(calls), 1)
 
+    def test_stop_model_clears_watchdog_flag_when_compose_stop_fails(self):
+        def runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
+            self.assertTrue(aipc_observer._watchdog.deliberately_stopped)
+            raise RuntimeError("compose failed")
+
+        mi = dict(MODEL_INFO)
+        with self.assertRaisesRegex(RuntimeError, "compose failed"):
+            aipc_observer.stop_model(model_info=mi, repo="", runner=runner)
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
+
+    def test_stop_model_clears_watchdog_flag_when_switch_down_fails(self):
+        import os
+        import tempfile
+
+        def runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
+            self.assertTrue(aipc_observer._watchdog.deliberately_stopped)
+            raise RuntimeError("switch failed")
+
+        with tempfile.TemporaryDirectory() as repo:
+            scripts = os.path.join(repo, "scripts")
+            os.mkdir(scripts)
+            open(os.path.join(scripts, "switch.sh"), "w").close()
+            with self.assertRaisesRegex(RuntimeError, "switch failed"):
+                aipc_observer.stop_model(
+                    model_info=dict(MODEL_INFO), repo=repo, runner=runner
+                )
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
+
 
 class UpdateRepoTests(unittest.TestCase):
     def setUp(self):

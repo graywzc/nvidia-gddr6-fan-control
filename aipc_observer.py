@@ -1872,12 +1872,16 @@ def stop_model(model_info=None, repo=None, runner=_run):
         if os.path.exists(switch_script):
             audit("stop", f"repo={repo} via switch.sh --down")
             _watchdog.mark_deliberately_stopped()
-            runner(
-                _repo_owner_cmd(repo, ["bash", "scripts/switch.sh", "--down"]),
-                env=dict(os.environ),
-                cwd=repo,
-                timeout=300,
-            )
+            try:
+                runner(
+                    _repo_owner_cmd(repo, ["bash", "scripts/switch.sh", "--down"]),
+                    env=dict(os.environ),
+                    cwd=repo,
+                    timeout=300,
+                )
+            except Exception:
+                _watchdog.clear_deliberately_stopped()
+                raise
             return {"stopped": True, "detail": "club-3090 switch.sh --down ran"}
 
     missing = [k for k in ("compose_file", "working_dir") if not mi.get(k)]
@@ -1891,7 +1895,11 @@ def stop_model(model_info=None, repo=None, runner=_run):
     cmd.append("down")
     audit("stop", f"variant={mi.get('variant')} container={mi.get('container')}")
     _watchdog.mark_deliberately_stopped()
-    runner(cmd, env=_compose_env(mi), cwd=mi["working_dir"], timeout=300)
+    try:
+        runner(cmd, env=_compose_env(mi), cwd=mi["working_dir"], timeout=300)
+    except Exception:
+        _watchdog.clear_deliberately_stopped()
+        raise
     return {"stopped": True, "variant": mi.get("variant"),
             "container": mi.get("container")}
 
@@ -4617,6 +4625,9 @@ class WatchdogState:
     def mark_deliberately_stopped(self):
         self.deliberately_stopped = True
         self._reset()
+
+    def clear_deliberately_stopped(self):
+        self.deliberately_stopped = False
 
     def tick(self, now, status, control_busy, *,
              classify=None, revive=None, notify=None, model=None):

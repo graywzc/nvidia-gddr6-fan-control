@@ -144,9 +144,9 @@ python -m pytest tests/test_observer.py -v -k "deliberately_stopped"
 
 - [x] Plan authored and committed
 - [x] Backend: `WatchdogState` changes (`mark_deliberately_stopped`, tick guard, summary) — ✓ Done
-- [x] Backend: `stop_model()` calls `_watchdog.mark_deliberately_stopped()` before stopping — ✓ Done
+- [x] Backend: `stop_model()` calls `_watchdog.mark_deliberately_stopped()` before stopping — ✓ Done; review revision clears flag if stop runner raises
 - [x] Frontend: replace "running" label with "Stop" button in variant list — ✓ Done
-- [x] Tests: add deliberate-stop suppression tests — ✓ Done
+- [x] Tests: add deliberate-stop suppression tests — ✓ Done; review revision covers stop-failure clearing
 - [x] Verification: all available tests pass — ✓ Done
 
 ## Completion Notes
@@ -165,3 +165,17 @@ python -m pytest tests/test_observer.py -v -k "deliberately_stopped"
   Ran `python3 -m unittest tests.test_observer -v` and
   `python3 -m py_compile aipc_observer.py tests/test_observer.py` instead; both
   passed.
+
+## Review Revision Notes
+
+- Finding: `stop_model()` set `_watchdog.deliberately_stopped` before invoking
+  the stop runner, but a runner exception left the flag set even though the stop
+  failed.
+- Resolution: both stop paths now keep the pre-runner flag set for race
+  protection, clear it in `except`, and re-raise the original exception.
+- Added tests for failed `switch.sh --down` and failed docker compose `down`
+  paths. Each test verifies the flag is set before the runner raises and cleared
+  afterward.
+- Verification: `python3 -m unittest tests.test_observer -v`,
+  `python3 -m py_compile aipc_observer.py tests/test_observer.py`, and
+  `git diff --check origin/main...HEAD` passed.
