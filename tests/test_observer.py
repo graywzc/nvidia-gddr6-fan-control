@@ -1400,6 +1400,13 @@ class PresetResolveTests(unittest.TestCase):
 
 
 class StopModelTests(unittest.TestCase):
+    def setUp(self):
+        self.old_watchdog = aipc_observer._watchdog
+        aipc_observer._watchdog = aipc_observer.WatchdogState()
+
+    def tearDown(self):
+        aipc_observer._watchdog = self.old_watchdog
+
     def test_stop_prefers_club3090_switch_down_when_available(self):
         import os
         import tempfile
@@ -1409,7 +1416,9 @@ class StopModelTests(unittest.TestCase):
             os.mkdir(scripts)
             open(os.path.join(scripts, "switch.sh"), "w").close()
             runner = FakeRunner()
-            result = aipc_observer.stop_model(repo=repo, runner=runner)
+            result = aipc_observer.stop_model(
+                model_info=dict(MODEL_INFO), repo=repo, runner=runner
+            )
         self.assertTrue(result["stopped"])
         self.assertEqual(result["detail"], "club-3090 switch.sh --down ran")
         self.assertEqual(runner.calls[0]["cmd"][-3:], ["bash", "scripts/switch.sh", "--down"])
@@ -1438,6 +1447,49 @@ class StopModelTests(unittest.TestCase):
         result = aipc_observer.stop_model(model_info={}, repo="", runner=runner)
         self.assertFalse(result["stopped"])
         self.assertEqual(runner.calls, [])
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
+
+    def test_stop_model_sets_watchdog_flag_before_stopping(self):
+        calls = []
+
+        def runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
+            self.assertTrue(aipc_observer._watchdog.deliberately_stopped)
+            calls.append({"cmd": list(cmd), "env": dict(env or {}), "cwd": cwd})
+            return ""
+
+        mi = dict(MODEL_INFO)
+        result = aipc_observer.stop_model(model_info=mi, repo="", runner=runner)
+        self.assertTrue(result["stopped"])
+        self.assertTrue(aipc_observer._watchdog.deliberately_stopped)
+        self.assertEqual(len(calls), 1)
+
+    def test_stop_model_clears_watchdog_flag_when_compose_stop_fails(self):
+        def runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
+            self.assertTrue(aipc_observer._watchdog.deliberately_stopped)
+            raise RuntimeError("compose failed")
+
+        mi = dict(MODEL_INFO)
+        with self.assertRaisesRegex(RuntimeError, "compose failed"):
+            aipc_observer.stop_model(model_info=mi, repo="", runner=runner)
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
+
+    def test_stop_model_clears_watchdog_flag_when_switch_down_fails(self):
+        import os
+        import tempfile
+
+        def runner(cmd, env=None, cwd=None, timeout=600, input_text=None):
+            self.assertTrue(aipc_observer._watchdog.deliberately_stopped)
+            raise RuntimeError("switch failed")
+
+        with tempfile.TemporaryDirectory() as repo:
+            scripts = os.path.join(repo, "scripts")
+            os.mkdir(scripts)
+            open(os.path.join(scripts, "switch.sh"), "w").close()
+            with self.assertRaisesRegex(RuntimeError, "switch failed"):
+                aipc_observer.stop_model(
+                    model_info=dict(MODEL_INFO), repo=repo, runner=runner
+                )
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
 
 
 class UpdateRepoTests(unittest.TestCase):
@@ -2887,6 +2939,29 @@ class WatchdogStateTests(unittest.TestCase):
             self.tick(now, "loading")
         self.assertEqual(self.events, [])
         self.assertEqual(self.revives, 0)
+
+    def test_deliberately_stopped_suppresses_alarm(self):
+        self.tick(0, "ready")
+        self.wd.mark_deliberately_stopped()
+        for now in range(5, 5 + int(aipc_observer.WATCHDOG_DOWN_GRACE) + 20, 5):
+            self.tick(now, "down")
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.revives, 0)
+        self.assertTrue(self.wd.deliberately_stopped)
+        self.assertIsNone(self.wd.down_since)
+
+    def test_deliberately_stopped_clears_on_recovery(self):
+        self.tick(0, "ready")
+        self.wd.mark_deliberately_stopped()
+        self.tick(5, "ready")
+        self.assertFalse(self.wd.deliberately_stopped)
+        self.assertTrue(self.wd.seen_healthy)
+        self.assertTrue(self.wd.armed)
+        self.assertEqual(self.wd.attempts, 0)
+
+    def test_deliberately_stopped_in_summary(self):
+        self.wd.mark_deliberately_stopped()
+        self.assertTrue(self.wd.summary()["deliberately_stopped"])
 
     def test_crash_loop_gives_up_after_max_attempts(self):
         self.revive_result = (False, "still OOM")
