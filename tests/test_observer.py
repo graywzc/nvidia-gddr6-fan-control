@@ -2994,5 +2994,17 @@ class WatchdogStateTests(unittest.TestCase):
         self.assertEqual([e for e, _ in self.events].count("down"), 2)
 
 
+class DashboardHtmlTests(unittest.TestCase):
+    def test_summary_renderer_does_not_depend_on_implicit_id_globals(self):
+        html = aipc_observer.DASHBOARD_HTML
+
+        self.assertIn("document.getElementById('gpuTemp')", html)
+        self.assertIn("document.getElementById('memTemp')", html)
+        self.assertIn("document.getElementById('avgTps')", html)
+        self.assertNotRegex(html, r"(?<![A-Za-z0-9_$])gpuTemp\.")
+        self.assertNotRegex(html, r"(?<![A-Za-z0-9_$])memTemp\.")
+        self.assertNotRegex(html, r"(?<![A-Za-z0-9_$])avgTps\.")
+
+
 if __name__ == "__main__":
     unittest.main()
