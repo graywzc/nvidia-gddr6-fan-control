@@ -32,6 +32,7 @@ DEFAULT_CONTAINER = None
 # The club-3090 checkout that launches the model server; the observer reports
 # its version and how far it is behind upstream. Empty/None disables this.
 DEFAULT_MODEL_REPO = "/home/graywzc/projects/club-3090"
+DEFAULT_MODEL_CACHE_DIR = "models-cache"
 GPU_POLL_INTERVAL = 2.0
 CONN_CHECK_INTERVAL = 3.0
 MODEL_POLL_INTERVAL = 30.0
@@ -304,6 +305,15 @@ class ObserverState:
                 "installed_at": time.time(),
                 **(detail or {}),
             }
+
+    def merge_installed_assets(self, assets):
+        with self.lock:
+            for variant, detail in (assets or {}).items():
+                if variant not in self.installed_assets:
+                    self.installed_assets[str(variant)] = {
+                        "installed_at": time.time(),
+                        **(detail or {}),
+                    }
 
     def set_metrics(self, metrics):
         with self.lock:
@@ -2295,6 +2305,84 @@ def infer_variant_setup(entry):
     return hint
 
 
+def _model_cache_roots(repo, model_info=None):
+    roots = []
+    model_dir = (model_info or {}).get("model_dir")
+    if model_dir:
+        roots.append(model_dir)
+    if repo:
+        roots.append(os.path.join(repo, DEFAULT_MODEL_CACHE_DIR))
+    seen = set()
+    for root in roots:
+        root = os.path.abspath(os.path.expanduser(str(root)))
+        if root not in seen:
+            seen.add(root)
+            yield root
+
+
+def _asset_path_has_files(path):
+    if not path or not os.path.isdir(path):
+        return False
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_file(follow_symlinks=False):
+                    return True
+                if entry.is_dir(follow_symlinks=False):
+                    return _asset_path_has_files(entry.path)
+    except OSError:
+        return False
+    return False
+
+
+def _variant_asset_candidates(root, hint):
+    model = hint.get("model")
+    weight_key = hint.get("weight_key")
+    if not model:
+        return []
+    candidates = []
+    if weight_key:
+        profile = weight_key.split(":", 1)[1] if ":" in weight_key else weight_key
+        candidates.extend([
+            os.path.join(root, weight_key),
+            os.path.join(root, weight_key.replace(":", os.sep)),
+            os.path.join(root, weight_key.replace(":", "_")),
+            os.path.join(root, weight_key.replace(":", "-")),
+            os.path.join(root, model, profile),
+            os.path.join(root, model, "weights", profile),
+            os.path.join(root, model, "profiles", profile),
+        ])
+    candidates.append(os.path.join(root, model))
+    seen = set()
+    return [p for p in candidates if not (p in seen or seen.add(p))]
+
+
+def detect_installed_assets(repo, catalog, model_info=None):
+    """Detect catalog variants whose model assets already exist on disk."""
+    variants = (catalog or {}).get("variants") or {}
+    detected = {}
+    roots = list(_model_cache_roots(repo, model_info))
+    for key, entry in variants.items():
+        hint = infer_variant_setup(entry)
+        if not hint.get("model"):
+            continue
+        for root in roots:
+            candidates = _variant_asset_candidates(root, hint)
+            matched = next((p for p in candidates if _asset_path_has_files(p)),
+                           None)
+            if matched:
+                detail = dict(hint)
+                detail.update({
+                    "source": "disk",
+                    "path": matched,
+                })
+                detected[key] = detail
+                break
+    return detected
+
+
 def parse_setup_hint(text):
     """Extract setup.sh instructions from club-3090 preflight output."""
     msg = re.sub(r"\s+", " ", str(text or ""))
@@ -3065,6 +3153,10 @@ def refresh_catalog(repo, info, cache, observer_state=None):
         if "error" not in local:
             cache[head] = local
     st.set_catalog(local)
+    if "error" not in local:
+        st.merge_installed_assets(
+            detect_installed_assets(repo, local, st.model_info)
+        )
     upstream_sha = info.get("upstream_sha")
     if info.get("behind") and upstream_sha and "error" not in local:
         upstream = cache.get(upstream_sha)
