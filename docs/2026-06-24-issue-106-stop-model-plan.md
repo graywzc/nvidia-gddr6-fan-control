@@ -142,9 +142,26 @@ python -m pytest tests/test_observer.py -v -k "deliberately_stopped"
 
 ## Progress
 
-- [ ] Plan authored and committed
-- [ ] Backend: `WatchdogState` changes (`mark_deliberately_stopped`, tick guard, summary)
-- [ ] Backend: `stop_model()` calls `_watchdog.mark_deliberately_stopped()` before stopping
-- [ ] Frontend: replace "running" label with "Stop" button in variant list
-- [ ] Tests: add deliberate-stop suppression tests
-- [ ] Verification: all tests pass
+- [x] Plan authored and committed
+- [x] Backend: `WatchdogState` changes (`mark_deliberately_stopped`, tick guard, summary) — ✓ Done
+- [x] Backend: `stop_model()` calls `_watchdog.mark_deliberately_stopped()` before stopping — ✓ Done
+- [x] Frontend: replace "running" label with "Stop" button in variant list — ✓ Done
+- [x] Tests: add deliberate-stop suppression tests — ✓ Done
+- [x] Verification: all available tests pass — ✓ Done
+
+## Completion Notes
+
+- Implemented deliberate-stop watchdog state. `tick()` now clears the flag on
+  `ready` and suppresses down-state crash detection/revive while the flag is set.
+- `stop_model()` now checks for a running container before either stop path,
+  marks the watchdog deliberate-stop flag before invoking the stop command, and
+  leaves the flag unset for no-op stops.
+- The variant-list running row now renders a `Stop` button that calls the
+  existing `doStop()` function.
+- Added watchdog and stop-model tests, including an ordering assertion that the
+  flag is set before the stop runner is called.
+- Deviation: `python` and `pytest` were unavailable in this worktree shell
+  (`python`: command not found; `python3 -m pytest`: no module named `pytest`).
+  Ran `python3 -m unittest tests.test_observer -v` and
+  `python3 -m py_compile aipc_observer.py tests/test_observer.py` instead; both
+  passed.

@@ -1860,10 +1860,18 @@ def _compose_file_args(compose_file):
 def stop_model(model_info=None, repo=None, runner=_run):
     """Stop the running model compose project without starting a replacement."""
     repo = repo if repo is not None else _config.get("model_repo")
+    mi = model_info if model_info is not None else state.model_info
+    container = (mi or {}).get("container")
+    if model_info is None and not container:
+        container = state.container_name
+    if not container:
+        return {"stopped": False, "detail": "model container is not running"}
+
     if repo:
         switch_script = os.path.join(repo, "scripts", "switch.sh")
         if os.path.exists(switch_script):
             audit("stop", f"repo={repo} via switch.sh --down")
+            _watchdog.mark_deliberately_stopped()
             runner(
                 _repo_owner_cmd(repo, ["bash", "scripts/switch.sh", "--down"]),
                 env=dict(os.environ),
@@ -1872,9 +1880,6 @@ def stop_model(model_info=None, repo=None, runner=_run):
             )
             return {"stopped": True, "detail": "club-3090 switch.sh --down ran"}
 
-    mi = model_info if model_info is not None else state.model_info
-    if not mi or not mi.get("container"):
-        return {"stopped": False, "detail": "model container is not running"}
     missing = [k for k in ("compose_file", "working_dir") if not mi.get(k)]
     if missing:
         raise RuntimeError(f"model info incomplete ({', '.join(missing)}); "
@@ -1885,6 +1890,7 @@ def stop_model(model_info=None, repo=None, runner=_run):
     cmd.extend(_compose_file_args(mi["compose_file"]))
     cmd.append("down")
     audit("stop", f"variant={mi.get('variant')} container={mi.get('container')}")
+    _watchdog.mark_deliberately_stopped()
     runner(cmd, env=_compose_env(mi), cwd=mi["working_dir"], timeout=300)
     return {"stopped": True, "variant": mi.get("variant"),
             "container": mi.get("container")}
@@ -3970,7 +3976,7 @@ function renderVariantListModal(d,fits,runKey,running,topo){let c=d.catalog||{};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let visible=new Set(fits);compareSelections.forEach(k=>{if(!visible.has(k))compareSelections.delete(k)});
 let rows='<div class="compare-toolbar"><button id="btnCompareVariants" class="btn" onclick="compareSelectedVariants()">Compare commands</button><span id="compareCount" class="label">0 selected</span><span class="label">select 2-4 variants</span></div><div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let installedLabel=installed[k]?'<span class="good">installed</span>':'<span class="label">needs download</span>';let action=k===runKey?'<span class="good">running</span>':`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStartOrSwitch('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let installing=installingVariant?`<span class="hot">installing…</span>`:'';let checked=compareSelections.has(k)?' checked':'';
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let installedLabel=installed[k]?'<span class="good">installed</span>':'<span class="label">needs download</span>';let action=k===runKey?`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStop()"${lastBusy?' disabled':''}>Stop</button>`:`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStartOrSwitch('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let installing=installingVariant?`<span class="hot">installing…</span>`:'';let checked=compareSelections.has(k)?' checked':'';
 return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${installing}${k!==runKey?installedLabel:''}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;
@@ -4587,6 +4593,7 @@ class WatchdogState:
         self.next_attempt_at = 0.0   # backoff gate for the next revive
         self.gave_up = False
         self.last_reason = None
+        self.deliberately_stopped = False
 
     def summary(self, now=None):
         now = time.monotonic() if now is None else now
@@ -4597,6 +4604,7 @@ class WatchdogState:
             "down_seconds": (now - self.down_since) if self.down_since else 0,
             "gave_up": self.gave_up,
             "last_reason": self.last_reason,
+            "deliberately_stopped": self.deliberately_stopped,
         }
 
     def _reset(self):
@@ -4606,6 +4614,10 @@ class WatchdogState:
         self.next_attempt_at = 0.0
         self.gave_up = False
 
+    def mark_deliberately_stopped(self):
+        self.deliberately_stopped = True
+        self._reset()
+
     def tick(self, now, status, control_busy, *,
              classify=None, revive=None, notify=None, model=None):
         """Advance the machine one probe. `status` is "ready"|"loading"|"down"."""
@@ -4613,16 +4625,22 @@ class WatchdogState:
         revive = revive or _revive_model
         notify = notify or _watchdog_notify
 
+        if status == "ready":
+            self.seen_healthy = True
+            if self.deliberately_stopped:
+                self.deliberately_stopped = False
+                self._reset()
+            elif not self.armed or self.attempts or self.down_since is not None:
+                self._reset()
+            return
+        if self.deliberately_stopped and status == "down":
+            self.down_since = None
+            return
         if control_busy or status == "loading":
             # A switch/install/restart — or a model still loading its weights —
             # is legitimately not serving; don't count that as a crash. Pause
             # the down clock and wait.
             self.down_since = None
-            return
-        if status == "ready":
-            self.seen_healthy = True
-            if not self.armed or self.attempts or self.down_since is not None:
-                self._reset()
             return
         # status == "down": the model is unreachable.
         if not self.seen_healthy:
