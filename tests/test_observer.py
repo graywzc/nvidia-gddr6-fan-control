@@ -2770,6 +2770,80 @@ class RunningInstalledSeedTests(unittest.TestCase):
         st.set_catalog(self.CATALOG)
         st.set_model_info({})
         self.assertEqual(st.snapshot()["installed_assets"], {})
+
+
+class InstalledAssetDetectionTests(unittest.TestCase):
+    CATALOG = {"variants": {
+        "eng/prod": {
+            "model": "m1",
+            "compose_path": "models/m1/vllm/compose/single/prod/x.yml",
+        },
+        "eng/profile": {
+            "model": "m2",
+            "compose_path": "models/m2/vllm/compose/single/aq4/x.yml",
+        },
+        "eng/missing": {
+            "model": "m3",
+            "compose_path": "models/m3/vllm/compose/single/prod/x.yml",
+        },
+    }}
+
+    def test_detects_existing_model_cache_assets(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as repo:
+            model_dir = os.path.join(repo, "models-cache", "m1")
+            os.makedirs(model_dir)
+            with open(os.path.join(model_dir, "weights.safetensors"), "w") as f:
+                f.write("x")
+
+            found = aipc_observer.detect_installed_assets(repo, self.CATALOG)
+
+        self.assertIn("eng/prod", found)
+        self.assertEqual(found["eng/prod"]["source"], "disk")
+        self.assertEqual(found["eng/prod"]["model"], "m1")
+        self.assertNotIn("eng/missing", found)
+
+    def test_detects_profile_specific_weight_key_assets(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as repo:
+            profile_dir = os.path.join(repo, "models-cache", "m2", "aq4")
+            os.makedirs(profile_dir)
+            with open(os.path.join(profile_dir, "model.gguf"), "w") as f:
+                f.write("x")
+
+            found = aipc_observer.detect_installed_assets(repo, self.CATALOG)
+
+        self.assertIn("eng/profile", found)
+        self.assertEqual(found["eng/profile"]["weight_key"], "m2:aq4")
+
+    def test_refresh_catalog_merges_disk_detected_assets_into_snapshot(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as repo:
+            model_dir = os.path.join(repo, "models-cache", "m1")
+            os.makedirs(model_dir)
+            with open(os.path.join(model_dir, "weights.safetensors"), "w") as f:
+                f.write("x")
+
+            st = aipc_observer.ObserverState()
+            with mock.patch.object(
+                aipc_observer, "extract_catalog", return_value=self.CATALOG
+            ):
+                aipc_observer.refresh_catalog(
+                    repo, {"head": "abc", "behind": 0}, {}, observer_state=st
+                )
+
+            installed = st.snapshot()["installed_assets"]
+
+        self.assertIn("eng/prod", installed)
+        self.assertEqual(installed["eng/prod"]["source"], "disk")
+
+
 class SendNtfyTests(unittest.TestCase):
     def test_posts_to_topic_with_headers(self):
         captured = {}
