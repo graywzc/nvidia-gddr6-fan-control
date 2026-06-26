@@ -1104,7 +1104,8 @@ MODEL_INFO = {
 
 CONFIG_JSON = (
     '{"services": {"svc": {"command": '
-    '["--host", "0.0.0.0", "--ctx-size", "102400", "--cache-ram", "0"]}}}'
+    '["--host", "0.0.0.0", "--ctx-size", "102400", "--cache-ram", "0"], '
+    '"image": "ghcr.io/anbeeld/beellama.cpp:server-cuda-v0.3.0"}}}'
 )
 
 
@@ -2314,6 +2315,60 @@ class SwitchModelTests(unittest.TestCase):
         self.assertEqual(runner.calls[0]["cmd"][-2:], ["--force", "eng/exp"])
 
 
+VLLM_CONFIG_JSON = (
+    '{"services": {"svc": {"command": '
+    '["--model", "/models/q", "--tensor-parallel-size", "2"], '
+    '"image": "vllm/vllm-openai:v0.22.0"}}}'
+)
+
+
+class BootModelOnceTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
+        tmp.close()
+        self.override_path = tmp.name
+
+    def tearDown(self):
+        import os
+
+        os.unlink(self.override_path)
+
+    def _boot(self, nvlink_mode=None, config_json=VLLM_CONFIG_JSON):
+        runner = FakeRunner(config_json)
+        entry = {"compose_path": "models/m/vllm/compose/dual/fp8.yml"}
+        aipc_observer.boot_model_once(
+            "/repo", "vllm/dual", entry, 8020,
+            runner=runner, override_path=self.override_path,
+            nvlink_mode=nvlink_mode,
+        )
+        import json
+
+        with open(self.override_path) as f:
+            return json.load(f), runner
+
+    def test_nvlink_mode_force_off_sets_env(self):
+        override, _ = self._boot(nvlink_mode="force_off")
+        env = override["services"]["svc"].get("environment") or {}
+        self.assertEqual(env.get("NVLINK_MODE"), "force_off")
+
+    def test_nvlink_mode_pcie_p2p_sets_env(self):
+        override, _ = self._boot(nvlink_mode="pcie_p2p")
+        env = override["services"]["svc"].get("environment") or {}
+        self.assertEqual(env.get("NVLINK_MODE"), "pcie_p2p")
+
+    def test_nvlink_mode_auto_does_not_set_env(self):
+        override, _ = self._boot(nvlink_mode="auto")
+        env = override["services"]["svc"].get("environment") or {}
+        self.assertNotIn("NVLINK_MODE", env)
+
+    def test_nvlink_mode_none_does_not_set_env(self):
+        override, _ = self._boot(nvlink_mode=None)
+        env = override["services"]["svc"].get("environment") or {}
+        self.assertNotIn("NVLINK_MODE", env)
+
+
 class SwitchWorkerTests(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -2339,7 +2394,8 @@ class SwitchWorkerTests(unittest.TestCase):
         os.unlink(self.override_path)
 
     def test_baseline_switch_still_reups_for_log_rotation(self):
-        runner = FakeRunner()
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer.state.set_catalog(SWITCH_CATALOG)
         aipc_observer._switch_worker(
             "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
             info_getter=lambda port: dict(MODEL_INFO),
@@ -2350,13 +2406,29 @@ class SwitchWorkerTests(unittest.TestCase):
         self.assertTrue(status["done"])
         self.assertTrue(status["ok"])
         self.assertFalse(aipc_observer._control_lock.locked())
-        # switch.sh, then the baseline re-up (override = log rotation +
-        # image pin only; no compose-config call for baseline).
+        # Single boot_model_once call: compose config + compose up
         self.assertEqual(len(runner.calls), 2)
-        self.assertIn("scripts/switch.sh", runner.calls[0]["cmd"])
+        self.assertIn("config", runner.calls[0]["cmd"])
         up_cmd = runner.calls[1]["cmd"]
         self.assertIn("up", up_cmd)
         self.assertIn(self.override_path, up_cmd)
+
+    def test_nvlink_mode_flows_to_override(self):
+        import json
+
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer.state.set_catalog(SWITCH_CATALOG)
+        aipc_observer._switch_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
+            override_path=self.override_path,
+            ready_waiter=lambda port: 0.0,
+            nvlink_mode="force_off",
+        )
+        self.assertTrue(aipc_observer.state.control_status["ok"])
+        with open(self.override_path) as f:
+            override = json.load(f)
+        env = override["services"]["svc"].get("environment") or {}
+        self.assertEqual(env.get("NVLINK_MODE"), "force_off")
 
     def test_preset_switch_resolves_config_then_reups(self):
         runner = FakeRunner(CONFIG_JSON)
@@ -2472,7 +2544,7 @@ class LastStartTests(unittest.TestCase):
         tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
         tmp.close()
         try:
-            runner = FakeRunner()
+            runner = FakeRunner(CONFIG_JSON)
             aipc_observer.state.set_catalog(SWITCH_CATALOG)
             aipc_observer._install_worker(
                 "/repo", "eng/prod", "baseline", 8020, False, True,
