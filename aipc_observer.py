@@ -1782,6 +1782,104 @@ def resolve_preset(preset_name, supported):
     return tweaks, dropped
 
 
+def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
+                    cache_ram=True, force=False, runner=_run,
+                    override_path=OVERRIDE_FILE, nvlink_mode=None):
+    """Boot a model variant in a single phase — no switch.sh + restart dance.
+
+    Resolves the compose config, builds the override with preset flags
+    and --disable-custom-all-reduce (if AIPC_OBSERVER_DISABLE_CUSTOM_ALL_REDUCE=1),
+    writes it, and runs docker compose up -d directly.
+    """
+    compose_path = (entry or {}).get("compose_path")
+    if not compose_path:
+        raise ValueError(f"variant {key!r} has no compose_path")
+    mode = normalize_observer_mode(preset)
+    if mode not in MODE_CAPABILITIES:
+        raise ValueError(f"unknown preset {preset!r}")
+
+    cfg_env = dict(os.environ)
+    cfg_env["PORT"] = str(monitor_port)
+    raw = runner(
+        ["docker", "compose", "-f", compose_path, "config", "--format", "json"],
+        env=cfg_env, cwd=repo, timeout=60,
+    )
+    cfg = json.loads(raw)
+    services = cfg.get("services") or {}
+    svc = None
+    service_name = None
+    for name, s in services.items():
+        if s.get("command"):
+            svc = s
+            service_name = name
+            break
+    if not svc:
+        service_name, svc = next(iter(services.items()))
+    image = svc.get("image")
+
+    mi = {
+        "compose_file": compose_path,
+        "service": service_name,
+        "working_dir": repo,
+        "command": svc.get("command") or [],
+        "image": image,
+        "host_port": monitor_port,
+        "variant": key,
+    }
+
+    env = _compose_env(mi)
+    cwd = repo
+    engine = infer_engine(mi)
+    effective_cache_ram = bool(cache_ram) and engine != "vllm"
+    argv = None
+    preset_env = None
+    dropped = []
+    if mode != "baseline" or effective_cache_ram:
+        baseline = compose_baseline_command(compose_path, service_name, env,
+                                            cwd, runner=runner)
+        if engine == "vllm":
+            tweaks = VLLM_PRESET_FLAGS.get(mode, [])
+            preset_env = VLLM_PRESET_ENV.get(mode)
+        else:
+            tweaks, dropped = resolve_preset(
+                mode, _supported_flags(mi, inspect_container_help))
+            if effective_cache_ram:
+                tweaks = [*tweaks, CACHE_RAM_TWEAK]
+        argv = apply_preset_to_command(baseline, tweaks)
+        if engine == "vllm":
+            argv = remove_command_options(argv, ["--cache-ram"])
+
+    if nvlink_mode and nvlink_mode != "auto":
+        preset_env = {"NVLINK_MODE": nvlink_mode, **(preset_env or {})}
+
+    with open(override_path, "w") as fp:
+        json.dump(
+            build_compose_override(
+                service_name, argv, image=image,
+                environment=preset_env,
+                labels={
+                    OBSERVER_PRESET_LABEL: mode,
+                    OBSERVER_CACHE_RAM_LABEL: str(effective_cache_ram).lower(),
+                },
+            ),
+            fp, indent=1,
+        )
+    os.chmod(override_path, 0o644)
+
+    detail = (f"preset={mode} cache_ram={effective_cache_ram} "
+              f"variant={key}")
+    if dropped:
+        detail += f" dropped={','.join(dropped)}"
+    audit("boot", detail)
+    runner(
+        ["docker", "compose", "-f", compose_path, "-f", override_path,
+         "up", "-d", "--remove-orphans"],
+        env=env, cwd=cwd,
+    )
+    return {"booted": True, "preset": mode, "cache_ram": effective_cache_ram,
+            "variant": key, "dropped_capabilities": dropped}
+
+
 def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
                   override_path=OVERRIDE_FILE, help_getter=inspect_container_help):
     """Recreate the model container with an observer mode/cache toggle applied.
@@ -2481,10 +2579,8 @@ def install_variant_assets(repo, variant, catalog, setup=None, runner=_run,
     audit("install", detail)
     cmd = _repo_owner_cmd(repo, ["bash", "scripts/setup.sh", model])
     if runner is _run:
-        _run_with_progress(
-            cmd, env=env, cwd=repo, timeout=INSTALL_TIMEOUT,
-            on_line=progress,
-        )
+        _run_with_progress(cmd, env=env, cwd=repo, timeout=INSTALL_TIMEOUT,
+                           on_line=progress)
     else:
         runner(cmd, env=env, cwd=repo, timeout=INSTALL_TIMEOUT)
     return {"installed": True, "variant": variant, **hint}
@@ -2525,7 +2621,8 @@ def _wait_for_model_info(monitor_port, timeout=120):
 
 def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                    info_getter=None, override_path=OVERRIDE_FILE,
-                   cache_ram=False, started_at=None, ready_waiter=None):
+                   cache_ram=False, started_at=None, ready_waiter=None,
+                   nvlink_mode=None):
     """Background body of a model switch; releases the control lock when done.
 
     switch.sh always boots the variant verbatim; the preset re-up afterwards
@@ -2545,24 +2642,14 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                     "switch", f"switching to {variant} — old model stopping, "
                               "new model loading (takes a few minutes)…"
                 )
-                print(f"[observer] _switch_worker: calling switch_model()", flush=True)
-                with profile.phase("switch.sh"):
-                    switch_model(repo, variant, monitor_port, force=force,
-                                 runner=runner)
-                print(f"[observer] _switch_worker: switch_model() returned OK", flush=True)
-                _start_step(
-                    "switch", f"{variant} is up; applying mode {preset} + cache "
-                              f"{'on' if cache_ram else 'off'} + log rotation "
-                              "(one more model reload)…"
-                )
-                print(f"[observer] _switch_worker: calling _wait_for_model_info()", flush=True)
-                with profile.phase("wait_model_info"):
-                    info = (info_getter or _wait_for_model_info)(monitor_port)
-                print(f"[observer] _switch_worker: model_info returned, calling restart_model()", flush=True)
-                with profile.phase("restart_preset"):
-                    result = restart_model(preset, model_info=info, runner=runner,
-                                           cache_ram=cache_ram,
-                                           override_path=override_path)
+                print(f"[observer] _switch_worker: calling boot_model_once()", flush=True)
+                with profile.phase("boot"):
+                    variants = (state.catalog or {}).get("variants") or {}
+                    entry = variants.get(variant) or {}
+                    result = boot_model_once(
+                        repo, variant, entry, monitor_port, preset=preset,
+                        cache_ram=cache_ram, force=force, runner=runner,
+                        override_path=override_path, nvlink_mode=nvlink_mode)
                 with profile.phase("ready_wait"):
                     ready_waiter(monitor_port)
                 dropped = result.get("dropped_capabilities") or []
@@ -2598,7 +2685,7 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
 def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     setup, runner=_run, info_getter=None,
                     override_path=OVERRIDE_FILE, cache_ram=False,
-                    started_at=None, ready_waiter=None):
+                    started_at=None, ready_waiter=None, nvlink_mode=None):
     ready_waiter = ready_waiter or wait_until_serving
     state.start_run("start", variant, preset, cache_ram)
     try:
@@ -2644,28 +2731,18 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     audit("install-done", f"variant={variant}")
                     print(f"[observer] _install_worker: DONE (no retry) variant={variant!r}", flush=True)
                     return
-                print(f"[observer] _install_worker: assets installed, calling switch_model() for retry", flush=True)
+                print(f"[observer] _install_worker: assets installed, calling boot_model_once()", flush=True)
                 _start_step(
-                    "install", f"installed assets for {variant}; retrying switch…",
+                    "install", f"installed assets for {variant}; booting…",
                     installed_variant=variant,
                 )
-                with profile.phase("switch.sh"):
-                    switch_model(repo, variant, monitor_port, force=force,
-                                 runner=runner)
-                print(f"[observer] _install_worker: switch_model() returned OK after install", flush=True)
-                _start_step(
-                    "switch", f"{variant} is up; applying mode {preset} + cache "
-                              f"{'on' if cache_ram else 'off'} + log rotation "
-                              "(one more model reload)…"
-                )
-                print(f"[observer] _install_worker: calling _wait_for_model_info() after switch", flush=True)
-                with profile.phase("wait_model_info"):
-                    info = (info_getter or _wait_for_model_info)(monitor_port)
-                print(f"[observer] _install_worker: calling restart_model() after switch", flush=True)
-                with profile.phase("restart_preset"):
-                    restart_model(preset, model_info=info, runner=runner,
-                                  cache_ram=cache_ram,
-                                  override_path=override_path)
+                with profile.phase("boot"):
+                    variants = (state.catalog or {}).get("variants") or {}
+                    entry = variants.get(variant) or {}
+                    result = boot_model_once(
+                        repo, variant, entry, monitor_port, preset=preset,
+                        cache_ram=cache_ram, force=force, runner=runner,
+                        override_path=override_path, nvlink_mode=nvlink_mode)
                 with profile.phase("ready_wait"):
                     ready_waiter(monitor_port)
                 detail = f"switched to {variant} (mode {preset}, " \
@@ -3890,7 +3967,7 @@ DASHBOARD_HTML = """<!doctype html>
 /* Drag & resize */
 /* Cards get a uniform height (280px) with internal scroll.
    .height-expanded removes the cap; .card-height-exempt skips it entirely (GPU History). */
-.card{transition:box-shadow .15s,opacity .15s;height:280px;overflow:auto;display:flex;flex-direction:column}.card.height-expanded{height:auto;max-height:none}.card.card-height-exempt{height:auto;max-height:none}.card.dragging{opacity:.4;box-shadow:0 0 0 2px var(--accent)}.card.drag-over{box-shadow:0 0 0 2px var(--green)}.card h2{display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.drag-handle{cursor:grab;color:var(--dim);font-size:14px;user-select:none;display:inline-block;width:20px;text-align:center}.drag-handle:active{cursor:grabbing}.resize-btn{background:transparent;border:1px solid var(--border);color:var(--dim);border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;font-family:inherit;line-height:1.6}.resize-btn:hover{border-color:var(--accent);color:var(--accent)}.resize-btn-h.active{color:var(--accent);border-color:var(--accent)}.half{grid-column:span 2}
+.card{transition:box-shadow .15s,opacity .15s;height:280px;overflow:auto;display:flex;flex-direction:column;user-select:text}.card.height-expanded{height:auto;max-height:none}.card.card-height-exempt{height:auto;max-height:none}.card.dragging{opacity:.4;box-shadow:0 0 0 2px var(--accent)}.card.drag-over{box-shadow:0 0 0 2px var(--green)}.card h2{display:flex;align-items:center;justify-content:space-between;flex-shrink:0}.drag-handle{cursor:grab;color:var(--dim);font-size:14px;user-select:none;display:inline-block;width:20px;text-align:center}.drag-handle:active{cursor:grabbing}.resize-btn{background:transparent;border:1px solid var(--border);color:var(--dim);border-radius:4px;padding:2px 6px;cursor:pointer;font-size:11px;font-family:inherit;line-height:1.6}.resize-btn:hover{border-color:var(--accent);color:var(--accent)}.resize-btn-h.active{color:var(--accent);border-color:var(--accent)}.half{grid-column:span 2}
 </style>
 </head>
 <body>
@@ -3911,7 +3988,9 @@ DASHBOARD_HTML = """<!doctype html>
 <section class="card"><h2><span>Model Config</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="modelInfo"></div>
 <div class="controls"><select id="presetSel" class="btn" onchange="renderModelInfoFromState()" title="baseline: club-3090 verbatim · debug: add engine-specific observability/debug flags">
 <option value="baseline">baseline</option><option value="debug" selected>debug</option>
-</select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div>
+</select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><select id="nvlinkSel" class="btn" title="NVLINK_MODE passed to detect_nvlink.sh inside the container">
+<option value="auto" selected>nvlink: auto</option><option value="force_off">nvlink: force_off</option><option value="pcie_p2p">nvlink: pcie_p2p</option><option value="force_on">nvlink: force_on</option>
+</select><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div>
 <div id="lastStartSummary" style="padding:8px 0;font-size:12px"></div>
 <div id="lastStartLog" class="docker-logs" style="max-height:180px;min-height:24px;border-top:1px solid var(--border);padding:4px 0"></div>
 </section>
@@ -3970,10 +4049,13 @@ const PRESET_FLAG_ALIASES={'-lv':'--log-verbosity'};
 function presetFlag(flag){return PRESET_FLAG_ALIASES[flag]||flag}
 function pct(v,max){return Math.max(0,Math.min(100,(v/max)*100))}
 function cls(t){return t>85?'critical':t>75?'hot':''}
-function connect(){if(es)es.close();es=new EventSource('/observer/sse');es.onmessage=e=>render(JSON.parse(e.data));es.onerror=()=>{es.close();setTimeout(connect,3000)}}
+var _renderRaf=null;
+function connect(){var myEs=new EventSource('/observer/sse');if(es)es.close();es=myEs;es.onmessage=function(e){scheduleRender(JSON.parse(e.data))};es.onerror=function(){if(es===myEs){myEs.close();es=null;setTimeout(connect,3000)}}}
+function scheduleRender(d){lastRenderData=d;if(_renderRaf)return;_renderRaf=requestAnimationFrame(function(){_renderRaf=null;doRender(lastRenderData)})}
 let lastActive=0;
 let lastBusy=false;
-function render(d){lastRenderData=d;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderLastStart(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function render(d){scheduleRender(d)}
+function doRender(d){if(window.getSelection&&window.getSelection().toString().length>0)return;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderLastStart(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doStartOrSwitch('${esc(h.variant)}','${esc(h.status||'')}')">Install + retry</button>`}st.innerHTML=msg}
 document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
@@ -3982,10 +4064,10 @@ document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
 let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
 if(rb){rb.disabled=lastBusy||!running;rb.title=running?'':'no model running — use Start in the Catalog below'}
 if(sb){sb.disabled=lastBusy||!running;sb.title=running?'':'no model running'}}
-function doStartOrSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';
-let confirmMsg=`Start/switch model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?\nThis downloads any missing files, then boots — takes a few minutes.${exp}${warn}`;
+function doStartOrSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam(),nvlink=selectedNvlinkMode();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';let nvlinkNote=nvlink!=='auto'?`\nNVLINK_MODE=${nvlink}`:'';
+let confirmMsg=`Start/switch model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?${nvlinkNote}\nThis downloads any missing files, then boots — takes a few minutes.${exp}${warn}`;
 if(!confirm(confirmMsg))return;
-let body={variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats'),retry:true};
+let body={variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats'),retry:true,nvlink_mode:nvlink!=='auto'?nvlink:null};
 ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent='⏳ preparing & starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function renderLastStart(d){let ls=d.last_start||{};let sumEl=document.getElementById('lastStartSummary');let logEl=document.getElementById('lastStartLog');if(!sumEl||!logEl)return;if(!ls.started_at){sumEl.innerHTML='<span class="label">No model start recorded yet.</span>';logEl.innerHTML='';return}let icon=ls.ok===true?'✓':(ls.ok===false?'✗':'⏳');let variant=ls.variant||'?';let preset=ls.preset||'?';let cacheLabel=ls.cache_ram?'on':'off';let endAt=ls.finished_at||Date.now()/1000;let dur=endAt-ls.started_at;let dm=Math.floor(dur/60);let ds=Math.floor(dur%60);let durStr=dm>0?`${dm}m ${ds}s`:`${ds}s`;let cls=ls.ok===true?'good':(ls.ok===false?'critical':'hot');sumEl.innerHTML=`<span class="${cls}">${icon} ${esc(variant)} · mode ${esc(preset)} · cache ${cacheLabel} · ${durStr}</span>`;let lines=ls.log||[];if(!lines.length){logEl.innerHTML='<div class="label" style="padding:4px 0">No log captured yet.</div>';return}let html=lines.map(l=>`<div class="log-line">${esc(l)}</div>`).join('');logEl.innerHTML=html;logEl.scrollTop=logEl.scrollHeight}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
@@ -4147,6 +4229,7 @@ function liveOptionMap(cmd){let out={};let argv=cmd||[];for(let i=0;i<argv.lengt
 function optionText(flag,value){return value==null?flag:`${flag} ${value}`}
 function selectedPreset(){let el=document.getElementById('presetSel');return el?el.value:'debug'}
 function selectedCacheRam(){if(lastModelInfo&&lastModelInfo.cache_ram_supported===false)return false;let el=document.getElementById('cacheRamChk');return el?el.checked:true}
+function selectedNvlinkMode(){let el=document.getElementById('nvlinkSel');return el?el.value:'auto'}
 function syncCacheControl(mi){let lab=document.getElementById('cacheRamLabel'),chk=document.getElementById('cacheRamChk');if(!lab||!chk)return;let supported=mi.cache_ram_supported!==false&&engineOf(mi)!=='vllm';lab.style.display=supported?'':'none';let key=[mi.container||'',engineOf(mi),supported,!!mi.cache_ram_enabled].join('|');if(key!==lastCacheSourceKey){lastCacheSourceKey=key;cacheRamUserEdited=false}if(!cacheRamUserEdited)chk.checked=supported?!!mi.cache_ram_enabled:true}
 function engineOf(mi){if(mi.engine)return mi.engine;let blob=[mi.image,mi.compose_file,mi.variant].join(' ').toLowerCase();return blob.includes('vllm')?'vllm':'llamacpp'}
 function presetOptionsFor(mi,selected,cacheRam){let opts=engineOf(mi)==='vllm'?(VLLM_PRESET_OPTIONS[selected]||{}):(PRESET_OPTIONS[selected]||{});opts={...opts};if(engineOf(mi)!=='vllm'&&cacheRam)opts['--cache-ram']='8192';return opts}
@@ -4357,14 +4440,14 @@ function applyHeights(){var raw=localStorage.getItem(HEIGHT_KEY);if(!raw)return;
 applyOrder();applySizes();applyHeights();
 var grid=document.querySelector('.grid');if(!grid)return;
 var dragSrc=null;
-for(var i=0;i<grid.children.length;i++)grid.children[i].draggable=true;
-grid.addEventListener('dragstart',function(e){var card=e.target.closest('.card');if(!card)return;dragSrc=card;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')});
-grid.addEventListener('dragend',function(e){var card=e.target.closest('.card');if(!card)return;card.classList.remove('dragging');for(var i=0;i<grid.children.length;i++)grid.children[i].classList.remove('drag-over');dragSrc=null;saveOrder()});
+grid.addEventListener('mousedown',function(e){var handle=e.target.closest('.drag-handle');var card=e.target.closest('.card');if(!card)return;card.draggable=!!handle});
+grid.addEventListener('dragstart',function(e){var card=e.target.closest('.card');if(!card||!card.draggable)return;dragSrc=card;card.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain','')});
+grid.addEventListener('dragend',function(e){var card=e.target.closest('.card');if(!card)return;card.draggable=false;card.classList.remove('dragging');for(var i=0;i<grid.children.length;i++)grid.children[i].classList.remove('drag-over');dragSrc=null;saveOrder()});
 grid.addEventListener('dragover',function(e){e.preventDefault();e.dataTransfer.dropEffect='move';var card=e.target.closest('.card');if(!card||card===dragSrc)return;for(var i=0;i<grid.children.length;i++)grid.children[i].classList.remove('drag-over');card.classList.add('drag-over')});
 grid.addEventListener('dragleave',function(e){if(e.target.classList.contains('card'))e.target.classList.remove('drag-over')});
 grid.addEventListener('drop',function(e){e.preventDefault();var card=e.target.closest('.card');if(!card||!dragSrc||card===dragSrc)return;card.classList.remove('drag-over');var children=[].slice.call(grid.children);var fromIdx=children.indexOf(dragSrc);var toIdx=children.indexOf(card);if(fromIdx<toIdx)card.after(dragSrc);else card.before(dragSrc)});
 grid.addEventListener('click',function(e){var btn=e.target.closest('.resize-btn');if(!btn)return;var card=btn.closest('.card');if(!card)return;if(btn.classList.contains('resize-btn-w')){if(!card.classList.contains('half')&&!card.classList.contains('full'))card.classList.add('half');else if(card.classList.contains('half')){card.classList.remove('half');card.classList.add('full')}else card.classList.remove('full');saveSizes()}else if(btn.classList.contains('resize-btn-h')){card.classList.toggle('height-expanded');btn.classList.toggle('active');saveHeights()}});
-var obs=new MutationObserver(function(mutations){mutations.forEach(function(m){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];if(n.nodeType===1&&n.classList&&n.classList.contains('card'))n.draggable=true}})});
+var obs=new MutationObserver(function(mutations){mutations.forEach(function(m){for(var i=0;i<m.addedNodes.length;i++){var n=m.addedNodes[i];if(n.nodeType===1&&n.classList&&n.classList.contains('card'))n.draggable=false}})});
 obs.observe(grid,{childList:true});
 })();
 connect();
@@ -4506,7 +4589,8 @@ def handle_observer_post(handler):
             variant = str(body.get("variant", ""))
             preset, cache_ram = observer_control_options(body, "baseline")
             force = bool(body.get("force"))
-            print(f"[observer] SWITCH: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force}", flush=True)
+            nvlink_mode = body.get("nvlink_mode") or None
+            print(f"[observer] SWITCH: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force} nvlink_mode={nvlink_mode!r}", flush=True)
             variant = normalize_switch_variant(variant, state.catalog)
             print(f"[observer] SWITCH: normalized variant={variant!r}", flush=True)
             validate_switch(variant, state.catalog, force=force)
@@ -4519,7 +4603,8 @@ def handle_observer_post(handler):
             threading.Thread(
                 target=_switch_worker,
                 args=(repo, variant, preset, _config["monitor_port"], force),
-                kwargs={"cache_ram": cache_ram, "started_at": started_at},
+                kwargs={"cache_ram": cache_ram, "started_at": started_at,
+                        "nvlink_mode": nvlink_mode},
                 name="observer-switch",
                 daemon=True,
             ).start()
@@ -4537,8 +4622,9 @@ def handle_observer_post(handler):
             preset, cache_ram = observer_control_options(body, "baseline")
             force = bool(body.get("force"))
             retry = bool(body.get("retry"))
+            nvlink_mode = body.get("nvlink_mode") or None
             variant = normalize_switch_variant(variant, state.catalog)
-            print(f"[observer] INSTALL: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force} retry={retry}", flush=True)
+            print(f"[observer] INSTALL: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force} retry={retry} nvlink_mode={nvlink_mode!r}", flush=True)
             validate_switch(variant, state.catalog, force=True)
             if retry:
                 check_restart_allowed(state, force=force)
@@ -4555,7 +4641,8 @@ def handle_observer_post(handler):
                     repo, variant, preset, _config["monitor_port"], force,
                     retry, setup,
                 ),
-                kwargs={"cache_ram": cache_ram, "started_at": started_at},
+                kwargs={"cache_ram": cache_ram, "started_at": started_at,
+                        "nvlink_mode": nvlink_mode},
                 name="observer-install",
                 daemon=True,
             ).start()
