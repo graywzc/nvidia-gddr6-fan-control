@@ -1344,6 +1344,7 @@ VLLM_PRESET_ENV = {
 CACHE_RAM_TWEAK = ("--cache-ram", "8192")
 
 _control_lock = threading.Lock()
+_boot_abort = threading.Event()
 
 
 def audit(action, detail, path=AUDIT_LOG):
@@ -2369,6 +2370,8 @@ def wait_until_serving(monitor_port, timeout=SERVING_READY_TIMEOUT,
     deadline = start + timeout
     url = f"http://127.0.0.1:{monitor_port}/v1/models"
     while time.time() < deadline:
+        if _boot_abort.is_set():
+            raise RuntimeError("boot aborted by user")
         data = fetch(url)
         if data and (data.get("data") or []):
             return time.time() - start
@@ -2632,6 +2635,7 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
     load), and the final ready-wait that marks the model actually serving.
     """
     ready_waiter = ready_waiter or wait_until_serving
+    _boot_abort.clear()
     state.start_run("start", variant, preset, cache_ram)
     try:
         with profiled_load("switch", variant=variant, preset=preset,
@@ -2687,6 +2691,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                     override_path=OVERRIDE_FILE, cache_ram=False,
                     started_at=None, ready_waiter=None, nvlink_mode=None):
     ready_waiter = ready_waiter or wait_until_serving
+    _boot_abort.clear()
     state.start_run("start", variant, preset, cache_ram)
     try:
         with profiled_load("install", variant=variant, preset=preset,
@@ -2778,6 +2783,7 @@ def _restart_worker(preset, monitor_port, cache_ram=None, runner=_run,
     again — and what makes the profile's total a true end-to-end measurement.
     """
     ready_waiter = ready_waiter or wait_until_serving
+    _boot_abort.clear()
     variant = (state.model_info or {}).get("variant")
     try:
         with profiled_load("restart", variant=variant, preset=preset,
@@ -3990,7 +3996,7 @@ DASHBOARD_HTML = """<!doctype html>
 <option value="baseline">baseline</option><option value="debug" selected>debug</option>
 </select><label id="cacheRamLabel" class="btn" title="llama.cpp only: set --cache-ram 8192 for host-RAM prompt cache"><input id="cacheRamChk" type="checkbox" checked onchange="cacheRamUserEdited=true;renderModelInfoFromState()"> cache-ram 8192</label><select id="nvlinkSel" class="btn" title="NVLINK_MODE passed to detect_nvlink.sh inside the container">
 <option value="auto" selected>nvlink: auto</option><option value="force_off">nvlink: force_off</option><option value="pcie_p2p">nvlink: pcie_p2p</option><option value="force_on">nvlink: force_on</option>
-</select><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div>
+</select><button id="btnRestart" class="btn" onclick="doRestart()">Restart model</button><button id="btnStop" class="btn" onclick="doStop()">Stop model</button><button id="btnAbort" class="btn" style="display:none;color:var(--red)" onclick="doAbort()">Abort boot</button><button class="btn" onclick="doUpdate()">Update club-3090</button><span id="ctlStatus" class="label"></span></div>
 <div id="lastStartSummary" style="padding:8px 0;font-size:12px"></div>
 <div id="lastStartLog" class="docker-logs" style="max-height:180px;min-height:24px;border-top:1px solid var(--border);padding:4px 0"></div>
 </section>
@@ -4056,9 +4062,11 @@ let lastActive=0;
 let lastBusy=false;
 function render(d){scheduleRender(d)}
 function doRender(d){if(window.getSelection&&window.getSelection().toString().length>0)return;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderLastStart(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function doAbort(){if(!confirm('Abort the in-progress boot and stop the container?'))return;let st=document.getElementById('ctlStatus');st.textContent='⏳ aborting…';ctlPost('/observer/api/abort',{}).then(r=>{st.textContent='✓ aborted'}).catch(e=>{st.textContent='✗ '+e.message})}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doStartOrSwitch('${esc(h.variant)}','${esc(h.status||'')}')">Install + retry</button>`}st.innerHTML=msg}
-document.querySelectorAll('.controls .btn').forEach(b=>b.disabled=lastBusy);
+let ab=document.getElementById('btnAbort');if(ab)ab.style.display=(d.control_busy&&cs.action&&!cs.done)?'':'none';
+document.querySelectorAll('.controls .btn').forEach(b=>{if(b.id!=='btnAbort')b.disabled=lastBusy});
 // Restart/Stop act on a running container; when nothing is up they 409 or
 // no-op, so disable them and point at the catalog's Start buttons instead.
 let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
@@ -4524,7 +4532,8 @@ def handle_observer_post(handler):
     path = handler.path.split("?", 1)[0]
     if path not in ("/observer/api/update", "/observer/api/restart",
                     "/observer/api/stop", "/observer/api/switch",
-                    "/observer/api/install", "/observer/api/compare"):
+                    "/observer/api/install", "/observer/api/compare",
+                    "/observer/api/abort"):
         return False
     body = {}
     length = int(handler.headers.get("Content-Length") or 0)
@@ -4559,6 +4568,19 @@ def handle_observer_post(handler):
             _send_json(handler, 400, {"error": str(e)})
         except Exception as e:
             _send_json(handler, 409, {"error": str(e)})
+        return True
+    if path == "/observer/api/abort":
+        if not _control_lock.locked():
+            _send_json(handler, 409, {"error": "no boot in progress"})
+            return True
+        _boot_abort.set()
+        try:
+            result = stop_model(repo=_config.get("model_repo"))
+        except Exception as e:
+            _send_json(handler, 500, {"error": str(e)})
+            return True
+        audit("abort", "user aborted in-progress boot")
+        _send_json(handler, 200, {"aborted": True, **result})
         return True
     if not _control_lock.acquire(blocking=False):
         print(f"[observer] {path}: rejected — another control action is running", flush=True)
