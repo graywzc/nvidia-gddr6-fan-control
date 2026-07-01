@@ -3323,7 +3323,7 @@ def poll_honcho_health():
                 r = subprocess.run(
                     ["docker", "exec", "honcho-database-1", "psql", "-U", "postgres",
                      "-d", "postgres", "-t", "-c",
-                     "SELECT (SELECT count(*) FROM messages WHERE workspace_name='hermes') || '|' || (SELECT count(*) FROM documents WHERE deleted_at IS NULL) || '|' || (SELECT count(*) FROM queue WHERE processed=false) || '|' || coalesce(to_char((SELECT max(created_at) FROM messages WHERE workspace_name='hermes'), 'YYYY-MM-DD HH24:MI:SS'), '') || '|' || coalesce(to_char((SELECT max(created_at) FROM documents WHERE deleted_at IS NULL), 'YYYY-MM-DD HH24:MI:SS'), '') ')"],
+                     "SELECT (SELECT count(*) FROM messages WHERE workspace_name='hermes') || '|' || (SELECT count(*) FROM documents WHERE deleted_at IS NULL) || '|' || (SELECT count(*) FROM queue WHERE processed=false) || '|' || coalesce(to_char((SELECT max(created_at) FROM messages WHERE workspace_name='hermes'), 'YYYY-MM-DD HH24:MI:SS'), '') || '|' || coalesce(to_char((SELECT max(created_at) FROM documents WHERE deleted_at IS NULL), 'YYYY-MM-DD HH24:MI:SS'), '')"],
                     capture_output=True, text=True, timeout=10)
                 if r.returncode == 0:
                     parts = r.stdout.strip().split("|")
