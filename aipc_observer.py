@@ -1229,12 +1229,18 @@ def _dual_card_rows(markdown):
 def _doc_row_matches_variant(row, key, entry):
     raw = row.get("_raw") or ""
     compose_path = entry.get("compose_path") or ""
-    if key and re.search(rf"(?<![\w/-]){re.escape(key)}(?![\w/-])", raw):
+    model = entry.get("model") or ""
+    if key and re.search(rf"(?<![\\w/-]){re.escape(key)}(?![\\w/-])", raw):
         return True
     if compose_path and compose_path in raw:
         return True
     base = os.path.basename(compose_path)
-    if base and base in raw:
+    if base and re.search(rf"(?<![\\w.\\-]){re.escape(base)}(?![\\w.\\-])", raw):
+        # Require the model name also appears in the row to prevent cross-model
+        # false matches (e.g. Gemma variant matching a Qwen Carnice row just
+        # because both compose files are named bf16-mtp.yml).
+        if model and model not in raw:
+            return False
         return True
     return False
 
