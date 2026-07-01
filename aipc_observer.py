@@ -3323,24 +3323,27 @@ def poll_honcho_health():
                 r = subprocess.run(
                     ["docker", "exec", "honcho-database-1", "psql", "-U", "postgres",
                      "-d", "postgres", "-t", "-c",
-                     "SELECT (SELECT count(*) FROM messages WHERE workspace_name='hermes') || '|' || (SELECT count(*) FROM documents WHERE deleted_at IS NULL) || '|' || (SELECT count(*) FROM queue WHERE processed=false)"],
+                     "SELECT (SELECT count(*) FROM messages WHERE workspace_name='hermes') || '|' || (SELECT count(*) FROM documents WHERE deleted_at IS NULL) || '|' || (SELECT count(*) FROM queue WHERE processed=false) || '|' || coalesce(to_char((SELECT max(created_at) FROM messages WHERE workspace_name='hermes'), 'YYYY-MM-DD HH24:MI:SS'), '') || '|' || coalesce(to_char((SELECT max(created_at) FROM documents WHERE deleted_at IS NULL), 'YYYY-MM-DD HH24:MI:SS'), '')"],
                     capture_output=True, text=True, timeout=10)
                 if r.returncode == 0:
                     parts = r.stdout.strip().split("|")
                     health["messages"] = int(parts[0]) if len(parts) > 0 else 0
                     health["documents"] = int(parts[1]) if len(parts) > 1 else 0
                     health["queue_pending"] = int(parts[2]) if len(parts) > 2 else 0
+                    health["last_message_at"] = parts[3].strip() if len(parts) > 3 else ""
+                    health["last_document_at"] = parts[4].strip() if len(parts) > 4 else ""
             except Exception:
                 pass
-            # Deriver last activity
+            # Deriver last activity and progress
             try:
                 r = subprocess.run(
-                    ["docker", "logs", "honcho-deriver-1", "--tail", "20"],
+                    ["docker", "logs", "honcho-deriver-1", "--tail", "30"],
                     capture_output=True, text=True, timeout=10)
                 import re as _re
-                m = _re.findall(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*PERFORMANCE', r.stdout or r.stderr or '')
+                m = _re.findall(r"(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}).*PERFORMANCE.*ending_message_id=(\\d+)", r.stdout or r.stderr or "")
                 if m:
-                    health["deriver_last"] = m[-1]
+                    health["deriver_last"] = m[-1][0]
+                    health["deriver_last_id"] = int(m[-1][1])
                     health["deriver_status"] = "active"
                 else:
                     health["deriver_status"] = "idle"
@@ -4274,7 +4277,7 @@ function flagValue(v){return v===undefined?'<span class="label">-</span>':(v===n
 function flagCompareRows(vars,rows,help){if(!rows||!rows.length)return '<div class="row"><span class="label">No command flags found</span></div>';let helpFailed=!!(help&&help.error);let missingDesc=helpFailed?'<span class="hot">help unavailable</span>':'<span class="hot">not found in --help</span>';let cols=`minmax(150px,.8fr) minmax(260px,1.3fr) repeat(${vars.length}, minmax(180px,1fr))`;let html=`<div class="flag-compare" style="grid-template-columns:${cols}"><div class="flag-cell head">Flag</div><div class="flag-cell head">Definition</div>`+vars.map(v=>`<div class="flag-cell head">${esc(v.variant)}</div>`).join('');html+=rows.map(r=>{let vals=vars.map(v=>Object.prototype.hasOwnProperty.call(r.values||{},v.variant)?r.values[v.variant]:undefined);let present=vals.filter(v=>v!==undefined).map(v=>v===null?'':String(v));let changed=new Set(present).size>1||present.length!==vals.length;let desc=r.known?esc(r.description||'listed in --help without description'):missingDesc;let aliases=(r.aliases||[]).filter(a=>a!==r.flag).join(', ');let title=aliases?` title="aliases: ${esc(aliases)}"`:'';return `<div class="flag-cell mono"${title}>${esc(r.flag)}</div><div class="flag-cell flag-desc">${desc}</div>`+vals.map(v=>`<div class="flag-cell mono ${changed?'changed':'same'}">${flagValue(v)}</div>`).join('')}).join('');return html+'</div>'}
 function renderCompareModal(data){let vars=data.variants||[];let help=data.help||{};let helpNote=help.error?`<div class="row"><span class="label">Help source</span><span class="value mono">${esc(help.source||'not available')}</span></div><div class="row"><span class="critical">help: ${esc(help.error)}</span></div>`:(help.source?`<div class="row"><span class="label">Help source</span><span class="value mono">${esc(help.source)}${help.warning?' · '+esc(help.warning):''}</span></div>`:'<div class="row"><span class="label">Help source</span><span class="value">not available</span></div>');document.getElementById('compareModalTitle').textContent=`Command compare (${vars.length})`;document.getElementById('compareModalBody').innerHTML=helpNote+flagCompareRows(vars,data.flag_matrix||[],help)+det('detCompareRaw',false,'raw compose details',`<div class="compare-grid">${vars.map(compareCard).join('')}</div>`);document.getElementById('compareModal').classList.add('open')}
 function compareSelectedVariants(){let variants=[...compareSelections];if(variants.length<2||variants.length>4){updateCompareToolbar();return}let btn=document.getElementById('btnCompareVariants');if(btn)btn.disabled=true;ctlPost('/observer/api/compare',{variants}).then(renderCompareModal).catch(e=>{document.getElementById('compareModalTitle').textContent='Command compare';document.getElementById('compareModalBody').innerHTML=`<div class="row"><span class="critical">${esc(e.message)}</span></div>`;document.getElementById('compareModal').classList.add('open')}).finally(()=>updateCompareToolbar())}
-function renderHoncho(d){let h=d.honcho_health||{};let el=document.getElementById('honchoInfo');if(!el)return;let api=h.api||'unknown';let apiCls=api==='up'?'good':'critical';let deriver=h.deriver_status||'unknown';let deriverCls=deriver==='active'?'good':(deriver==='idle'?'hot':'critical');let rows='';rows+=infoRow('API',`<span class=\"${apiCls}\">${esc(api)}</span>`);rows+=infoRow('Deriver',`<span class=\"${deriverCls}\">${esc(deriver)}</span>`+(h.deriver_last?' <span class=\"label\">'+esc(h.deriver_last)+'</span>':''));if(h.messages!=null)rows+=infoRow('Messages',Number(h.messages).toLocaleString());if(h.documents!=null)rows+=infoRow('Observations',Number(h.documents).toLocaleString());if(h.queue_pending!=null)rows+=infoRow('Queue',Number(h.queue_pending).toLocaleString());el.innerHTML=rows||'<div class=\"row\"><span class=\"label\">No Honcho data yet</span></div>'}
+function renderHoncho(d){let h=d.honcho_health||{};let el=document.getElementById('honchoInfo');if(!el)return;let api=h.api||'unknown';let apiCls=api==='up'?'good':'critical';let deriver=h.deriver_status||'unknown';let deriverCls=deriver==='active'?'good':(deriver==='idle'?'hot':'critical');let rows='';rows+=infoRow('API',`<span class=\"${apiCls}\">${esc(api)}</span>`);let deriverInfo=`<span class=\"${deriverCls}\">${esc(deriver)}</span>`;if(h.deriver_last)deriverInfo+=' <span class=\"label\">'+esc(h.deriver_last)+'</span>';if(h.deriver_last_id!=null&&h.messages!=null){let behind=h.messages-h.deriver_last_id;if(behind>0)deriverInfo+=` <span class=\"hot\">${behind} msgs behind</span>`;else deriverInfo+=' <span class=\"good\">caught up</span>'}rows+=infoRow('Deriver',deriverInfo);if(h.messages!=null)rows+=infoRow('Messages',Number(h.messages).toLocaleString()+(h.last_message_at?' <span class=\"label\">'+esc(h.last_message_at)+'</span>':''));if(h.documents!=null)rows+=infoRow('Observations',Number(h.documents).toLocaleString()+(h.last_document_at?' <span class=\"label\">'+esc(h.last_document_at)+'</span>':''));if(h.queue_pending!=null)rows+=infoRow('Queue',Number(h.queue_pending).toLocaleString());el.innerHTML=rows||'<div class=\"row\"><span class=\"label\">No Honcho data yet</span></div>'}
 
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
 if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
