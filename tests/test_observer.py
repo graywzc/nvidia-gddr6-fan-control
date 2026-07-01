@@ -1726,6 +1726,63 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(s["spec"], m["spec_accept_pct"])
         self.assertIn("t", s)
 
+    def test_zero_vllm_gauges_prune_preexisting_active_rows(self):
+        state = aipc_observer.ObserverState()
+        state.add_active_request({
+            "task_id": "chatcmpl-old",
+            "request_id": "chatcmpl-old",
+            "start_time": 100.0,
+        })
+
+        removed = state.prune_vllm_inactive_requests({
+            "engine": "vllm",
+            "available": True,
+            "processing": 0,
+            "queued": 0,
+            "scraped_at": 200.0,
+        })
+
+        self.assertEqual(removed, 1)
+        self.assertEqual(state.snapshot()["active_requests"], [])
+
+    def test_busy_vllm_gauges_keep_active_rows(self):
+        state = aipc_observer.ObserverState()
+        state.add_active_request({
+            "task_id": "chatcmpl-live",
+            "request_id": "chatcmpl-live",
+            "start_time": 100.0,
+        })
+
+        removed = state.prune_vllm_inactive_requests({
+            "engine": "vllm",
+            "available": True,
+            "processing": 1,
+            "queued": 0,
+            "scraped_at": 200.0,
+        })
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(state.snapshot()["active_requests"]), 1)
+
+    def test_zero_vllm_gauges_keep_rows_newer_than_scrape(self):
+        state = aipc_observer.ObserverState()
+        state.add_active_request({
+            "task_id": "chatcmpl-new",
+            "request_id": "chatcmpl-new",
+            "start_time": 300.0,
+        })
+
+        removed = state.prune_vllm_inactive_requests({
+            "engine": "vllm",
+            "available": True,
+            "processing": 0,
+            "queued": 0,
+            "scraped_at": 200.0,
+        })
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(state.snapshot()["active_requests"]), 1)
+
 
 class VllmLogTrackerTests(unittest.TestCase):
     # Real vLLM streaming shapes (see vllm/entrypoints/logger.py).

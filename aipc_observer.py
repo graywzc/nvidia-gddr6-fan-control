@@ -250,6 +250,29 @@ class ObserverState:
                 ) > SLOTS_POLL_INTERVAL * 2:
                     del self.active_requests[task_id]
 
+    def prune_vllm_inactive_requests(self, metrics=None):
+        """Drop vLLM rows that the authoritative engine gauges prove inactive.
+
+        vLLM does not expose per-request slots, and the log tail can miss the
+        final "Generated response" line that normally clears an active row.
+        When a fresh metrics scrape reports zero running and zero waiting
+        requests, any row that already existed at the scrape time is a ghost.
+        """
+        metrics = metrics or self.metrics
+        if metrics.get("engine") != "vllm" or not metrics.get("available"):
+            return 0
+        if metrics.get("processing") != 0 or metrics.get("queued") != 0:
+            return 0
+        scraped_at = metrics.get("scraped_at") or time.time()
+        removed = 0
+        with self.lock:
+            for task_id in list(self.active_requests):
+                req = self.active_requests[task_id]
+                if req.get("request_id") and req.get("start_time", 0) <= scraped_at:
+                    del self.active_requests[task_id]
+                    removed += 1
+        return removed
+
     def set_vram_temps(self, mapping):
         with self.lock:
             self.vram_temps = dict(mapping)
@@ -3077,12 +3100,13 @@ def poll_metrics(monitor_port):
                 metrics = summarize_vllm_metrics(text, prev_vllm)
                 prev_vllm = metrics
                 state.set_metrics(metrics)
+                pruned = state.prune_vllm_inactive_requests(metrics)
                 state.add_vllm_sample(vllm_timeline_sample(metrics))
                 # Push while there's activity so throughput updates live, not
                 # only when the running/queued counts flip.
                 sig = (metrics.get("queued"), metrics.get("processing"),
                        round(metrics.get("gen_tps_avg") or 0))
-                if sig != last_sig:
+                if sig != last_sig or pruned:
                     last_sig = sig
                     state.notify_subscribers()
             else:
