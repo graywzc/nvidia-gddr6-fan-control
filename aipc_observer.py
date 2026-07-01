@@ -136,8 +136,6 @@ class ObserverState:
         self.control_status = {}
         # Recent raw docker log lines for the Docker Logs card.
         self.docker_logs = deque(maxlen=500)
-        # Honcho memory backend health (deriver status, message/document counts).
-        self.honcho_health = {}
         # Recent end-to-end model-load profiles (button click -> serving).
         self.load_profiles = deque(maxlen=LOAD_PROFILE_HISTORY)
         # Most recent model start action (merged install+start/switch).
@@ -352,10 +350,6 @@ class ObserverState:
         with self.lock:
             self.docker_logs.append(line.rstrip())
 
-    def set_honcho_health(self, health):
-        with self.lock:
-            self.honcho_health = dict(health)
-
     def add_load_profile(self, record):
         with self.lock:
             self.load_profiles.append(record)
@@ -460,7 +454,6 @@ class ObserverState:
                 "active_load_profile": active_profile,
                 "watchdog": _watchdog.summary(),
                 "docker_logs": list(self.docker_logs)[-100:],
-                "honcho_health": dict(self.honcho_health),
                 "uptime_seconds": uptime,
                 "uptime_human": format_duration(uptime),
                 "gpu_stats": list(self.gpu_stats),
@@ -3304,55 +3297,6 @@ def poll_repo(repo):
         _repo_wake.clear()
 
 
-HONCHO_POLL_INTERVAL = 30.0
-
-def poll_honcho_health():
-    while True:
-        try:
-            health = {}
-            # API health
-            try:
-                r = subprocess.run(
-                    ["curl", "-sf", "http://100.110.105.33:8000/health"],
-                    capture_output=True, text=True, timeout=5)
-                health["api"] = "up" if r.returncode == 0 else "down"
-            except Exception:
-                health["api"] = "unreachable"
-            # DB stats
-            try:
-                r = subprocess.run(
-                    ["docker", "exec", "honcho-database-1", "psql", "-U", "postgres",
-                     "-d", "postgres", "-t", "-c",
-                     "SELECT (SELECT count(*) FROM messages WHERE workspace_name='hermes') || '|' || (SELECT count(*) FROM documents WHERE deleted_at IS NULL) || '|' || (SELECT count(*) FROM queue WHERE processed=false)"],
-                    capture_output=True, text=True, timeout=10)
-                if r.returncode == 0:
-                    parts = r.stdout.strip().split("|")
-                    health["messages"] = int(parts[0]) if len(parts) > 0 else 0
-                    health["documents"] = int(parts[1]) if len(parts) > 1 else 0
-                    health["queue_pending"] = int(parts[2]) if len(parts) > 2 else 0
-            except Exception:
-                pass
-            # Deriver last activity
-            try:
-                r = subprocess.run(
-                    ["docker", "logs", "honcho-deriver-1", "--tail", "20"],
-                    capture_output=True, text=True, timeout=10)
-                import re as _re
-                m = _re.findall(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*PERFORMANCE', r.stdout or r.stderr or '')
-                if m:
-                    health["deriver_last"] = m[-1]
-                    health["deriver_status"] = "active"
-                else:
-                    health["deriver_status"] = "idle"
-            except Exception:
-                health["deriver_status"] = "error"
-            state.set_honcho_health(health)
-            state.notify_subscribers()
-        except Exception as e:
-            print(f"WARNING: observer honcho health poll error: {e}", file=sys.stderr)
-        time.sleep(HONCHO_POLL_INTERVAL)
-
-
 def overlay_vram_temps(gpus, vram_temps):
     """Replace each GPU's nvidia-smi mem temp with the gddr6 reading when known."""
     for g in gpus:
@@ -4087,7 +4031,6 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="lastStartLog" class="docker-logs" style="max-height:180px;min-height:24px;border-top:1px solid var(--border);padding:4px 0"></div>
 </section>
 <section class="card"><h2><span>club-3090 Catalog</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="catalogInfo"></div></section>
-<section class="card"><h2><span>Honcho Memory</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="honchoInfo"></div></section>
 <section class="card"><h2><span>Server Metrics</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="metricsInfo"></div></section>
 <section class="card full" id="vllmTimelineCard"><h2><span>vLLM Activity (live)</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="vllmTimeline"></div></section>
 <section class="card full" id="loadProfileCard" style="display:none"><h2><span>Model Load Profile</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="loadProfile"></div></section>
@@ -4148,7 +4091,7 @@ function scheduleRender(d){lastRenderData=d;if(_renderRaf)return;_renderRaf=requ
 let lastActive=0;
 let lastBusy=false;
 function render(d){scheduleRender(d)}
-function doRender(d){if(window.getSelection&&window.getSelection().toString().length>0)return;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderHoncho(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderLastStart(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
+function doRender(d){if(window.getSelection&&window.getSelection().toString().length>0)return;lastActive=(d.active_requests||[]).length;lastBusy=!!d.control_busy;renderHeader(d);renderGpu(d.gpu_stats||[]);renderCaseFans(d.case_fans||[]);renderGpuHistory(d);renderSummary(d);renderSlots(d);renderModelInfo(d);renderCatalog(d);renderMetrics(d);renderVllmTimeline(d);renderLoadProfile(d);renderHealth(d);renderControl(d);renderLastStart(d);renderRequests(d.requests||[],d.active_requests||[]);renderDockerLogs(d);refreshVariantListIfOpen();document.getElementById('uptime').textContent=d.uptime_human;document.getElementById('updated').textContent=new Date().toLocaleTimeString()}
 function doAbort(){if(!confirm('Abort the in-progress boot and stop the container?'))return;let st=document.getElementById('ctlStatus');st.textContent='⏳ aborting…';ctlPost('/observer/api/abort',{}).then(r=>{st.textContent='✓ aborted'}).catch(e=>{st.textContent='✗ '+e.message})}
 function renderControl(d){let cs=d.control_status||{};let st=document.getElementById('ctlStatus');
 if(cs.action&&(!cs.done||(Date.now()/1000-(cs.updated_at||0))<120)){let msg=(cs.done?(cs.ok?'✓ ':'✗ '):'⏳ ')+esc(cs.detail||'');let h=cs.install_hint;if(h&&!cs.ok){msg+=` <button class="btn" style="padding:2px 8px" onclick="doStartOrSwitch('${esc(h.variant)}','${esc(h.status||'')}')">Install + retry</button>`}st.innerHTML=msg}
@@ -4274,8 +4217,6 @@ function flagValue(v){return v===undefined?'<span class="label">-</span>':(v===n
 function flagCompareRows(vars,rows,help){if(!rows||!rows.length)return '<div class="row"><span class="label">No command flags found</span></div>';let helpFailed=!!(help&&help.error);let missingDesc=helpFailed?'<span class="hot">help unavailable</span>':'<span class="hot">not found in --help</span>';let cols=`minmax(150px,.8fr) minmax(260px,1.3fr) repeat(${vars.length}, minmax(180px,1fr))`;let html=`<div class="flag-compare" style="grid-template-columns:${cols}"><div class="flag-cell head">Flag</div><div class="flag-cell head">Definition</div>`+vars.map(v=>`<div class="flag-cell head">${esc(v.variant)}</div>`).join('');html+=rows.map(r=>{let vals=vars.map(v=>Object.prototype.hasOwnProperty.call(r.values||{},v.variant)?r.values[v.variant]:undefined);let present=vals.filter(v=>v!==undefined).map(v=>v===null?'':String(v));let changed=new Set(present).size>1||present.length!==vals.length;let desc=r.known?esc(r.description||'listed in --help without description'):missingDesc;let aliases=(r.aliases||[]).filter(a=>a!==r.flag).join(', ');let title=aliases?` title="aliases: ${esc(aliases)}"`:'';return `<div class="flag-cell mono"${title}>${esc(r.flag)}</div><div class="flag-cell flag-desc">${desc}</div>`+vals.map(v=>`<div class="flag-cell mono ${changed?'changed':'same'}">${flagValue(v)}</div>`).join('')}).join('');return html+'</div>'}
 function renderCompareModal(data){let vars=data.variants||[];let help=data.help||{};let helpNote=help.error?`<div class="row"><span class="label">Help source</span><span class="value mono">${esc(help.source||'not available')}</span></div><div class="row"><span class="critical">help: ${esc(help.error)}</span></div>`:(help.source?`<div class="row"><span class="label">Help source</span><span class="value mono">${esc(help.source)}${help.warning?' · '+esc(help.warning):''}</span></div>`:'<div class="row"><span class="label">Help source</span><span class="value">not available</span></div>');document.getElementById('compareModalTitle').textContent=`Command compare (${vars.length})`;document.getElementById('compareModalBody').innerHTML=helpNote+flagCompareRows(vars,data.flag_matrix||[],help)+det('detCompareRaw',false,'raw compose details',`<div class="compare-grid">${vars.map(compareCard).join('')}</div>`);document.getElementById('compareModal').classList.add('open')}
 function compareSelectedVariants(){let variants=[...compareSelections];if(variants.length<2||variants.length>4){updateCompareToolbar();return}let btn=document.getElementById('btnCompareVariants');if(btn)btn.disabled=true;ctlPost('/observer/api/compare',{variants}).then(renderCompareModal).catch(e=>{document.getElementById('compareModalTitle').textContent='Command compare';document.getElementById('compareModalBody').innerHTML=`<div class="row"><span class="critical">${esc(e.message)}</span></div>`;document.getElementById('compareModal').classList.add('open')}).finally(()=>updateCompareToolbar())}
-function renderHoncho(d){let h=d.honcho_health||{};let el=document.getElementById('honchoInfo');if(!el)return;let api=h.api||'unknown';let apiCls=api==='up'?'good':'critical';let deriver=h.deriver_status||'unknown';let deriverCls=deriver==='active'?'good':(deriver==='idle'?'hot':'critical');let rows='';rows+=infoRow('API',`<span class=\"${apiCls}\">${esc(api)}</span>`);rows+=infoRow('Deriver',`<span class=\"${deriverCls}\">${esc(deriver)}</span>`+(h.deriver_last?' <span class=\"label\">'+esc(h.deriver_last)+'</span>':''));if(h.messages!=null)rows+=infoRow('Messages',Number(h.messages).toLocaleString());if(h.documents!=null)rows+=infoRow('Observations',Number(h.documents).toLocaleString());if(h.queue_pending!=null)rows+=infoRow('Queue',Number(h.queue_pending).toLocaleString());el.innerHTML=rows||'<div class=\"row\"><span class=\"label\">No Honcho data yet</span></div>'}
-
 function renderCatalog(d){let c=d.catalog||{};let diff=d.catalog_diff||{};let mi=d.model_info||{};let ri=d.repo_info||{};let el=document.getElementById('catalogInfo');
 if(c.error){el.innerHTML=infoRow('Catalog',`<span class="critical">${esc(c.error)}</span>`);return}
 let vars=c.variants||{};let keys=Object.keys(vars);
@@ -5048,11 +4989,6 @@ def start_observer(monitor_port=DEFAULT_MONITOR_PORT, container=DEFAULT_CONTAINE
             name="observer-repo",
             daemon=True,
         ).start()
-    threading.Thread(
-        target=poll_honcho_health,
-        name="observer-honcho",
-        daemon=True,
-    ).start()
     if WATCHDOG_ENABLED:
         threading.Thread(
             target=watch_model_health,
