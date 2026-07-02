@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import SwiftUI
 
@@ -8,12 +9,23 @@ final class StatusPoller: ObservableObject {
     }
     @Published var states: [UUID: HostState] = [:]
 
+    let liveActivities = LiveActivityManager()
+
     private var timer: Timer?
     private let storageKey = "configuredHosts"
+    private var cancellables: Set<AnyCancellable> = []
 
     init() {
         loadHosts()
+        wireLiveActivities()
         start()
+    }
+
+    private func wireLiveActivities() {
+        liveActivities.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        .store(in: &cancellables)
     }
 
     func start() {
@@ -113,6 +125,11 @@ final class StatusPoller: ObservableObject {
                     state.lastError = error.localizedDescription
                 }
                 states[id] = state
+
+                if case .success(let payload) = result,
+                   let host = hosts.first(where: { $0.id == id }) {
+                    liveActivities.update(host: host, payload: payload)
+                }
             }
         }
     }

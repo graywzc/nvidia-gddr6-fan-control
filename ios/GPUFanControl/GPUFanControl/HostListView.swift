@@ -126,6 +126,7 @@ struct HostDetailView: View {
     private var host: Host? { poller.hosts.first { $0.id == hostID } }
     private var state: HostState? { poller.states[hostID] }
     private var payload: HostStatusPayload? { state?.lastPayload }
+    private var isPinned: Bool { poller.liveActivities.pinnedHostID == hostID }
 
     var body: some View {
         List {
@@ -179,6 +180,15 @@ struct HostDetailView: View {
                     Label("Open Observer Dashboard", systemImage: "safari")
                 }
                 .disabled(host?.observerURL == nil)
+
+                Button {
+                    toggleLiveActivityPin()
+                } label: {
+                    Label(
+                        isPinned ? "Unpin Live Activity" : "Pin Live Activity",
+                        systemImage: isPinned ? "pin.slash" : "pin"
+                    )
+                }
             }
         }
         .navigationTitle(host?.name ?? "Host")
@@ -200,6 +210,14 @@ struct HostDetailView: View {
     private func openObserver() {
         guard let url = host?.observerURL else { return }
         UIApplication.shared.open(url)
+    }
+
+    private func toggleLiveActivityPin() {
+        if isPinned {
+            poller.liveActivities.setPinnedHost(nil)
+        } else if let host {
+            poller.liveActivities.setPinnedHost(host)
+        }
     }
 }
 

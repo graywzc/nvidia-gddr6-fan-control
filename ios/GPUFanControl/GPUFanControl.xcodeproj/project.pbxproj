@@ -15,6 +15,14 @@
 		A10000000000000000000006 /* CurveEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* CurveEditor.swift */; };
 		A10000000000000000000007 /* PowerLimitEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* PowerLimitEditor.swift */; };
 		A10000000000000000000008 /* GPUFanControlTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000019 /* GPUFanControlTests.swift */; };
+		A100000000000000000000B6 /* LiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B5 /* LiveActivityManager.swift */; };
+		A100000000000000000000B7 /* GPUStatusActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B0 /* GPUStatusActivityAttributes.swift */; };
+		A100000000000000000000B8 /* GPUStatusActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B0 /* GPUStatusActivityAttributes.swift */; };
+		A100000000000000000000B9 /* SharedViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* SharedViews.swift */; };
+		A100000000000000000000BA /* GPUFanControlWidgetsBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B1 /* GPUFanControlWidgetsBundle.swift */; };
+		A100000000000000000000BB /* GPUStatusLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B2 /* GPUStatusLiveActivity.swift */; };
+		A100000000000000000000BC /* GPUFanControlWidgets.appex in Embed Extensions */ = {isa = PBXBuildFile; fileRef = A100000000000000000000B4 /* GPUFanControlWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A100000000000000000000C9 /* HostStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000012 /* HostStatus.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -24,6 +32,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = A10000000000000000000040;
 			remoteInfo = GPUFanControl;
+		};
+		A100000000000000000000C7 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000060 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A100000000000000000000C0;
+			remoteInfo = GPUFanControlWidgets;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -39,6 +54,12 @@
 		A10000000000000000000018 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000019 /* GPUFanControlTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GPUFanControlTests.swift; sourceTree = "<group>"; };
 		A1000000000000000000001A /* GPUFanControlTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = GPUFanControlTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A100000000000000000000B0 /* GPUStatusActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GPUStatusActivityAttributes.swift; sourceTree = "<group>"; };
+		A100000000000000000000B1 /* GPUFanControlWidgetsBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GPUFanControlWidgetsBundle.swift; sourceTree = "<group>"; };
+		A100000000000000000000B2 /* GPUStatusLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GPUStatusLiveActivity.swift; sourceTree = "<group>"; };
+		A100000000000000000000B3 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A100000000000000000000B4 /* GPUFanControlWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = GPUFanControlWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A100000000000000000000B5 /* LiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -56,6 +77,24 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+A100000000000000000000BF /* Embed Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A100000000000000000000BC /* GPUFanControlWidgets.appex in Embed Extensions */,
+			);
+			name = "Embed Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A100000000000000000000C2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -63,6 +102,8 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000031 /* GPUFanControl */,
+				A100000000000000000000BD /* Shared */,
+				A100000000000000000000BE /* GPUFanControlWidgets */,
 				A10000000000000000000033 /* GPUFanControlTests */,
 				A10000000000000000000032 /* Products */,
 			);
@@ -79,6 +120,7 @@
 				A10000000000000000000013 /* StatusPoller.swift */,
 				A10000000000000000000012 /* HostStatus.swift */,
 				A10000000000000000000018 /* Info.plist */,
+				A100000000000000000000B5 /* LiveActivityManager.swift */,
 			);
 			path = GPUFanControl;
 			sourceTree = "<group>";
@@ -88,6 +130,7 @@
 			children = (
 				A10000000000000000000010 /* GPUFanControl.app */,
 				A1000000000000000000001A /* GPUFanControlTests.xctest */,
+				A100000000000000000000B4 /* GPUFanControlWidgets.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -100,6 +143,24 @@
 			path = GPUFanControlTests;
 			sourceTree = "<group>";
 		};
+		A100000000000000000000BD /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				A100000000000000000000B0 /* GPUStatusActivityAttributes.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		A100000000000000000000BE /* GPUFanControlWidgets */ = {
+			isa = PBXGroup;
+			children = (
+				A100000000000000000000B1 /* GPUFanControlWidgetsBundle.swift */,
+				A100000000000000000000B2 /* GPUStatusLiveActivity.swift */,
+				A100000000000000000000B3 /* Info.plist */,
+			);
+			path = GPUFanControlWidgets;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -110,10 +171,12 @@
 				A10000000000000000000050 /* Sources */,
 				A10000000000000000000020 /* Frameworks */,
 				A10000000000000000000051 /* Resources */,
+				A100000000000000000000BF /* Embed Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				A100000000000000000000C8 /* PBXTargetDependency */,
 			);
 			name = GPUFanControl;
 			productName = GPUFanControl;
@@ -138,6 +201,23 @@
 			productReference = A1000000000000000000001A /* GPUFanControlTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		A100000000000000000000C0 /* GPUFanControlWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A100000000000000000000C4 /* Build configuration list for PBXNativeTarget "GPUFanControlWidgets" */;
+			buildPhases = (
+				A100000000000000000000C1 /* Sources */,
+				A100000000000000000000C2 /* Frameworks */,
+				A100000000000000000000C3 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = GPUFanControlWidgets;
+			productName = GPUFanControlWidgets;
+			productReference = A100000000000000000000B4 /* GPUFanControlWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -149,6 +229,9 @@
 				LastUpgradeCheck = 1540;
 				TargetAttributes = {
 					A10000000000000000000040 = {
+						CreatedOnToolsVersion = 15.4;
+					};
+					A100000000000000000000C0 = {
 						CreatedOnToolsVersion = 15.4;
 					};
 				};
@@ -168,6 +251,7 @@
 			targets = (
 				A10000000000000000000040 /* GPUFanControl */,
 				A10000000000000000000041 /* GPUFanControlTests */,
+				A100000000000000000000C0 /* GPUFanControlWidgets */,
 			);
 		};
 /* End PBXProject section */
@@ -181,6 +265,13 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A10000000000000000000053 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A100000000000000000000C3 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -201,6 +292,8 @@
 				A10000000000000000000005 /* HostListView.swift in Sources */,
 				A10000000000000000000006 /* CurveEditor.swift in Sources */,
 				A10000000000000000000007 /* PowerLimitEditor.swift in Sources */,
+				A100000000000000000000B6 /* LiveActivityManager.swift in Sources */,
+				A100000000000000000000B7 /* GPUStatusActivityAttributes.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -212,6 +305,18 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		A100000000000000000000C1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A100000000000000000000B8 /* GPUStatusActivityAttributes.swift in Sources */,
+				A100000000000000000000B9 /* SharedViews.swift in Sources */,
+				A100000000000000000000BA /* GPUFanControlWidgetsBundle.swift in Sources */,
+				A100000000000000000000BB /* GPUStatusLiveActivity.swift in Sources */,
+				A100000000000000000000C9 /* HostStatus.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -219,6 +324,11 @@
 			isa = PBXTargetDependency;
 			target = A10000000000000000000040 /* GPUFanControl */;
 			targetProxy = A10000000000000000000090 /* PBXContainerItemProxy */;
+		};
+		A100000000000000000000C8 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A100000000000000000000C0 /* GPUFanControlWidgets */;
+			targetProxy = A100000000000000000000C7 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -441,6 +551,59 @@
 			};
 			name = Release;
 		};
+		A100000000000000000000C5 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = GPUFanControlWidgets/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.graywzc.gpufancontrol.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A100000000000000000000C6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = GPUFanControlWidgets/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.graywzc.gpufancontrol.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -467,6 +630,15 @@
 			buildConfigurations = (
 				A10000000000000000000084 /* Debug */,
 				A10000000000000000000085 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A100000000000000000000C4 /* Build configuration list for PBXNativeTarget "GPUFanControlWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A100000000000000000000C5 /* Debug */,
+				A100000000000000000000C6 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
