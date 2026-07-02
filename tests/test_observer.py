@@ -8,6 +8,65 @@ import unittest
 from unittest import mock
 
 import aipc_observer
+import honcho_health
+
+
+class _Completed:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class HonchoHealthTests(unittest.TestCase):
+    def test_parse_deriver_logs_reports_batch_progress_and_caught_up(self):
+        logs = (
+            "2026-07-02 01:02:03 INFO PERFORMANCE ending_message_id=42\n"
+            "age flush tokens=120 < 500\n"
+        )
+
+        health = honcho_health._parse_deriver_logs(logs, queue_pending=0)
+
+        self.assertEqual(health["deriver_status"], "caught up")
+        self.assertEqual(health["deriver_last"], "2026-07-02 01:02:03")
+        self.assertEqual(health["deriver_last_id"], 42)
+        self.assertEqual(health["batch_tokens"], 120)
+        self.assertEqual(health["batch_max"], 500)
+
+    def test_parse_deriver_logs_reports_active_when_queue_pending(self):
+        health = honcho_health._parse_deriver_logs("", queue_pending=3)
+
+        self.assertEqual(health["deriver_status"], "active")
+
+    def test_collect_honcho_health_combines_api_db_and_deriver(self):
+        calls = []
+
+        def runner(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[:2] == ["curl", "-sf"]:
+                return _Completed(returncode=0)
+            if cmd[:3] == ["docker", "exec", "honcho-database-1"]:
+                query = cmd[-1]
+                if "id > 42" in query:
+                    return _Completed(stdout="0\n")
+                return _Completed(
+                    stdout="223|106|0|2026-07-01 16:34:41|2026-07-01 16:59:58\n"
+                )
+            if cmd[:3] == ["docker", "logs", "honcho-deriver-1"]:
+                return _Completed(
+                    stdout="2026-07-02 01:02:03 INFO PERFORMANCE ending_message_id=42\n"
+                )
+            raise AssertionError(cmd)
+
+        health = honcho_health.collect_honcho_health(runner=runner)
+
+        self.assertEqual(health["api"], "up")
+        self.assertEqual(health["messages"], 223)
+        self.assertEqual(health["documents"], 106)
+        self.assertEqual(health["queue_pending"], 0)
+        self.assertEqual(health["deriver_status"], "caught up")
+        self.assertEqual(health["pending_msgs"], 0)
+        self.assertGreaterEqual(len(calls), 4)
 
 
 class RequestTrackerTests(unittest.TestCase):
