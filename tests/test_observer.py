@@ -19,6 +19,32 @@ class _Completed:
 
 
 class HonchoHealthTests(unittest.TestCase):
+    def test_embedding_health_reports_model_and_dimensions(self):
+        def runner(cmd, **kwargs):
+            self.assertEqual(cmd[:4], ["curl", "-sfS", "-X", "POST"])
+            return _Completed(
+                stdout=json.dumps(
+                    {
+                        "model": "BAAI/bge-m3",
+                        "data": [{"embedding": [0.1, 0.2, 0.3]}],
+                    }
+                )
+            )
+
+        health = honcho_health._embedding_health(runner)
+
+        self.assertEqual(health["embedding"], "up")
+        self.assertEqual(health["embedding_model"], "BAAI/bge-m3")
+        self.assertEqual(health["embedding_dims"], 3)
+
+    def test_embedding_health_reports_down_on_endpoint_failure(self):
+        def runner(cmd, **kwargs):
+            return _Completed(returncode=7, stderr="connection refused")
+
+        health = honcho_health._embedding_health(runner)
+
+        self.assertEqual(health["embedding"], "down")
+
     def test_parse_deriver_logs_reports_batch_progress_and_caught_up(self):
         logs = (
             "2026-07-02 01:02:03 INFO PERFORMANCE ending_message_id=42\n"
@@ -45,6 +71,15 @@ class HonchoHealthTests(unittest.TestCase):
             calls.append(cmd)
             if cmd[:2] == ["curl", "-sf"]:
                 return _Completed(returncode=0)
+            if cmd[:4] == ["curl", "-sfS", "-X", "POST"]:
+                return _Completed(
+                    stdout=json.dumps(
+                        {
+                            "model": "BAAI/bge-m3",
+                            "data": [{"embedding": [0.1] * 1024}],
+                        }
+                    )
+                )
             if cmd[:3] == ["docker", "exec", "honcho-database-1"]:
                 query = cmd[-1]
                 if "id > 42" in query:
@@ -64,6 +99,8 @@ class HonchoHealthTests(unittest.TestCase):
         self.assertEqual(health["messages"], 223)
         self.assertEqual(health["documents"], 106)
         self.assertEqual(health["queue_pending"], 0)
+        self.assertEqual(health["embedding"], "up")
+        self.assertEqual(health["embedding_dims"], 1024)
         self.assertEqual(health["deriver_status"], "caught up")
         self.assertEqual(health["pending_msgs"], 0)
         self.assertGreaterEqual(len(calls), 4)

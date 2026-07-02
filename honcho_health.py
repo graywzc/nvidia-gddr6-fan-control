@@ -1,5 +1,6 @@
 """Honcho memory health polling for the observer dashboard."""
 
+import json
 import re
 import subprocess
 import sys
@@ -8,6 +9,8 @@ import time
 
 HONCHO_POLL_INTERVAL = 30.0
 HONCHO_BASE_URL = "http://100.110.105.33:8000"
+HONCHO_EMBEDDING_URL = "http://100.110.105.33:8766/v1/embeddings"
+HONCHO_EMBEDDING_MODEL = "BAAI/bge-m3"
 HONCHO_WORKSPACE = "hermes"
 HONCHO_DATABASE_CONTAINER = "honcho-database-1"
 HONCHO_DERIVER_CONTAINER = "honcho-deriver-1"
@@ -35,6 +38,7 @@ def collect_honcho_health(runner=subprocess.run):
     """
     health = {}
     health.update(_api_health(runner))
+    health.update(_embedding_health(runner))
     health.update(_db_stats(runner))
     health.update(_deriver_health(runner, health))
     return health
@@ -46,6 +50,45 @@ def _api_health(runner):
         return {"api": "up" if result.returncode == 0 else "down"}
     except Exception:
         return {"api": "unreachable"}
+
+
+def _embedding_health(runner):
+    body = json.dumps(
+        {
+            "model": HONCHO_EMBEDDING_MODEL,
+            "input": "observer health check",
+            "encoding_format": "float",
+        }
+    )
+    try:
+        result = _run(
+            runner,
+            [
+                "curl",
+                "-sfS",
+                "-X",
+                "POST",
+                HONCHO_EMBEDDING_URL,
+                "-H",
+                "Content-Type: application/json",
+                "-d",
+                body,
+            ],
+            timeout=20,
+        )
+        if result.returncode != 0:
+            return {"embedding": "down"}
+        payload = json.loads(result.stdout or "{}")
+        embedding = payload.get("data", [{}])[0].get("embedding", [])
+        if not isinstance(embedding, list) or not embedding:
+            return {"embedding": "bad response"}
+        return {
+            "embedding": "up",
+            "embedding_model": payload.get("model") or HONCHO_EMBEDDING_MODEL,
+            "embedding_dims": len(embedding),
+        }
+    except Exception:
+        return {"embedding": "unreachable"}
 
 
 def _db_stats(runner):
