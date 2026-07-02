@@ -26,6 +26,8 @@ import urllib.request
 from collections import deque
 from datetime import datetime
 
+import honcho_health
+
 DEFAULT_MONITOR_PORT = 8020
 # None => auto-detect the container publishing the monitor port.
 DEFAULT_CONTAINER = None
@@ -3304,74 +3306,8 @@ def poll_repo(repo):
         _repo_wake.clear()
 
 
-HONCHO_POLL_INTERVAL = 30.0
-
 def poll_honcho_health():
-    while True:
-        try:
-            health = {}
-            # API health
-            try:
-                r = subprocess.run(
-                    ["curl", "-sf", "http://100.110.105.33:8000/health"],
-                    capture_output=True, text=True, timeout=5)
-                health["api"] = "up" if r.returncode == 0 else "down"
-            except Exception:
-                health["api"] = "unreachable"
-            # DB stats
-            try:
-                r = subprocess.run(
-                    ["docker", "exec", "honcho-database-1", "psql", "-U", "postgres",
-                     "-d", "postgres", "-t", "-c",
-                     "SELECT (SELECT count(*) FROM messages WHERE workspace_name='hermes') || '|' || (SELECT count(*) FROM documents WHERE deleted_at IS NULL) || '|' || (SELECT count(*) FROM queue WHERE processed=false) || '|' || coalesce(to_char((SELECT max(created_at) FROM messages WHERE workspace_name='hermes'), 'YYYY-MM-DD HH24:MI:SS'), '') || '|' || coalesce(to_char((SELECT max(created_at) FROM documents WHERE deleted_at IS NULL), 'YYYY-MM-DD HH24:MI:SS'), '')"],
-                    capture_output=True, text=True, timeout=10)
-                if r.returncode == 0:
-                    parts = r.stdout.strip().split("|")
-                    health["messages"] = int(parts[0]) if len(parts) > 0 else 0
-                    health["documents"] = int(parts[1]) if len(parts) > 1 else 0
-                    health["queue_pending"] = int(parts[2]) if len(parts) > 2 else 0
-                    health["last_message_at"] = parts[3].strip() if len(parts) > 3 else ""
-                    health["last_document_at"] = parts[4].strip() if len(parts) > 4 else ""
-            except Exception:
-                pass
-            # Deriver last activity and progress
-            try:
-                r = subprocess.run(
-                    ["docker", "logs", "honcho-deriver-1", "--tail", "30"],
-                    capture_output=True, text=True, timeout=10)
-                import re as _re
-                m = _re.findall(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*PERFORMANCE.*ending_message_id=(\d+)", r.stdout or r.stderr or "")
-                # Also parse age-flushing lines for batch token progress
-                age = _re.findall(r"tokens=(\d+) < (\d+)", r.stdout or r.stderr or "")
-                if age:
-                    health["batch_tokens"] = int(age[-1][0])
-                    health["batch_max"] = int(age[-1][1])
-                if health.get("queue_pending", 0) > 0:
-                    health["deriver_status"] = "active"
-                elif m:
-                    health["deriver_last"] = m[-1][0]
-                    health["deriver_last_id"] = int(m[-1][1])
-                    health["deriver_status"] = "caught up"
-                    # Query actual pending count (IDs may have gaps across workspaces)
-                    try:
-                        r2 = subprocess.run(
-                            ["docker", "exec", "honcho-database-1", "psql", "-U", "postgres",
-                             "-d", "postgres", "-t", "-c",
-                             f"SELECT count(*) FROM messages WHERE workspace_name='hermes' AND id > {health['deriver_last_id']}"],
-                            capture_output=True, text=True, timeout=10)
-                        if r2.returncode == 0:
-                            health["pending_msgs"] = int(r2.stdout.strip()) if r2.stdout.strip() else 0
-                    except Exception:
-                        pass
-                else:
-                    health["deriver_status"] = "caught up"
-            except Exception:
-                health["deriver_status"] = "error"
-            state.set_honcho_health(health)
-            state.notify_subscribers()
-        except Exception as e:
-            print(f"WARNING: observer honcho health poll error: {e}", file=sys.stderr)
-        time.sleep(HONCHO_POLL_INTERVAL)
+    honcho_health.poll_honcho_health(state.set_honcho_health, state.notify_subscribers)
 
 
 def overlay_vram_temps(gpus, vram_temps):
