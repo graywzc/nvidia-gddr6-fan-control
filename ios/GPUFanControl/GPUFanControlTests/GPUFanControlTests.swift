@@ -1,3 +1,4 @@
+import ActivityKit
 import XCTest
 @testable import GPUFanControl
 
@@ -82,6 +83,91 @@ final class GPUFanControlTests: XCTestCase {
             powerLimitMaxW: nil,
             powerLimitDefaultW: nil,
             powerLimitSupported: nil
+        )
+    }
+}
+
+// MARK: - Live Activity Tests
+
+extension GPUFanControlTests {
+    func testActivityContentStateRoundTripsThroughJSON() throws {
+        let original = GPUStatusActivityAttributes.ContentState(
+            vramTempC: 88,
+            fanPct: 74,
+            gpuUtilPct: 62,
+            powerW: 215.4,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(
+            GPUStatusActivityAttributes.ContentState.self,
+            from: data
+        )
+
+        XCTAssertEqual(decoded.vramTempC, original.vramTempC)
+        XCTAssertEqual(decoded.fanPct, original.fanPct)
+        XCTAssertEqual(decoded.gpuUtilPct, original.gpuUtilPct)
+        XCTAssertEqual(decoded.powerW, original.powerW)
+        XCTAssertEqual(decoded.updatedAt, original.updatedAt)
+        XCTAssertEqual(decoded, original)
+    }
+
+    func testLiveActivityThrottleDecision() {
+        let now = Date()
+        let baseState = GPUStatusActivityAttributes.ContentState(
+            vramTempC: 88,
+            fanPct: 74,
+            gpuUtilPct: 62,
+            powerW: 215.4,
+            updatedAt: now
+        )
+
+        // Pushes when previous is nil
+        XCTAssertTrue(
+            LiveActivityManager.shouldPush(
+                previous: nil,
+                lastPushDate: nil,
+                new: baseState,
+                now: now
+            )
+        )
+
+        // Skips when values identical and 1 s elapsed
+        XCTAssertFalse(
+            LiveActivityManager.shouldPush(
+                previous: baseState,
+                lastPushDate: now.addingTimeInterval(-1),
+                new: baseState,
+                now: now
+            )
+        )
+
+        // Pushes when values identical but 6 s elapsed
+        XCTAssertTrue(
+            LiveActivityManager.shouldPush(
+                previous: baseState,
+                lastPushDate: now.addingTimeInterval(-6),
+                new: baseState,
+                now: now
+            )
+        )
+
+        // Pushes immediately when a value changed
+        let changedState = GPUStatusActivityAttributes.ContentState(
+            vramTempC: 89,
+            fanPct: 74,
+            gpuUtilPct: 62,
+            powerW: 215.4,
+            updatedAt: now
+        )
+        XCTAssertTrue(
+            LiveActivityManager.shouldPush(
+                previous: baseState,
+                lastPushDate: now.addingTimeInterval(-1),
+                new: changedState,
+                now: now
+            )
         )
     }
 }
