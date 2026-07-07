@@ -90,6 +90,12 @@ OOM_LOG_SIGNATURES = (
     "cuda error: out of memory",
     "out of memory",
 )
+# Crash-evidence log dump: before the first revive of a crash episode, capture
+# the tail of the crashed container's logs to a file so forensics survive
+# container recreation.
+CRASH_DUMP_DIR = "/var/log/aipc-observer-crash-dumps"
+CRASH_DUMP_TAIL = 500   # lines of docker logs to capture
+CRASH_DUMP_KEEP = 20    # newest dump files retained; older pruned
 
 HOSTNAME = socket.gethostname().split(".")[0]
 
@@ -4779,8 +4785,76 @@ def classify_crash(container_name, logs, runner=_run):
     return "unresponsive"
 
 
+def dump_crash_logs(container_name, buffered_logs, reason=None, model=None,
+                    dump_dir=CRASH_DUMP_DIR):
+    """Persist crash evidence to a file before the revive destroys it.
+
+    Returns the path written, or None. Must never raise.
+    """
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = container_name or "unknown"
+        fname = f"{ts}-{name}.log"
+        fpath = os.path.join(dump_dir, fname)
+
+        # Primary source: docker logs (merge stderr — vLLM/llama.cpp write to stderr)
+        log_lines = ""
+        source = "docker-logs"
+        if container_name:
+            try:
+                result = subprocess.run(
+                    ["docker", "logs", "--tail", str(CRASH_DUMP_TAIL), container_name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=30,
+                )
+                log_lines = result.stdout
+            except Exception:
+                log_lines = ""
+
+        # Fallback to ring-buffer if docker logs produced nothing
+        if not log_lines:
+            log_lines = "\n".join(buffered_logs) if buffered_logs else ""
+            source = "ring-buffer"
+
+        # Write the file with header
+        header_ts = datetime.now().isoformat()
+        with open(fpath, "w") as f:
+            f.write(f"Timestamp: {header_ts}\n")
+            f.write(f"Container: {name}\n")
+            f.write(f"Reason: {reason or 'unknown'}\n")
+            f.write(f"Model: {model or 'unknown'}\n")
+            f.write(f"Source: {source}\n")
+            f.write("---\n")
+            f.write(log_lines)
+            if not log_lines.endswith("\n"):
+                f.write("\n")
+
+        # Retention: delete oldest dumps beyond CRASH_DUMP_KEEP
+        try:
+            dumps = sorted(f for f in os.listdir(dump_dir) if f.endswith(".log"))
+            while len(dumps) > CRASH_DUMP_KEEP:
+                oldest = dumps.pop(0)
+                os.remove(os.path.join(dump_dir, oldest))
+        except Exception:
+            pass  # retention failure is non-critical
+
+        return fpath
+    except Exception:
+        return None
+
+
 def _classify_crash_now():
     return classify_crash(state.container_name, list(state.docker_logs))
+
+
+def _dump_crash_logs_now(reason=None, model=None):
+    return dump_crash_logs(
+        state.container_name, list(state.docker_logs),
+        reason=reason, model=model,
+    )
 
 
 def _revive_model():
@@ -4806,9 +4880,15 @@ def _watchdog_notify(event, **info):
     if event == "down":
         reason = info.get("reason", "")
         tags = ["rotating_light"] + (["warning"] if reason.startswith("OOM") else [])
-        send_ntfy(
+        msg = (
             f"Model on {host} is DOWN: {reason}. "
-            f"model={info.get('model') or '?'}. Attempting auto-revive.",
+            f"model={info.get('model') or '?'}. Attempting auto-revive."
+        )
+        dump_path = info.get("dump")
+        if dump_path:
+            msg += f" Logs: {dump_path}."
+        send_ntfy(
+            msg,
             title=f"{host} model down", priority="urgent", tags=tags,
         )
     elif event == "revived":
@@ -4849,6 +4929,8 @@ class WatchdogState:
         self.gave_up = False
         self.last_reason = None
         self.deliberately_stopped = False
+        # Path to the crash-evidence dump file for the current episode.
+        self.last_dump = None
 
     def summary(self, now=None):
         now = time.monotonic() if now is None else now
@@ -4860,6 +4942,7 @@ class WatchdogState:
             "gave_up": self.gave_up,
             "last_reason": self.last_reason,
             "deliberately_stopped": self.deliberately_stopped,
+            "last_dump": self.last_dump,
         }
 
     def _reset(self):
@@ -4868,6 +4951,7 @@ class WatchdogState:
         self.down_since = None
         self.next_attempt_at = 0.0
         self.gave_up = False
+        self.last_dump = None
 
     def mark_deliberately_stopped(self):
         self.deliberately_stopped = True
@@ -4877,11 +4961,12 @@ class WatchdogState:
         self.deliberately_stopped = False
 
     def tick(self, now, status, control_busy, *,
-             classify=None, revive=None, notify=None, model=None):
+             classify=None, revive=None, notify=None, dump=None, model=None):
         """Advance the machine one probe. `status` is "ready"|"loading"|"down"."""
         classify = classify or _classify_crash_now
         revive = revive or _revive_model
         notify = notify or _watchdog_notify
+        dump = dump or _dump_crash_logs_now
 
         if status == "ready":
             self.seen_healthy = True
@@ -4913,8 +4998,12 @@ class WatchdogState:
             self.armed = False
             reason = classify()
             self.last_reason = reason
+            # Dump crash logs once per episode (before first revive destroys them)
+            self.last_dump = dump(reason=reason, model=model)
+            if self.last_dump:
+                audit("watchdog", f"crash logs dumped: {self.last_dump}")
             audit("watchdog", f"model down: {reason}")
-            notify("down", reason=reason, model=model)
+            notify("down", reason=reason, model=model, dump=self.last_dump)
         if self.attempts >= MAX_REVIVE_ATTEMPTS:
             if not self.gave_up:
                 self.gave_up = True

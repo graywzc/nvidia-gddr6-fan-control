@@ -2,7 +2,9 @@
 """Tests for integrated aipc observer request parsing."""
 
 import json
+import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -3185,6 +3187,7 @@ class WatchdogStateTests(unittest.TestCase):
         self.events = []
         self.revives = 0
         self.revive_result = (True, "preset=baseline")
+        self.dump_calls = []
 
     def _notify(self, event, **info):
         self.events.append((event, info))
@@ -3196,10 +3199,15 @@ class WatchdogStateTests(unittest.TestCase):
         self.revives += 1
         return self.revive_result
 
+    def _dump(self, **kwargs):
+        self.dump_calls.append(kwargs)
+        return "/tmp/crash-dump.log"
+
     def tick(self, now, status, control_busy=False):
         self.wd.tick(
             now, status, control_busy,
-            classify=self._classify, revive=self._revive, notify=self._notify,
+            classify=self._classify, revive=self._revive,
+            notify=self._notify, dump=self._dump,
         )
 
     def test_never_healthy_never_alarms(self):
@@ -3291,6 +3299,159 @@ class WatchdogStateTests(unittest.TestCase):
         self.tick(2000, "down")             # down-clock starts again
         self.tick(2000 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
         self.assertEqual([e for e, _ in self.events].count("down"), 2)
+
+    def test_dump_called_once_per_crash_episode(self):
+        # dump fires exactly once when the crash is confirmed (armed=True),
+        # not on subsequent revive attempts within the same episode.
+        self.tick(0, "ready")
+        self.tick(5, "down")
+        self.tick(5 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        self.assertEqual(len(self.dump_calls), 1)
+        # Drive more down ticks to trigger revive attempts 2 and 3.
+        now = 5 + aipc_observer.WATCHDOG_DOWN_GRACE + 2
+        for _ in range(400):
+            now += 5
+            self.tick(now, "down")
+        # Still only one dump call — revives 2/3 must NOT dump again.
+        self.assertEqual(len(self.dump_calls), 1)
+
+    def test_dump_called_again_in_new_episode(self):
+        # After recovery, a new crash episode should trigger another dump.
+        self.tick(0, "ready")
+        self.tick(5, "down")
+        self.tick(5 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        self.assertEqual(len(self.dump_calls), 1)
+        self.tick(1000, "ready")            # recovery resets
+        self.tick(2000, "down")
+        self.tick(2000 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        self.assertEqual(len(self.dump_calls), 2)
+
+    def test_dump_not_called_before_first_health(self):
+        for now in range(0, 200, 5):
+            self.tick(now, "down")
+        self.assertEqual(len(self.dump_calls), 0)
+
+    def test_dump_not_called_during_loading(self):
+        self.tick(0, "ready")
+        for now in range(5, 5 + int(aipc_observer.WATCHDOG_DOWN_GRACE) + 20, 5):
+            self.tick(now, "loading")
+        self.assertEqual(len(self.dump_calls), 0)
+
+    def test_dump_not_called_when_control_busy(self):
+        self.tick(0, "ready")
+        for now in range(5, 5 + int(aipc_observer.WATCHDOG_DOWN_GRACE) + 20, 5):
+            self.tick(now, "down", control_busy=True)
+        self.assertEqual(len(self.dump_calls), 0)
+
+    def test_dump_not_called_after_deliberate_stop(self):
+        self.tick(0, "ready")
+        self.wd.mark_deliberately_stopped()
+        for now in range(5, 5 + int(aipc_observer.WATCHDOG_DOWN_GRACE) + 20, 5):
+            self.tick(now, "down")
+        self.assertEqual(len(self.dump_calls), 0)
+
+    def test_summary_exposes_last_dump(self):
+        self.tick(0, "ready")
+        self.assertIsNone(self.wd.summary().get("last_dump"))
+        self.tick(5, "down")
+        self.tick(5 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        self.assertEqual(self.wd.summary()["last_dump"], "/tmp/crash-dump.log")
+
+    def test_down_notification_includes_dump_path(self):
+        self.tick(0, "ready")
+        self.tick(5, "down")
+        self.tick(5 + aipc_observer.WATCHDOG_DOWN_GRACE + 1, "down")
+        down_info = next(i for e, i in self.events if e == "down")
+        self.assertEqual(down_info["dump"], "/tmp/crash-dump.log")
+
+
+class DumpCrashLogsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+
+    def test_happy_path_writes_file_with_docker_logs(self):
+        from unittest import mock
+        fake_output = "line 1\nline 2\nline 3\n"
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout=fake_output)):
+            path = aipc_observer.dump_crash_logs(
+                "my-container", [], reason="OOM", model="llama3",
+                dump_dir=self.tmpdir.name,
+            )
+        self.assertIsNotNone(path)
+        self.assertTrue(path.endswith("my-container.log"))
+        content = open(path).read()
+        self.assertIn("Container: my-container", content)
+        self.assertIn("Reason: OOM", content)
+        self.assertIn("Model: llama3", content)
+        self.assertIn("Source: docker-logs", content)
+        self.assertIn(fake_output, content)
+
+    def test_fallback_to_ring_buffer_on_docker_failure(self):
+        from unittest import mock
+        buffered = ["ring line 1", "ring line 2"]
+        with mock.patch("subprocess.run", side_effect=TimeoutError("timeout")):
+            path = aipc_observer.dump_crash_logs(
+                "my-container", buffered, reason="crash",
+                dump_dir=self.tmpdir.name,
+            )
+        self.assertIsNotNone(path)
+        content = open(path).read()
+        self.assertIn("Source: ring-buffer", content)
+        self.assertIn("ring line 1", content)
+        self.assertIn("ring line 2", content)
+
+    def test_fallback_to_ring_buffer_on_empty_docker_output(self):
+        from unittest import mock
+        buffered = ["ring line 1"]
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout="")):
+            path = aipc_observer.dump_crash_logs(
+                "my-container", buffered,
+                dump_dir=self.tmpdir.name,
+            )
+        self.assertIsNotNone(path)
+        content = open(path).read()
+        self.assertIn("Source: ring-buffer", content)
+        self.assertIn("ring line 1", content)
+
+    def test_fallback_when_container_name_none(self):
+        from unittest import mock
+        buffered = ["fallback line"]
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout="docker output")):
+            path = aipc_observer.dump_crash_logs(
+                None, buffered,
+                dump_dir=self.tmpdir.name,
+            )
+        self.assertIsNotNone(path)
+        self.assertTrue(path.endswith("unknown.log"))
+        content = open(path).read()
+        # container_name is None so docker command is skipped → ring-buffer fallback
+        self.assertIn("Source: ring-buffer", content)
+        self.assertIn("fallback line", content)
+
+    def test_retention_prunes_oldest_dumps(self):
+        from unittest import mock
+        # Create more dump files than CRASH_DUMP_KEEP allows
+        for i in range(aipc_observer.CRASH_DUMP_KEEP + 5):
+            fpath = os.path.join(
+                self.tmpdir.name,
+                f"20260101-00000{i:02d}-old.log",
+            )
+            with open(fpath, "w") as f:
+                f.write(f"old dump {i}\n")
+        # Now write a new dump (mock subprocess to avoid real docker)
+        with mock.patch("subprocess.run", return_value=mock.Mock(stdout="new")):
+            aipc_observer.dump_crash_logs(
+                "new", [], dump_dir=self.tmpdir.name,
+            )
+        remaining = [f for f in os.listdir(self.tmpdir.name) if f.endswith(".log")]
+        self.assertLessEqual(len(remaining), aipc_observer.CRASH_DUMP_KEEP)
+
+    def test_never_raises_on_unwritable_dir(self):
+        result = aipc_observer.dump_crash_logs(
+            "c", [], dump_dir="/nonexistent/dir/that/does/not/exist",
+        )
+        self.assertIsNone(result)
 
 
 class DashboardHtmlTests(unittest.TestCase):
