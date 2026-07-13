@@ -1881,6 +1881,30 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertEqual(len(state.snapshot()["active_requests"]), 1)
 
+    def test_zero_vllm_gauges_keep_newborn_rows(self):
+        # vLLM's running/waiting gauges lag the "Received request" log line by
+        # up to a couple of seconds, and scraped_at is stamped after the HTTP
+        # fetch — so a 0/0 scrape can postdate a row created for a request the
+        # gauges haven't seen yet. Newborn rows must survive that scrape.
+        state = aipc_observer.ObserverState()
+        now = time.time()
+        state.add_active_request({
+            "task_id": "chatcmpl-newborn",
+            "request_id": "chatcmpl-newborn",
+            "start_time": now - 0.5,
+        })
+
+        removed = state.prune_vllm_inactive_requests({
+            "engine": "vllm",
+            "available": True,
+            "processing": 0,
+            "queued": 0,
+            "scraped_at": now,
+        })
+
+        self.assertEqual(removed, 0)
+        self.assertEqual(len(state.snapshot()["active_requests"]), 1)
+
 
 class VllmLogTrackerTests(unittest.TestCase):
     # Real vLLM streaming shapes (see vllm/entrypoints/logger.py).
@@ -1950,6 +1974,18 @@ class VllmLogTrackerTests(unittest.TestCase):
         # Output preview captured (apostrophe in repr unescaped).
         self.assertIn("doesn't stop", row["response_output"])
         self.assertGreaterEqual(row["total_ms"], 0)
+
+    def test_streaming_delta_reinserts_pruned_row(self):
+        # If the metrics pruner wrongly dropped a live row (gauge-lag race),
+        # the next streaming delta must put it back, not silently update a
+        # row that no longer exists.
+        self.tracker.process_line(self.RECV)
+        self.state.remove_active_request("chatcmpl-abc")
+        self.tracker.process_line(self.DELTA1)
+        rows = self.state.snapshot()["active_requests"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["task_id"], "chatcmpl-abc")
+        self.assertEqual(rows[0]["completion_tokens"], 2)
 
     def test_delta_without_arrival_is_dropped(self):
         self.tracker.process_line(self.DELTA1)  # observer started mid-stream

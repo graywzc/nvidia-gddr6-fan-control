@@ -267,6 +267,11 @@ class ObserverState:
         final "Generated response" line that normally clears an active row.
         When a fresh metrics scrape reports zero running and zero waiting
         requests, any row that already existed at the scrape time is a ghost.
+        Newborn rows are exempt: the gauges lag the "Received request" log
+        line by up to a couple of seconds (and scraped_at is stamped after the
+        HTTP fetch), so a 0/0 scrape can postdate a row whose request the
+        engine simply hasn't reported yet — pruning it would blind the
+        dashboard for that request's entire lifetime.
         """
         metrics = metrics or self.metrics
         if metrics.get("engine") != "vllm" or not metrics.get("available"):
@@ -274,11 +279,14 @@ class ObserverState:
         if metrics.get("processing") != 0 or metrics.get("queued") != 0:
             return 0
         scraped_at = metrics.get("scraped_at") or time.time()
+        now = time.time()
         removed = 0
         with self.lock:
             for task_id in list(self.active_requests):
                 req = self.active_requests[task_id]
-                if req.get("request_id") and req.get("start_time", 0) <= scraped_at:
+                start = req.get("start_time", 0)
+                if (req.get("request_id") and start <= scraped_at
+                        and now - start > METRICS_POLL_INTERVAL * 2):
                     del self.active_requests[task_id]
                     removed += 1
         return removed
@@ -3910,10 +3918,12 @@ class VllmLogTracker:
             req = self.active.get(rid)
             if req is not None and now - meta["push"] > 0.5:
                 meta["push"] = now  # throttle live pushes, not one per token
-                self.state.update_active_request(rid, {
-                    "completion_tokens": meta["tokens"],
-                    "ttft_ms": round((meta["first"] - req["start_time"]) * 1000, 1),
-                })
+                req["completion_tokens"] = meta["tokens"]
+                req["ttft_ms"] = round(
+                    (meta["first"] - req["start_time"]) * 1000, 1)
+                # Re-add rather than update: if the metrics pruner wrongly
+                # dropped this row (gauge-lag race), the next delta restores it.
+                self.state.add_active_request(req)
                 self.state.notify_subscribers()
             return
         # Completion: a streaming-complete line, or a whole non-streaming response.
