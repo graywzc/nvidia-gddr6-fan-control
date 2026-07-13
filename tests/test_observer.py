@@ -2025,6 +2025,66 @@ class VllmLogTrackerTests(unittest.TestCase):
             aipc_observer.vllm_log_tracker)
 
 
+class VllmChatmlPromptTests(unittest.TestCase):
+    """The DEBUG 'details' line carries the full rendered chat-template
+    prompt; ChatML markers let us recover per-role messages instead of
+    keeping only the head of the blob (which is always the same
+    system/tools boilerplate for agent traffic)."""
+
+    SYSTEM = "# Tools\n\nYou have access to the following functions:\n<tools>…"
+
+    def _prompt(self, turns):
+        parts = [f"<|im_start|>system\n{self.SYSTEM}<|im_end|>"]
+        for role, text in turns:
+            parts.append(f"<|im_start|>{role}\n{text}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")  # generation stub
+        return "\n".join(parts)
+
+    def test_chatml_prompt_parsed_into_role_messages(self):
+        p = self._prompt([("user", "check the fan curve please"),
+                          ("assistant", "done, curve looks fine"),
+                          ("user", "now watch VRAM temps")])
+        meta = aipc_observer._vllm_debug_prompt_metadata(repr(p), "None")
+        roles = [m["role"] for m in meta["request_messages"]]
+        self.assertEqual(roles, ["system", "user", "assistant", "user"])
+        # The tail (latest turn) must survive, not just the head.
+        self.assertEqual(meta["request_messages"][-1]["content"],
+                         "now watch VRAM temps")
+        self.assertEqual(meta["request_message_count"], 4)
+
+    def test_chatml_label_is_first_user_message_and_group_stable(self):
+        p1 = self._prompt([("user", "monitor the deal page for RTX drops"),
+                           ("assistant", "ok, watching")])
+        p2 = self._prompt([("user", "monitor the deal page for RTX drops"),
+                           ("assistant", "ok, watching"),
+                           ("user", "also email me when it changes")])
+        m1 = aipc_observer._vllm_debug_prompt_metadata(repr(p1), "None")
+        m2 = aipc_observer._vllm_debug_prompt_metadata(repr(p2), "None")
+        self.assertTrue(
+            m1["request_group_label"].startswith("monitor the deal page"))
+        # Later turns must not change the conversation's group id.
+        self.assertEqual(m1["request_group_id"], m2["request_group_id"])
+
+    def test_chatml_keeps_only_most_recent_messages(self):
+        turns = []
+        for i in range(20):
+            turns.append(("user", f"turn {i}"))
+            turns.append(("assistant", f"reply {i}"))
+        meta = aipc_observer._vllm_debug_prompt_metadata(
+            repr(self._prompt(turns)), "None")
+        self.assertEqual(meta["request_message_count"], 41)  # system + 40
+        self.assertEqual(len(meta["request_messages"]),
+                         aipc_observer.VLLM_MESSAGES_KEPT)
+        self.assertEqual(meta["request_messages"][-1]["content"], "reply 19")
+
+    def test_non_chatml_prompt_falls_back_to_blob(self):
+        meta = aipc_observer._vllm_debug_prompt_metadata(
+            repr("just a plain completion prompt"), "[1, 2]")
+        self.assertEqual(meta["request_messages"][0]["role"], "prompt")
+        self.assertEqual(meta["request_message_count"], 1)
+        self.assertEqual(meta["prompt_tokens"], 2)
+
+
 class TraceLogTests(unittest.TestCase):
     """Lines that only appear under debug/trace logging."""
 

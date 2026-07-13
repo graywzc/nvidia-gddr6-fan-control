@@ -3811,6 +3811,25 @@ def _vllm_extract_output(line, limit=VLLM_OUTPUT_PREVIEW_MAX):
     return s[:limit]
 
 
+# ChatML message boundary in a rendered chat-template prompt (Qwen et al.).
+# The trailing "<|im_start|>assistant\n" generation stub yields an empty
+# content match and is dropped.
+RE_CHATML_MSG = re.compile(
+    r"<\|im_start\|>([^\n<]+)\n(.*?)(?=<\|im_end\|>|<\|im_start\|>|\Z)", re.S)
+# Most recent messages kept per row; older turns only bloat the snapshot
+# (agent prompts reach megabytes) while the group label already identifies
+# the conversation.
+VLLM_MESSAGES_KEPT = 8
+
+
+def _parse_chatml_messages(prompt):
+    return [
+        {"role": role.strip(), "content": content.strip()}
+        for role, content in RE_CHATML_MSG.findall(prompt)
+        if content.strip()
+    ]
+
+
 def _vllm_debug_prompt_metadata(prompt_repr, token_ids_repr):
     try:
         prompt = ast.literal_eval(prompt_repr)
@@ -3818,18 +3837,36 @@ def _vllm_debug_prompt_metadata(prompt_repr, token_ids_repr):
         prompt = prompt_repr
     if prompt is None:
         prompt = ""
-    prompt = _bounded_text(str(prompt), MESSAGE_TEXT_MAX)
-    meta = {
-        "request_messages": [{"role": "prompt", "name": "", "content": prompt}],
-        "request_message_count": 1 if prompt else 0,
-        "request_detail_json": _bounded_json({"prompt": prompt}),
-    }
+    prompt = str(prompt)
+    messages = _parse_chatml_messages(prompt)
+    if messages:
+        kept = [
+            {"role": m["role"], "name": "",
+             "content": _bounded_text(m["content"], MESSAGE_TEXT_MAX)}
+            for m in messages[-VLLM_MESSAGES_KEPT:]
+        ]
+        meta = {
+            "request_messages": kept,
+            "request_detail_json": _bounded_json({"messages": kept}),
+        }
+        # Same label/grouping semantics as the llama.cpp trace path: label by
+        # the first user message, group by the conversation's stable prefix.
+        meta.update(request_group_metadata({"messages": messages}))
+    else:
+        prompt = _bounded_text(prompt, MESSAGE_TEXT_MAX)
+        meta = {
+            "request_messages": [
+                {"role": "prompt", "name": "", "content": prompt}],
+            "request_message_count": 1 if prompt else 0,
+            "request_detail_json": _bounded_json({"prompt": prompt}),
+        }
+        if prompt:
+            meta["request_group_label"] = _shorten(prompt)
+            meta["request_group_id"] = hashlib.sha256(
+                prompt.encode()).hexdigest()[:12]
     if token_ids_repr not in ("None", ""):
         meta["prompt_tokens"] = _vllm_count_debug_ids(token_ids_repr)
         meta["total_tokens"] = meta["prompt_tokens"]
-    if prompt:
-        meta["request_group_label"] = _shorten(prompt)
-        meta["request_group_id"] = hashlib.sha256(prompt.encode()).hexdigest()[:12]
     return meta
 
 
