@@ -1214,12 +1214,15 @@ class RestartModelTests(unittest.TestCase):
         tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
         tmp.close()
         self.override_path = tmp.name
+        self.logging_config_path = tempfile.mktemp(suffix=".json")
         self.runner = FakeRunner(CONFIG_JSON)
 
     def tearDown(self):
         import os
 
         os.unlink(self.override_path)
+        if os.path.exists(self.logging_config_path):
+            os.unlink(self.logging_config_path)
 
     def _restart(self, preset, model_info=None, cache_ram=None):
         return aipc_observer.restart_model(
@@ -1228,6 +1231,7 @@ class RestartModelTests(unittest.TestCase):
             runner=self.runner,
             cache_ram=cache_ram,
             override_path=self.override_path,
+            logging_config_path=self.logging_config_path,
         )
 
     def test_debug_with_cache_resolves_baseline_then_ups_with_override(self):
@@ -1364,7 +1368,7 @@ class RestartModelTests(unittest.TestCase):
         self.assertNotIn("--cache-ram", argv)
         self.assertFalse(result["cache_ram"])
 
-    def test_vllm_debug_sets_debug_logging_env(self):
+    def test_vllm_debug_mounts_scoped_logging_config(self):
         import json
 
         mi = dict(MODEL_INFO)
@@ -1374,7 +1378,22 @@ class RestartModelTests(unittest.TestCase):
         self._restart("debug", model_info=mi)
         with open(self.override_path) as f:
             svc = json.load(f)["services"]["svc"]
-        self.assertEqual(svc["environment"]["VLLM_LOGGING_LEVEL"], "DEBUG")
+        # Scoped config replaces the global DEBUG env: only the request
+        # logger runs at DEBUG, the rest of vLLM stays at INFO.
+        self.assertNotIn("VLLM_LOGGING_LEVEL", svc.get("environment") or {})
+        self.assertEqual(
+            svc["environment"]["VLLM_LOGGING_CONFIG_PATH"],
+            self.logging_config_path,
+        )
+        self.assertIn(
+            f"{self.logging_config_path}:{self.logging_config_path}:ro",
+            svc["volumes"],
+        )
+        with open(self.logging_config_path) as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["loggers"]["vllm"]["level"], "INFO")
+        self.assertEqual(cfg["loggers"]["vllm.entrypoints"]["level"], "DEBUG")
+        self.assertEqual(cfg["handlers"]["vllm"]["level"], "DEBUG")
         self.assertEqual(
             svc["labels"][aipc_observer.OBSERVER_PRESET_LABEL], "debug"
         )
@@ -1383,6 +1402,53 @@ class RestartModelTests(unittest.TestCase):
         )
         self.assertIn("--enable-log-requests", svc["command"])
         self.assertIn("--enable-log-outputs", svc["command"])
+
+    def test_vllm_baseline_writes_no_logging_config(self):
+        import json
+        import os
+
+        mi = dict(MODEL_INFO)
+        mi["image"] = "vllm/vllm-openai:v0.22.0"
+        mi["compose_file"] = "/repo/models/m/vllm/compose/dual/fp8.yml"
+        mi["working_dir"] = "/repo/models/m/vllm/compose/dual"
+        self._restart("baseline", model_info=mi)
+        with open(self.override_path) as f:
+            svc = json.load(f)["services"]["svc"]
+        self.assertNotIn("environment", svc)
+        self.assertNotIn("volumes", svc)
+        self.assertFalse(os.path.exists(self.logging_config_path))
+
+    def test_scoped_logging_config_matches_vllm_defaults(self):
+        # Mirrors vLLM's DEFAULT_LOGGING_CONFIG (vllm/logger.py) so the log
+        # line shape — and thus the observer's parsing regexes — is unchanged.
+        cfg = aipc_observer.vllm_scoped_debug_logging_config()
+        self.assertEqual(cfg["version"], 1)
+        self.assertFalse(cfg["disable_existing_loggers"])
+        fmt = cfg["formatters"]["vllm"]
+        self.assertEqual(fmt["class"], "vllm.logging_utils.NewLineFormatter")
+        self.assertEqual(
+            fmt["format"],
+            "%(levelname)s %(asctime)s [%(fileinfo)s:%(lineno)d] %(message)s",
+        )
+        self.assertEqual(fmt["datefmt"], "%m-%d %H:%M:%S")
+        h = cfg["handlers"]["vllm"]
+        self.assertEqual(h["class"], "logging.StreamHandler")
+        self.assertEqual(h["stream"], "ext://sys.stdout")
+        self.assertEqual(h["level"], "DEBUG")
+        root = cfg["loggers"]["vllm"]
+        self.assertEqual(root["handlers"], ["vllm"])
+        self.assertEqual(root["level"], "INFO")
+        self.assertFalse(root["propagate"])
+        # The request logger subtree propagates to the vllm handler.
+        self.assertEqual(cfg["loggers"]["vllm.entrypoints"], {"level": "DEBUG"})
+
+    def test_build_compose_override_volumes(self):
+        ov = aipc_observer.build_compose_override(
+            "svc", ["--a"], volumes=["/a/b.json:/a/b.json:ro"]
+        )
+        self.assertEqual(
+            ov["services"]["svc"]["volumes"], ["/a/b.json:/a/b.json:ro"]
+        )
 
     def test_vllm_baseline_ignores_cache_toggle(self):
         import json
@@ -2586,13 +2652,18 @@ class BootModelOnceTests(unittest.TestCase):
 
         os.unlink(self.override_path)
 
-    def _boot(self, nvlink_mode=None, config_json=VLLM_CONFIG_JSON):
+    def _boot(self, nvlink_mode=None, config_json=VLLM_CONFIG_JSON,
+              preset="baseline"):
+        import tempfile
+
         runner = FakeRunner(config_json)
         entry = {"compose_path": "models/m/vllm/compose/dual/fp8.yml"}
+        self.logging_config_path = tempfile.mktemp(suffix=".json")
         aipc_observer.boot_model_once(
-            "/repo", "vllm/dual", entry, 8020,
+            "/repo", "vllm/dual", entry, 8020, preset=preset,
             runner=runner, override_path=self.override_path,
             nvlink_mode=nvlink_mode,
+            logging_config_path=self.logging_config_path,
         )
         import json
 
@@ -2618,6 +2689,26 @@ class BootModelOnceTests(unittest.TestCase):
         override, _ = self._boot(nvlink_mode=None)
         env = override["services"]["svc"].get("environment") or {}
         self.assertNotIn("NVLINK_MODE", env)
+
+    def test_vllm_debug_boot_mounts_scoped_logging_config(self):
+        import json
+        import os
+
+        override, _ = self._boot(preset="debug")
+        svc = override["services"]["svc"]
+        env = svc.get("environment") or {}
+        self.assertNotIn("VLLM_LOGGING_LEVEL", env)
+        self.assertEqual(
+            env["VLLM_LOGGING_CONFIG_PATH"], self.logging_config_path)
+        self.assertIn(
+            f"{self.logging_config_path}:{self.logging_config_path}:ro",
+            svc["volumes"],
+        )
+        self.assertTrue(os.path.exists(self.logging_config_path))
+        with open(self.logging_config_path) as f:
+            cfg = json.load(f)
+        self.assertEqual(cfg["loggers"]["vllm.entrypoints"]["level"], "DEBUG")
+        os.unlink(self.logging_config_path)
 
 
 class SwitchWorkerTests(unittest.TestCase):

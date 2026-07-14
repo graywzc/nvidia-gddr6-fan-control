@@ -1026,6 +1026,7 @@ def inspect_container(name):
         "cache_ram_enabled": labeled_cache,
         "cache_ram_supported": cache_supported,
         "vllm_logging_level": env_map.get("VLLM_LOGGING_LEVEL"),
+        "vllm_logging_config": env_map.get("VLLM_LOGGING_CONFIG_PATH"),
         "flags": summarize_command(cmd),
         "help": help_info,
         "command_guide": command_guide(cmd, help_index),
@@ -1390,9 +1391,67 @@ VLLM_PRESET_FLAGS = {
     "baseline": [],
     "debug": VLLM_REQUEST_LOG_FLAGS,
 }
-VLLM_PRESET_ENV = {
-    "debug": {"VLLM_LOGGING_LEVEL": "DEBUG"},
-}
+# Debug mode needs the request logger's DEBUG `details` line (full rendered
+# prompt + token ids) but not the rest of vLLM's DEBUG chatter. A scoped
+# logging config keeps every other vllm.* logger at INFO instead of setting
+# VLLM_LOGGING_LEVEL=DEBUG globally; the file is written on the host and
+# bind-mounted into the container at the same path.
+VLLM_LOGGING_CONFIG_FILE = "/etc/aipc-observer-vllm-logging.json"
+
+
+def vllm_scoped_debug_logging_config():
+    """vLLM dictConfig: request-logger subtree at DEBUG, everything else INFO.
+
+    Mirrors vLLM's DEFAULT_LOGGING_CONFIG (vllm/logger.py) — same formatter
+    class, format and stream — so the emitted line shape (and the observer's
+    parsing regexes) is identical to plain VLLM_LOGGING_LEVEL=DEBUG. Only the
+    logger levels differ: the handler passes DEBUG records, the root vllm
+    logger stays at INFO, and vllm.entrypoints (home of RequestLogger)
+    propagates its DEBUG records up to the shared handler.
+    """
+    return {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "vllm": {
+                "class": "vllm.logging_utils.NewLineFormatter",
+                "datefmt": "%m-%d %H:%M:%S",
+                "format": ("%(levelname)s %(asctime)s "
+                           "[%(fileinfo)s:%(lineno)d] %(message)s"),
+            },
+        },
+        "handlers": {
+            "vllm": {
+                "class": "logging.StreamHandler",
+                "formatter": "vllm",
+                "level": "DEBUG",
+                "stream": "ext://sys.stdout",
+            },
+        },
+        "loggers": {
+            "vllm": {"handlers": ["vllm"], "level": "INFO",
+                     "propagate": False},
+            "vllm.entrypoints": {"level": "DEBUG"},
+        },
+    }
+
+
+def vllm_preset_overrides(mode, logging_config_path=VLLM_LOGGING_CONFIG_FILE):
+    """Environment + volume mounts for a vLLM preset boot.
+
+    Debug writes the scoped logging config to the host and mounts it into the
+    container read-only at the same path. Baseline needs neither.
+    """
+    if mode != "debug":
+        return None, None
+    with open(logging_config_path, "w") as f:
+        json.dump(vllm_scoped_debug_logging_config(), f, indent=1)
+    os.chmod(logging_config_path, 0o644)
+    env = {"VLLM_LOGGING_CONFIG_PATH": logging_config_path}
+    volumes = [f"{logging_config_path}:{logging_config_path}:ro"]
+    return env, volumes
+
+
 CACHE_RAM_TWEAK = ("--cache-ram", "8192")
 
 _control_lock = threading.Lock()
@@ -1553,7 +1612,7 @@ def infer_insight_preset(cmd, engine=None, env=None):
 
 
 def build_compose_override(service, argv=None, image=None, environment=None,
-                           labels=None):
+                           labels=None, volumes=None):
     svc = {
         # Cap docker log growth; club-3090 composes set no logging limits.
         "logging": {
@@ -1572,6 +1631,10 @@ def build_compose_override(service, argv=None, image=None, environment=None,
         svc["environment"] = environment
     if labels:
         svc["labels"] = labels
+    if volumes:
+        # compose merges override volume lists with the base file's by
+        # mount target, so this adds mounts without clobbering existing ones.
+        svc["volumes"] = volumes
     return {"services": {service: svc}}
 
 
@@ -1837,7 +1900,8 @@ def resolve_preset(preset_name, supported):
 
 def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
                     cache_ram=True, force=False, runner=_run,
-                    override_path=OVERRIDE_FILE, nvlink_mode=None):
+                    override_path=OVERRIDE_FILE, nvlink_mode=None,
+                    logging_config_path=VLLM_LOGGING_CONFIG_FILE):
     """Boot a model variant in a single phase — no switch.sh + restart dance.
 
     Resolves the compose config, builds the override with preset flags
@@ -1886,13 +1950,15 @@ def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
     effective_cache_ram = bool(cache_ram) and engine != "vllm"
     argv = None
     preset_env = None
+    preset_volumes = None
     dropped = []
     if mode != "baseline" or effective_cache_ram:
         baseline = compose_baseline_command(compose_path, service_name, env,
                                             cwd, runner=runner)
         if engine == "vllm":
             tweaks = VLLM_PRESET_FLAGS.get(mode, [])
-            preset_env = VLLM_PRESET_ENV.get(mode)
+            preset_env, preset_volumes = vllm_preset_overrides(
+                mode, logging_config_path)
         else:
             tweaks, dropped = resolve_preset(
                 mode, _supported_flags(mi, inspect_container_help))
@@ -1914,6 +1980,7 @@ def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
                     OBSERVER_PRESET_LABEL: mode,
                     OBSERVER_CACHE_RAM_LABEL: str(effective_cache_ram).lower(),
                 },
+                volumes=preset_volumes,
             ),
             fp, indent=1,
         )
@@ -1934,7 +2001,8 @@ def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
 
 
 def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
-                  override_path=OVERRIDE_FILE, help_getter=inspect_container_help):
+                  override_path=OVERRIDE_FILE, help_getter=inspect_container_help,
+                  logging_config_path=VLLM_LOGGING_CONFIG_FILE):
     """Recreate the model container with an observer mode/cache toggle applied.
 
     Presets always build on the compose file's own command (resolved via
@@ -1963,6 +2031,7 @@ def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
     effective_cache_ram = bool(cache_ram) and engine != "vllm"
     argv = None
     preset_env = None
+    preset_volumes = None
     dropped = []
     if mode != "baseline" or effective_cache_ram:
         baseline = compose_baseline_command(compose_file, mi["service"], env,
@@ -1971,7 +2040,8 @@ def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
             # vLLM: inject its own request-logging flags directly; the llama.cpp
             # --help capability probe doesn't apply (and can't run here).
             tweaks = VLLM_PRESET_FLAGS.get(mode, [])
-            preset_env = VLLM_PRESET_ENV.get(mode)
+            preset_env, preset_volumes = vllm_preset_overrides(
+                mode, logging_config_path)
         else:
             tweaks, dropped = resolve_preset(
                 mode, _supported_flags(mi, help_getter))
@@ -1992,6 +2062,7 @@ def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
                     OBSERVER_PRESET_LABEL: mode,
                     OBSERVER_CACHE_RAM_LABEL: str(effective_cache_ram).lower(),
                 },
+                volumes=preset_volumes,
             ),
             f, indent=1,
         )
@@ -4146,7 +4217,7 @@ const VLLM_PRESET_OPTIONS={
 baseline:{},
 debug:{'--enable-log-requests':null,'--enable-log-outputs':null}
 };
-const VLLM_PRESET_ENV={baseline:{},debug:{'VLLM_LOGGING_LEVEL':'DEBUG'}};
+const VLLM_PRESET_ENV={baseline:{},debug:{'VLLM_LOGGING_CONFIG_PATH':'/etc/aipc-observer-vllm-logging.json'}};
 const MANAGED_FLAGS=new Set([...Object.values(PRESET_OPTIONS),...Object.values(VLLM_PRESET_OPTIONS)].flatMap(o=>Object.keys(o)).concat(['--cache-ram']));
 const PRESET_FLAG_ALIASES={'-lv':'--log-verbosity'};
 function presetFlag(flag){return PRESET_FLAG_ALIASES[flag]||flag}
@@ -4341,7 +4412,7 @@ function syncCacheControl(mi){let lab=document.getElementById('cacheRamLabel'),c
 function engineOf(mi){if(mi.engine)return mi.engine;let blob=[mi.image,mi.compose_file,mi.variant].join(' ').toLowerCase();return blob.includes('vllm')?'vllm':'llamacpp'}
 function presetOptionsFor(mi,selected,cacheRam){let opts=engineOf(mi)==='vllm'?(VLLM_PRESET_OPTIONS[selected]||{}):(PRESET_OPTIONS[selected]||{});opts={...opts};if(engineOf(mi)!=='vllm'&&cacheRam)opts['--cache-ram']='8192';return opts}
 function presetEnvFor(mi,selected){return engineOf(mi)==='vllm'?(VLLM_PRESET_ENV[selected]||{}):{}}
-function liveEnvMap(mi){let out={};if(mi.vllm_logging_level)out.VLLM_LOGGING_LEVEL=mi.vllm_logging_level;return out}
+function liveEnvMap(mi){let out={};if(mi.vllm_logging_level)out.VLLM_LOGGING_LEVEL=mi.vllm_logging_level;if(mi.vllm_logging_config)out.VLLM_LOGGING_CONFIG_PATH=mi.vllm_logging_config;return out}
 function presetDiff(mi,selected){let live=liveOptionMap(mi.command||[]);let want=presetOptionsFor(mi,selected,selectedCacheRam());let envLive=liveEnvMap(mi);let envWant=presetEnvFor(mi,selected);let flags=new Set([...Object.keys(live),...Object.keys(want)].filter(f=>MANAGED_FLAGS.has(f)));let rows=[];flags.forEach(flag=>{let hasLive=Object.prototype.hasOwnProperty.call(live,flag);let hasWant=Object.prototype.hasOwnProperty.call(want,flag);if(hasLive&&hasWant&&String(live[flag])!==String(want[flag]))rows.push(`<span class="cmd-add">${esc(flag)}: ${esc(live[flag]??'switch')} → ${esc(want[flag]??'switch')}</span>`);else if(!hasLive&&hasWant)rows.push(`<span class="cmd-add">add ${esc(optionText(flag,want[flag]))}</span>`);else if(hasLive&&!hasWant)rows.push(`<span class="cmd-add">remove ${esc(optionText(flag,live[flag]))}</span>`)});Object.keys(envWant).forEach(k=>{if(String(envLive[k]||'')!==String(envWant[k]))rows.push(`<span class="cmd-add">set ${esc(k)}=${esc(envWant[k])}</span>`)});Object.keys(envLive).forEach(k=>{if(!Object.prototype.hasOwnProperty.call(envWant,k))rows.push(`<span class="cmd-add">unset ${esc(k)}</span>`)});return rows.join('')}
 function renderPresetStatus(mi){let running=mi.preset||'unknown';let selected=selectedPreset();let cls=running==='custom'?'preset-custom':(running===selected?'preset-match':'preset-diff');let rows='';
 rows+=infoRow('Running mode',`<span class="preset-pill ${cls}">${esc(presetLabel(running))}</span>`,PRESET_DESCRIPTIONS[running]||'inferred from the live container command');
@@ -4415,7 +4486,7 @@ if(vllm){meta+=detailField('Max tokens',r.max_tokens);meta+=detailField('Tempera
 let out=r.response_output?`<div class="prewrap">${esc(r.response_output)}</div>`:`<div class="label">${vllm?'No output captured — enable debug mode (--enable-log-outputs) to log responses.':'No response body captured yet. Non-streaming responses require debug logs.'}</div>`;
 let rawReq=r.request_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw request JSON</summary><div class="prewrap">${esc(r.request_detail_json)}</div></details>`:'';
 let rawResp=r.response_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw response JSON</summary><div class="prewrap">${esc(r.response_detail_json)}</div></details>`:'';
-let reqBody=(vllm&&!(r.request_messages&&r.request_messages.length))?'<div class="label">Prompt not logged — restart with debug mode to set VLLM_LOGGING_LEVEL=DEBUG.</div>':renderMessages(r.request_messages);
+let reqBody=(vllm&&!(r.request_messages&&r.request_messages.length))?'<div class="label">Prompt not logged — restart with debug mode to enable request-logger DEBUG logging.</div>':renderMessages(r.request_messages);
 return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${reqBody}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
 function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
 function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
