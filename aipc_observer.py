@@ -260,6 +260,38 @@ class ObserverState:
                 ) > SLOTS_POLL_INTERVAL * 2:
                     del self.active_requests[task_id]
 
+    def attribute_vllm_cache(self, delta_q, delta_h):
+        """Stamp a prefix-cache hit %% onto the request that just scheduled.
+
+        vLLM has no per-request cache metric, but its cumulative
+        prefix_cache_queries counter ticks when a request is scheduled, so a
+        scrape-to-scrape delta belongs to whichever request(s) just entered
+        prefill. Attribute only when unambiguous: a single unattributed row,
+        or a delta matching exactly one row's prompt length within 15%%.
+        Otherwise show nothing rather than guess.
+        """
+        if not delta_q:
+            return 0
+        with self.lock:
+            candidates = [
+                req for req in self.active_requests.values()
+                if req.get("request_id") and req.get("cache_hit_pct") is None
+            ]
+            if len(candidates) != 1:
+                matched = [
+                    req for req in candidates
+                    if req.get("prompt_tokens")
+                    and abs(delta_q - req["prompt_tokens"])
+                    <= 0.15 * req["prompt_tokens"]
+                ]
+                if len(matched) != 1:
+                    return 0
+                candidates = matched
+            req = candidates[0]
+            req["cache_hit_pct"] = round(100.0 * delta_h / delta_q, 1)
+            req["cached_tokens"] = delta_h
+            return 1
+
     def prune_vllm_inactive_requests(self, metrics=None):
         """Drop vLLM rows that the authoritative engine gauges prove inactive.
 
@@ -3129,6 +3161,19 @@ def summarize_vllm_metrics(text, prev=None):
     ph = num("vllm:prefix_cache_hits_total")
     if pq:
         out["prefix_cache_hit_pct"] = round(100.0 * (ph or 0) / pq, 1)
+    if pq is not None:
+        out["prefix_cache_queries_total"] = int(pq)
+    if ph is not None:
+        out["prefix_cache_hits_total"] = int(ph)
+    # Per-scrape counter deltas: the queries counter ticks when a request is
+    # scheduled, so the delta window attributes cache stats to the request(s)
+    # that just entered prefill (see ObserverState.attribute_vllm_cache).
+    if (prev and pq is not None
+            and prev.get("prefix_cache_queries_total") is not None):
+        out["prefix_cache_queries_delta"] = max(
+            0, int(pq) - prev["prefix_cache_queries_total"])
+        out["prefix_cache_hits_delta"] = max(
+            0, int(ph or 0) - (prev.get("prefix_cache_hits_total") or 0))
     drafted = num("vllm:spec_decode_num_draft_tokens_total")
     accepted = num("vllm:spec_decode_num_accepted_tokens_total")
     if drafted:
@@ -3170,6 +3215,8 @@ def summarize_vllm_metrics(text, prev=None):
 
 def vllm_timeline_sample(metrics):
     """Compact a vLLM metric snapshot into one point on the activity timeline."""
+    cq = metrics.get("prefix_cache_queries_delta") or 0
+    ch = metrics.get("prefix_cache_hits_delta") or 0
     return {
         "t": metrics.get("scraped_at") or time.time(),
         "running": metrics.get("processing") or 0,
@@ -3178,6 +3225,9 @@ def vllm_timeline_sample(metrics):
         "prompt_tps": round(metrics.get("prompt_tps_avg") or 0, 1),
         "kv": round(100 * (metrics.get("kv_cache_usage_ratio") or 0), 1),
         "spec": metrics.get("spec_accept_pct"),
+        "cq": cq,
+        "ch": ch,
+        "cache": round(100.0 * ch / cq, 1) if cq else None,
     }
 
 
@@ -3201,12 +3251,16 @@ def poll_metrics(monitor_port):
                 prev_vllm = metrics
                 state.set_metrics(metrics)
                 pruned = state.prune_vllm_inactive_requests(metrics)
+                attributed = state.attribute_vllm_cache(
+                    metrics.get("prefix_cache_queries_delta") or 0,
+                    metrics.get("prefix_cache_hits_delta") or 0,
+                )
                 state.add_vllm_sample(vllm_timeline_sample(metrics))
                 # Push while there's activity so throughput updates live, not
                 # only when the running/queued counts flip.
                 sig = (metrics.get("queued"), metrics.get("processing"),
                        round(metrics.get("gen_tps_avg") or 0))
-                if sig != last_sig or pruned:
+                if sig != last_sig or pruned or attributed:
                     last_sig = sig
                     state.notify_subscribers()
             else:
@@ -3315,9 +3369,20 @@ def poll_model(monitor_port):
         time.sleep(MODEL_POLL_INTERVAL)
 
 
+def should_poll_llama_endpoints(model_info):
+    """/slots and /props exist only on llama.cpp; polling them under vLLM
+    404-spams the access log twice per interval. Unknown engine (model_info
+    not yet populated) keeps polling — the llama.cpp default."""
+    return infer_engine(model_info) != "vllm"
+
+
 def poll_slots(monitor_port):
     base = f"http://127.0.0.1:{monitor_port}"
     while True:
+        # Re-checked each tick so an engine switch self-corrects mid-stream.
+        if not should_poll_llama_endpoints(state.model_info):
+            time.sleep(SLOTS_POLL_INTERVAL)
+            continue
         if not state.n_ctx:
             n_ctx = detect_n_ctx(monitor_port)
             if n_ctx:
@@ -3986,6 +4051,20 @@ class VllmLogTracker:
             "temperature": float(tp.group(1)) if tp else None,
         }
 
+    @staticmethod
+    def _derive_prompt_tps(req):
+        """Prefill rate estimate: PT / TTFT.
+
+        vLLM emits nothing between arrival and the first streaming delta, so
+        TTFT ~= prefill time. Understates the rate for requests that sat in
+        the queue first (TTFT includes the wait) — acceptable for a dashboard
+        column that would otherwise always be empty.
+        """
+        pt = req.get("prompt_tokens")
+        ttft = req.get("ttft_ms")
+        if pt and ttft:
+            req["prompt_tps"] = round(pt / (ttft / 1000.0), 1)
+
     def process_line(self, line):
         m = RE_VLLM_DEBUG.search(line)
         if m:
@@ -4029,6 +4108,7 @@ class VllmLogTracker:
                 req["completion_tokens"] = meta["tokens"]
                 req["ttft_ms"] = round(
                     (meta["first"] - req["start_time"]) * 1000, 1)
+                self._derive_prompt_tps(req)
                 # Re-add rather than update: if the metrics pruner wrongly
                 # dropped this row (gauge-lag race), the next delta restores it.
                 self.state.add_active_request(req)
@@ -4046,6 +4126,7 @@ class VllmLogTracker:
         first = meta.get("first")
         if first:
             req["ttft_ms"] = round((first - req["start_time"]) * 1000, 1)
+            self._derive_prompt_tps(req)
         gen_secs = (now - first) if first else (now - req.get("start_time", now))
         output = _vllm_extract_output(line)
         req.update({
@@ -4262,7 +4343,8 @@ if(m.decode_calls_total!=null)rows+=infoRow('Decode calls',Number(m.decode_calls
 if(m.busy_slots_per_decode!=null)rows+=infoRow('Busy slots / decode',Number(m.busy_slots_per_decode).toFixed(2));
 if(m.kv_cache_usage_ratio!=null)rows+=infoRow('KV cache usage',(100*m.kv_cache_usage_ratio).toFixed(1)+'%');
 if(vllm){
-if(m.prefix_cache_hit_pct!=null)rows+=infoRow('Prefix cache hit',Number(m.prefix_cache_hit_pct).toFixed(1)+'%','prefix_cache_hits_total / prefix_cache_queries_total');
+if(m.prefix_cache_hit_pct!=null)rows+=infoRow('Prefix cache hit',Number(m.prefix_cache_hit_pct).toFixed(1)+'%','prefix_cache_hits_total / prefix_cache_queries_total (cumulative since engine start)');
+let cacheWin=recentCacheHit(d,300);if(cacheWin!=null)rows+=infoRow('Prefix cache hit (5m)',cacheWin.toFixed(1)+'%','counter deltas summed over the last 5 minutes of scrapes');
 if(m.spec_accept_pct!=null)rows+=infoRow('Spec-decode acceptance',Number(m.spec_accept_pct).toFixed(1)+'%','accepted / drafted speculative tokens');
 if(m.avg_ttft_ms!=null)rows+=infoRow('Avg TTFT',Number(m.avg_ttft_ms).toFixed(0)+' ms','time_to_first_token histogram mean');
 if(m.avg_tpot_ms!=null)rows+=infoRow('Avg time / output tok',Number(m.avg_tpot_ms).toFixed(1)+' ms','request_time_per_output_token histogram mean');
@@ -4271,9 +4353,10 @@ if(m.requests_total!=null){let br=m.success_by_reason||{};let parts=Object.keys(
 if(m.preemptions_total)rows+=infoRow('Preemptions',Number(m.preemptions_total).toLocaleString(),'num_preemptions_total — requests evicted under KV pressure');
 }
 el.innerHTML=rows}
+function recentCacheHit(d,windowSecs){let h=d.vllm_history||[];if(!h.length)return null;let cutoff=(h[h.length-1].t||0)-windowSecs;let q=0,hits=0;for(let s of h){if((s.t||0)>=cutoff){q+=(s.cq||0);hits+=(s.ch||0)}}return q>0?100*hits/q:null}
 function renderVllmTimeline(d){let card=document.getElementById('vllmTimelineCard');let el=document.getElementById('vllmTimeline');let m=d.metrics||{};if(m.engine!=='vllm'){card.style.display='none';return}card.style.display='';let h=d.vllm_history||[];if(!h.length){el.innerHTML='<div class="row"><span class="label">no samples yet</span></div>';return}
 let spark=(key,color,unit,dec)=>{let vals=h.map(s=>Number(s[key])||0);let max=Math.max(1,...vals);let bars=vals.map(v=>`<span style="display:inline-block;width:3px;margin-right:1px;background:${color};height:${Math.max(1,Math.round(30*v/max))}px;vertical-align:bottom" title="${v}${unit}"></span>`).join('');let last=vals[vals.length-1];let peak=Math.max(...vals);return `<div class="row" style="align-items:flex-end"><span class="label" style="min-width:130px">${key}</span><span style="height:32px;line-height:0;flex:1;overflow:hidden;white-space:nowrap">${bars}</span><span class="value" style="min-width:120px;text-align:right">${last.toFixed(dec||0)}${unit} <span class="label">(peak ${peak.toFixed(dec||0)})</span></span></div>`};
-let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
+let rows='';rows+=spark('gen_tps','var(--green)',' t/s',1);rows+=spark('prompt_tps','var(--accent)',' t/s',0);rows+=spark('running','var(--purple)','',0);rows+=spark('kv','var(--yellow)','%',0);if(h.some(s=>s.spec!=null))rows+=spark('spec','var(--green)','%',0);if(h.some(s=>s.cache!=null))rows+=spark('cache','var(--accent)','%',0);rows+='<div class="row"><span class="label">~'+Math.round(h.length*2)+'s of history · newest at right</span></div>';el.innerHTML=rows}
 let _loadAnchor=null,_loadTimer=null,_loadCollapsed=new Set();
 function renderLoadProfile(d){let card=document.getElementById('loadProfileCard');
 let active=d.active_load_profile;let ps=d.load_profiles||[];

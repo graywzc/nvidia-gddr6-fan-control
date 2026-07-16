@@ -1890,6 +1890,84 @@ class VllmMetricsTests(unittest.TestCase):
         self.assertEqual(s["spec"], m["spec_accept_pct"])
         self.assertIn("t", s)
 
+    def test_prefix_cache_deltas_from_prev_scrape(self):
+        prev = {
+            "scraped_at": aipc_observer.time.time() - 2,
+            "prefix_cache_queries_total": 1000 - 200,
+            "prefix_cache_hits_total": 826 - 30,
+        }
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
+        self.assertEqual(m["prefix_cache_queries_total"], 1000)
+        self.assertEqual(m["prefix_cache_hits_total"], 826)
+        self.assertEqual(m["prefix_cache_queries_delta"], 200)
+        self.assertEqual(m["prefix_cache_hits_delta"], 30)
+        # First scrape: no deltas (no bogus attribution on observer restart).
+        first = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        self.assertNotIn("prefix_cache_queries_delta", first)
+
+    def test_timeline_sample_carries_cache_deltas(self):
+        m = {"scraped_at": 123.0, "processing": 1, "queued": 0,
+             "prefix_cache_queries_delta": 500,
+             "prefix_cache_hits_delta": 400}
+        s = aipc_observer.vllm_timeline_sample(m)
+        self.assertEqual(s["cq"], 500)
+        self.assertEqual(s["ch"], 400)
+        self.assertEqual(s["cache"], 80.0)
+        # No queries in the window -> no rate (UI hides zero-query samples).
+        s2 = aipc_observer.vllm_timeline_sample({"scraped_at": 125.0})
+        self.assertEqual(s2["cq"], 0)
+        self.assertIsNone(s2["cache"])
+
+    def test_cache_attribution_single_candidate(self):
+        state = aipc_observer.ObserverState()
+        state.add_active_request({
+            "task_id": "chatcmpl-a", "request_id": "chatcmpl-a",
+            "start_time": 100.0, "prompt_tokens": 5000,
+        })
+        assigned = state.attribute_vllm_cache(4992, 4000)
+        self.assertEqual(assigned, 1)
+        row = state.snapshot()["active_requests"][0]
+        self.assertAlmostEqual(row["cache_hit_pct"], 80.1, places=1)
+        self.assertEqual(row["cached_tokens"], 4000)
+
+    def test_cache_attribution_skips_ambiguous_candidates(self):
+        state = aipc_observer.ObserverState()
+        for rid, pt in (("chatcmpl-a", 5000), ("chatcmpl-b", 5100)):
+            state.add_active_request({
+                "task_id": rid, "request_id": rid,
+                "start_time": 100.0, "prompt_tokens": pt,
+            })
+        # Two candidates, delta matches both within tolerance: never guess.
+        assigned = state.attribute_vllm_cache(5000, 100)
+        self.assertEqual(assigned, 0)
+        for row in state.snapshot()["active_requests"]:
+            self.assertNotIn("cache_hit_pct", row)
+
+    def test_cache_attribution_matches_by_prompt_tokens(self):
+        state = aipc_observer.ObserverState()
+        for rid, pt in (("chatcmpl-a", 5000), ("chatcmpl-b", 180000)):
+            state.add_active_request({
+                "task_id": rid, "request_id": rid,
+                "start_time": 100.0, "prompt_tokens": pt,
+            })
+        assigned = state.attribute_vllm_cache(179968, 3200)
+        self.assertEqual(assigned, 1)
+        rows = {r["request_id"]: r for r in state.snapshot()["active_requests"]}
+        self.assertNotIn("cache_hit_pct", rows["chatcmpl-a"])
+        self.assertAlmostEqual(rows["chatcmpl-b"]["cache_hit_pct"], 1.8,
+                               places=1)
+
+    def test_cache_attribution_skips_attributed_rows(self):
+        state = aipc_observer.ObserverState()
+        state.add_active_request({
+            "task_id": "chatcmpl-a", "request_id": "chatcmpl-a",
+            "start_time": 100.0, "prompt_tokens": 5000,
+            "cache_hit_pct": 42.0,
+        })
+        self.assertEqual(state.attribute_vllm_cache(5000, 100), 0)
+        self.assertEqual(
+            state.snapshot()["active_requests"][0]["cache_hit_pct"], 42.0)
+
     def test_zero_vllm_gauges_prune_preexisting_active_rows(self):
         state = aipc_observer.ObserverState()
         state.add_active_request({
@@ -2041,6 +2119,23 @@ class VllmLogTrackerTests(unittest.TestCase):
         self.assertIn("doesn't stop", row["response_output"])
         self.assertGreaterEqual(row["total_ms"], 0)
 
+    def test_streaming_delta_derives_prompt_tps_from_ttft(self):
+        # vLLM logs nothing between arrival and first delta, so once the
+        # first token lands, TTFT ~= prefill time and P t/s = PT / TTFT.
+        self.tracker.process_line(self.DEBUG_PROMPT)  # PT = 3
+        self.tracker.process_line(self.RECV)
+        # Simulate a real prefill gap; in-process the delta lands <1ms later.
+        self.tracker.active["chatcmpl-abc"]["start_time"] -= 0.5
+        self.tracker.process_line(self.DELTA1)
+        row = self.state.snapshot()["active_requests"][0]
+        self.assertGreater(row["ttft_ms"], 0)
+        self.assertAlmostEqual(
+            row["prompt_tps"], 3 / (row["ttft_ms"] / 1000.0), delta=1.0)
+        # Carried onto the completed row.
+        self.tracker.process_line(self.COMPLETE)
+        done = self.state.snapshot()["requests"][0]
+        self.assertGreater(done["prompt_tps"], 0)
+
     def test_streaming_delta_reinserts_pruned_row(self):
         # If the metrics pruner wrongly dropped a live row (gauge-lag race),
         # the next streaming delta must put it back, not silently update a
@@ -2078,6 +2173,15 @@ class VllmLogTrackerTests(unittest.TestCase):
             aipc_observer._vllm_count_ids("output_token_ids: [1, 2, 3]"), 3)
         self.assertEqual(
             aipc_observer._vllm_extract_output(self.NONSTREAM), "ok")
+
+    def test_llama_endpoint_polling_gated_by_engine(self):
+        # /slots and /props are llama.cpp-only; polling them under vLLM
+        # just 404-spams the access log every 2s.
+        self.assertTrue(aipc_observer.should_poll_llama_endpoints({}))
+        self.assertTrue(aipc_observer.should_poll_llama_endpoints(
+            {"image": "ghcr.io/anbeeld/beellama.cpp:server-cuda"}))
+        self.assertFalse(aipc_observer.should_poll_llama_endpoints(
+            {"compose_file": "models/m/vllm/compose/dual.yml"}))
 
     def test_log_tracker_routes_by_engine(self):
         # Unknown engine (model_info not populated yet) -> llama.cpp default;
