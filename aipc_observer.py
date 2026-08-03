@@ -3601,6 +3601,13 @@ RE_ROUTE_LRU = re.compile(r"selected slot by LRU")
 RE_ACCESS = re.compile(r"done request:\s+(\w+)\s+(\S+)\s+\S+\s+(\d{3})")
 RE_REQUEST_BODY = re.compile(r"\brequest:\s*(\{.*\})\s*$")
 RE_RESPONSE_BODY = re.compile(r"\bresponse:\s*(\{.*\})\s*$")
+# b9967 streams responses one OpenAI chunk per line (older builds logged a single
+# `response: {…}`; the b9246->b9967 pin bump switched to this). The chunk carries
+# delta.content plus a cumulative `timings` block; the terminal chunk (non-null
+# finish_reason) holds the final prompt_n/predicted_n/cache_n. No task id on the
+# line — correlated to the single active row (llama.cpp `-np 1`, enforced by the
+# llama.cpp composes; multi-slot would need a slot id the line does not carry).
+RE_STREAM_CHUNK = re.compile(r"http: streamed chunk: data:\s*(\{.*\})\s*$")
 RE_ADAPTIVE_DM = re.compile(r"adaptive dm:\s+(\w+)\s*=\s*([\d.-]+)\s+n_max\s*=\s*(\d+)")
 RE_GRAPHS_REUSED = re.compile(r"graphs reused\s*=\s*(\d+)")
 RE_NEW_PROMPT = re.compile(r"new prompt,.*task\.n_tokens\s*=\s*(\d+)")
@@ -3648,6 +3655,14 @@ class RequestTracker:
                 detail = {}
             if detail:
                 self._attach_response_detail(line, detail)
+            return
+
+        m = RE_STREAM_CHUNK.search(line)
+        if m:
+            try:
+                self._on_stream_chunk(json.loads(m.group(1)))
+            except json.JSONDecodeError:
+                pass
             return
 
         m = RE_ACCESS.search(line)
@@ -3885,6 +3900,59 @@ class RequestTracker:
         req.update(detail)
         if req.get("task_id") in self.active:
             self.state.update_active_request(req["task_id"], detail)
+        self.state.notify_subscribers()
+
+    def _sole_active_request(self):
+        """The one in-flight row, or None.
+
+        b9967 streamed-chunk lines carry the OpenAI id, not the llama.cpp task
+        id, so they can only be attributed when exactly one request is active —
+        which is the `-np 1` case every llama.cpp compose here runs. With 0 or
+        >1 active rows the chunk is dropped rather than mis-attributed.
+        """
+        if len(self.active) == 1:
+            return next(iter(self.active.values()))
+        return None
+
+    def _on_stream_chunk(self, chunk):
+        """Fold one b9967 `http: streamed chunk` into the active row.
+
+        Accumulates delta.content into response_output — the field the detail
+        modal shows and the only one missing on b9967, since the metric columns
+        already come from the `slot print_timing` / release lines. The `timings`
+        block is OPTIONAL (only emitted when the client requests usage), so it is
+        applied opportunistically and never depended on. Finalization is left to
+        RE_RELEASE, which fires for every request and carries this same req dict
+        (so the accumulated output rides along) — finalizing here too would
+        double-finalize. Chunks with no (or an ambiguous) active row are dropped
+        rather than mis-attributed, exactly as the vLLM path guards mid-stream.
+        """
+        req = self._sole_active_request()
+        if req is None:
+            return
+        choice = (chunk.get("choices") or [{}])[0]
+        delta = (choice.get("delta") or {}).get("content") or ""
+        if delta:
+            acc = req.get("response_output") or ""
+            req["response_output"] = (acc + delta)[:DETAIL_TEXT_MAX]
+        finish = choice.get("finish_reason")
+        if finish:
+            req["finish_reason"] = finish
+        # Opportunistic: present only when the client asked for usage/timings.
+        timings = chunk.get("timings") or {}
+        pt, cache_n = timings.get("prompt_n"), timings.get("cache_n")
+        gps = timings.get("predicted_per_second")
+        if isinstance(pt, int) and isinstance(cache_n, int) and pt > 0:
+            req["cache_hit_pct"] = round(cache_n / pt * 100, 1)
+        if gps:
+            req["gen_tps"] = round(safe_float(gps), 1)
+        dn, dna = timings.get("draft_n"), timings.get("draft_n_accepted")
+        if dn:
+            req["draft_generated"] = dn
+            req["draft_accepted"] = dna or 0
+            req["draft_acceptance"] = round((dna or 0) / dn, 3)
+        self.state.update_active_request(
+            req.get("task_id"), {"response_output": req.get("response_output")})
         self.state.notify_subscribers()
 
     def _current_request_for_line(self, line):

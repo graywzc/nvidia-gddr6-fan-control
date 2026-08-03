@@ -113,6 +113,77 @@ class RequestTrackerTests(unittest.TestCase):
         self.state = aipc_observer.ObserverState()
         self.tracker = aipc_observer.RequestTracker(self.state)
 
+    # --- b9967 streamed-chunk response parsing (regression: the b9246->b9967
+    # engine-pin bump changed the response log format; RequestTracker's
+    # request:/response: matchers stopped matching, so the Recent Requests card
+    # showed metric-only rows with empty output on every llama.cpp model). ---
+
+    # A real b9967 streamed-chunk line (captured live on Deckard-40B). Timings
+    # are cumulative; the terminal chunk (finish_reason != null) carries finals.
+    @staticmethod
+    def _chunk(content, finish=None, predicted_n=1, cache_n=601, prompt_n=779):
+        payload = {
+            "choices": [{"finish_reason": finish, "index": 0,
+                         "delta": {"content": content}}],
+            "created": 1785795184, "id": "chatcmpl-STREAMTEST01",
+            "model": "deckard-40b", "object": "chat.completion.chunk",
+            "timings": {"cache_n": cache_n, "prompt_n": prompt_n,
+                        "prompt_ms": 1456.4, "prompt_per_second": 534.9,
+                        "predicted_n": predicted_n, "predicted_ms": 22569.5,
+                        "predicted_per_second": 30.79,
+                        "draft_n": 714, "draft_n_accepted": 338},
+        }
+        return ("8.04.745.959 D srv    operator(): http: streamed chunk: data: "
+                + json.dumps(payload, ensure_ascii=False))
+
+    def test_streamed_chunks_accumulate_output_onto_active_row(self):
+        # Deltas accumulate onto the single active row (np=1); the detail modal
+        # reads response_output, which was empty on b9967 before this parser.
+        self.tracker.process_line(
+            "I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(self._chunk("Hello"))
+        self.tracker.process_line(self._chunk(", world"))
+        self.tracker.process_line(self._chunk("!", finish="stop"))
+
+        row = self.tracker.active[100]
+        self.assertEqual(row["response_output"], "Hello, world!")
+        self.assertEqual(row["finish_reason"], "stop")
+        # cache% is opportunistic (client asked for timings): cache_n / prompt_n.
+        self.assertAlmostEqual(row["cache_hit_pct"], 601 / 779 * 100, places=0)
+
+    def test_streamed_output_survives_release_finalization(self):
+        # RE_RELEASE (not the chunk handler) finalizes; the accumulated output
+        # must ride the same req dict into the completed record.
+        self.tracker.process_line(
+            "I slot launch_slot_: id 0 | task 100 | processing task")
+        self.tracker.process_line(self._chunk("answer text", finish="stop"))
+        self.tracker.process_line(
+            "I slot release: id 0 | task 100 | stop processing: n_tokens = 42")
+
+        recent = list(self.state.requests)
+        self.assertEqual(len(recent), 1, "release should finalize exactly once")
+        self.assertEqual(recent[0]["response_output"], "answer text")
+        self.assertEqual(recent[0]["status"], "completed")
+        self.assertNotIn(100, self.tracker.active)
+
+    def test_streamed_chunk_without_timings_still_captures_output(self):
+        # b9967 omits the timings block unless the client requests usage; output
+        # must still be captured (this is the common Hermes/agent case).
+        self.tracker.process_line(
+            "I slot launch_slot_: id 0 | task 100 | processing task")
+        no_timings = json.dumps({"choices": [{"finish_reason": None, "index": 0,
+                                              "delta": {"content": "hi"}}],
+                                 "id": "chatcmpl-x", "object": "chat.completion.chunk"})
+        self.tracker.process_line(
+            "D srv operator(): http: streamed chunk: data: " + no_timings)
+        self.assertEqual(self.tracker.active[100]["response_output"], "hi")
+
+    def test_streamed_chunk_ignored_when_no_active_request(self):
+        # Observer started mid-stream: no launch_slot seen -> do not fabricate.
+        self.tracker.process_line(self._chunk("orphan", finish="stop"))
+        self.assertEqual(len(self.state.requests), 0)
+        self.assertEqual(len(self.tracker.active), 0)
+
     def test_timing_lines_are_applied_to_matching_task_only(self):
         self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
         self.tracker.process_line("I slot launch_slot_: id 1 | task 200 | processing task")
