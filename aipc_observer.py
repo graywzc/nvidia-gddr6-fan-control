@@ -50,6 +50,17 @@ MESSAGE_TEXT_MAX = 4000
 # How many shown (user/tool) turns to keep on a request row — the tail, since
 # the latest turns are what matter. Bounds snapshot size on long agent chats.
 MESSAGES_SHOWN_MAX = 8
+# llama.cpp --log-prompts-dir: the server writes one rendered-prompt file per
+# request; the observer consumes the oldest at each launch_slot_ and deletes it.
+# This is upstream's sanctioned way to capture prompts after the request-body
+# stdout log was compiled out (b9967 "logs: reduce"). CONTAINER_PROMPT_DIR is
+# where the container writes; HOST_PROMPT_DIR (mounted onto it) is where the
+# observer reads. HOST_PROMPT_DIR is a module global so tests can point it at a
+# tempdir.
+CONTAINER_PROMPT_DIR = "/aipc-observer-prompts"
+HOST_PROMPT_DIR = "/var/lib/aipc-observer/prompts"
+PROMPT_DIR_ORPHAN_KEEP = 32     # cap on files left behind if some never consume
+PROMPT_FILE_READ_MAX = 262144   # bound one prompt-file read (multimodal payloads)
 # JSON is valid YAML, so the generated compose override is written as JSON.
 OVERRIDE_FILE = "/tmp/aipc-observer-compose-override.yml"
 AUDIT_LOG = "/var/log/aipc-observer-actions.log"
@@ -1477,13 +1488,17 @@ CAPABILITY_FLAGS = {
     "verbose_logging": [("--log-verbosity", "4"), ("--verbosity", "4")],
     "trace_logging": [("--log-verbosity", "5"), ("--verbosity", "5")],
     "timestamps": [("--log-timestamps", None), ("--log-format", "json")],
+    # Per-request rendered-prompt files — how request messages reach the card on
+    # builds that no longer log request bodies to stdout (llama.cpp #22031).
+    "prompt_logging": [("--log-prompts-dir", CONTAINER_PROMPT_DIR)],
 }
 
 MODE_CAPABILITIES = {
     "baseline": [],
     # Debug verbosity logs full request/response bodies where the engine
-    # supports it. Very chatty; use for experiments.
-    "debug": ["metrics", "props", "trace_logging", "timestamps"],
+    # supports it. Very chatty; use for experiments. prompt_logging captures
+    # request messages via --log-prompts-dir (dropped on builds lacking it).
+    "debug": ["metrics", "props", "trace_logging", "timestamps", "prompt_logging"],
 }
 LEGACY_PRESET_TO_MODE = {
     "baseline": "baseline",
@@ -1683,6 +1698,8 @@ def command_capabilities(cmd):
         caps.add("ram_cache")
     if "--log-timestamps" in options or options.get("--log-format") == "json":
         caps.add("timestamps")
+    if "--log-prompts-dir" in options:
+        caps.add("prompt_logging")
     level = options.get("--log-verbosity", options.get("--verbosity"))
     try:
         level = int(level)
@@ -1729,10 +1746,13 @@ def infer_insight_preset(cmd, engine=None, env=None):
     """Infer which observer-managed observability mode the live argv matches."""
     if engine == "vllm":
         return infer_vllm_preset(cmd, env)
+    # ram_cache is a toggle, not a mode; prompt_logging is optional (dropped on
+    # builds without --log-prompts-dir) — neither should flip the mode.
+    optional = {"ram_cache", "prompt_logging"}
     caps = command_capabilities(cmd)
-    mode_caps = caps - {"ram_cache"}
+    mode_caps = caps - optional
     for name in ("debug",):
-        if mode_caps == set(MODE_CAPABILITIES[name]):
+        if mode_caps == set(MODE_CAPABILITIES[name]) - optional:
             return name
     if not mode_caps:
         return "baseline"
@@ -2092,6 +2112,13 @@ def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
                 mode, _supported_flags(mi, inspect_container_help))
             if effective_cache_ram:
                 tweaks = [*tweaks, CACHE_RAM_TWEAK]
+            # If --log-prompts-dir survived (build supports it), mount the host
+            # dir the observer reads and start it fresh. Dropped builds simply
+            # get no request messages — no mount, no error.
+            if any(normalize_preset_flag(f) == "--log-prompts-dir"
+                   for f, _ in tweaks):
+                reset_prompt_dir()
+                preset_volumes = [f"{HOST_PROMPT_DIR}:{CONTAINER_PROMPT_DIR}"]
         argv = apply_preset_to_command(baseline, tweaks)
         if engine == "vllm":
             argv = remove_command_options(argv, ["--cache-ram"])
@@ -3717,6 +3744,73 @@ RE_SLOT_ID = re.compile(r"\bid\s+(\d+)\s+\|")
 RE_TASK_ID = re.compile(r"\btask\s+(\d+)\b")
 
 
+def reset_prompt_dir(path=None):
+    """Empty (or create) the prompt dir for a fresh model boot, so a prior
+    model's leftover prompt files can't mis-attach to the next model's requests.
+    Best-effort — never raises."""
+    path = path or HOST_PROMPT_DIR
+    try:
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0o777)  # container writes as root; observer reads
+        for name in os.listdir(path):
+            if name.startswith("."):
+                continue
+            try:
+                os.remove(os.path.join(path, name))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _consume_oldest_prompt_file(path=None, keep=PROMPT_DIR_ORPHAN_KEEP):
+    """Pop the oldest rendered-prompt file, parse it into request metadata, and
+    delete it. Returns {} when the dir is empty/absent (prompt logging off, or
+    the observer started mid-stream). Prunes orphans beyond `keep` — files a
+    request wrote but that never reached a launch_slot_ (e.g. it errored) — so
+    the dir cannot grow without bound."""
+    path = path or HOST_PROMPT_DIR
+    try:
+        names = [n for n in os.listdir(path) if not n.startswith(".")]
+    except OSError:
+        return {}
+    if not names:
+        return {}
+    names.sort(key=lambda n: (_safe_mtime(os.path.join(path, n)), n))
+    # Drop the oldest excess before taking one, so a fallen-behind consumer
+    # keeps at most `keep` files around.
+    while len(names) > keep:
+        stale = names.pop(0)
+        try:
+            os.remove(os.path.join(path, stale))
+        except OSError:
+            pass
+    fpath = os.path.join(path, names[0])
+    try:
+        with open(fpath, "r", errors="replace") as fp:
+            text = fp.read(PROMPT_FILE_READ_MAX)
+    except OSError:
+        return {}
+    try:
+        os.remove(fpath)
+    except OSError:
+        pass
+    messages = _parse_chatml_messages(text)
+    if not messages:
+        return {}
+    payload = {"messages": messages}
+    meta = request_detail_metadata(payload)
+    meta.update(request_group_metadata(payload))
+    return meta
+
+
+def _safe_mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return 0.0
+
+
 class RequestTracker:
     def __init__(self, observer_state=None):
         self.state = observer_state or state
@@ -3793,6 +3887,10 @@ class RequestTracker:
             slot_id, task_id = int(m.group(1)), int(m.group(2))
             route = self.pending_routes.pop(slot_id, None)
             meta = self.pending_request_meta.popleft() if self.pending_request_meta else {}
+            if not meta:
+                # b9967+ logs no request body to stdout; the rendered prompt is
+                # in a per-request file written before the slot launched.
+                meta = _consume_oldest_prompt_file()
             now = time.time()
             self.active[task_id] = {
                 "id": self.task_counter,

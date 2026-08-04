@@ -184,6 +184,67 @@ class RequestTrackerTests(unittest.TestCase):
         self.assertEqual(len(self.state.requests), 0)
         self.assertEqual(len(self.tracker.active), 0)
 
+    # --- b9967 --log-prompts-dir: request messages come from per-request files
+    # (upstream disabled the request-body stdout log). ---
+
+    RENDERED = ("<|im_start|>system\nYou watch RTX prices and alert on drops."
+                "<|im_end|>\n<|im_start|>user\nAny drops today?<|im_end|>\n"
+                "<|im_start|>assistant\n")
+
+    def _write_prompt_file(self, dirpath, name, text):
+        with open(os.path.join(dirpath, name), "w") as fp:
+            fp.write(text)
+
+    def test_consume_prompt_file_parses_and_deletes(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_prompt_file(d, "000000000001.txt", self.RENDERED)
+            meta = aipc_observer._consume_oldest_prompt_file(d)
+            self.assertIn("watch RTX prices", meta["request_session_summary"])
+            self.assertEqual([m["role"] for m in meta["request_messages"]], ["user"])
+            self.assertEqual(meta["request_messages"][0]["content"], "Any drops today?")
+            self.assertEqual(os.listdir(d), [], "consumed file must be deleted")
+
+    def test_consume_returns_empty_when_absent_or_empty(self):
+        self.assertEqual(aipc_observer._consume_oldest_prompt_file("/no/such/dir"), {})
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(aipc_observer._consume_oldest_prompt_file(d), {})
+
+    def test_consume_takes_oldest_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_prompt_file(d, "a.txt",
+                "<|im_start|>user\nFIRST<|im_end|>\n<|im_start|>assistant\n")
+            os.utime(os.path.join(d, "a.txt"), (1000, 1000))
+            self._write_prompt_file(d, "b.txt",
+                "<|im_start|>user\nSECOND<|im_end|>\n<|im_start|>assistant\n")
+            os.utime(os.path.join(d, "b.txt"), (2000, 2000))
+            first = aipc_observer._consume_oldest_prompt_file(d)
+            self.assertEqual(first["request_messages"][0]["content"], "FIRST")
+            second = aipc_observer._consume_oldest_prompt_file(d)
+            self.assertEqual(second["request_messages"][0]["content"], "SECOND")
+
+    def test_consume_orphan_cap_prunes_oldest(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(5):
+                self._write_prompt_file(d, f"{i:03d}.txt",
+                    f"<|im_start|>user\nq{i}<|im_end|>\n<|im_start|>assistant\n")
+                os.utime(os.path.join(d, f"{i:03d}.txt"), (1000 + i, 1000 + i))
+            aipc_observer._consume_oldest_prompt_file(d, keep=2)
+            # kept<=2 before consuming the newest-of-kept: orphans 0..2 pruned,
+            # the consumed one deleted; only the newest remains.
+            left = sorted(os.listdir(d))
+            self.assertEqual(left, ["004.txt"])
+
+    def test_launch_slot_attaches_prompt_from_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write_prompt_file(d, "000000000001.txt", self.RENDERED)
+            with mock.patch.object(aipc_observer, "HOST_PROMPT_DIR", d):
+                self.tracker.process_line(
+                    "I slot launch_slot_: id 0 | task 100 | processing task")
+            row = self.tracker.active[100]
+            self.assertIn("watch RTX prices", row["request_session_summary"])
+            self.assertEqual(row["request_messages"][0]["content"], "Any drops today?")
+            self.assertEqual(os.listdir(d), [], "file consumed on launch")
+
     def test_timing_lines_are_applied_to_matching_task_only(self):
         self.tracker.process_line("I slot launch_slot_: id 0 | task 100 | processing task")
         self.tracker.process_line("I slot launch_slot_: id 1 | task 200 | processing task")
@@ -1663,9 +1724,9 @@ class PresetResolveTests(unittest.TestCase):
         # trace_logging resolves to --verbosity 5, not --log-verbosity.
         self.assertEqual(argv[argv.index("--verbosity") + 1], "5")
         self.assertNotIn("--log-verbosity", argv)
-        # props and timestamps have no supported flag on this build.
+        # props, timestamps, prompt_logging have no supported flag here.
         self.assertEqual(sorted(result["dropped_capabilities"]),
-                         ["props", "timestamps"])
+                         ["prompt_logging", "props", "timestamps"])
 
     def test_drops_capabilities_with_no_supported_flag(self):
         result = self._restart(
@@ -1679,7 +1740,7 @@ class PresetResolveTests(unittest.TestCase):
         self.assertNotIn("--log-verbosity", argv)
         self.assertNotIn("--verbosity", argv)
         self.assertEqual(sorted(result["dropped_capabilities"]),
-                         ["timestamps", "trace_logging"])
+                         ["prompt_logging", "timestamps", "trace_logging"])
 
     def test_unknown_help_falls_back_to_default_flags(self):
         result = self._restart("debug", help_flags=None)
@@ -1692,7 +1753,7 @@ class PresetResolveTests(unittest.TestCase):
         result = self._restart(
             "debug",
             help_flags={"--metrics", "--props", "--log-verbosity",
-                        "--log-timestamps", "--host"},
+                        "--log-timestamps", "--log-prompts-dir", "--host"},
         )
         self.assertEqual(result["dropped_capabilities"], [])
         self.assertIn("--log-verbosity", self._override_argv())
@@ -1704,7 +1765,7 @@ class PresetResolveTests(unittest.TestCase):
         self.assertIn(("--verbosity", "5"), tweaks)
         self.assertIn(("--metrics", None), tweaks)
         self.assertNotIn(("--log-verbosity", "5"), tweaks)
-        self.assertEqual(sorted(dropped), ["props", "timestamps"])
+        self.assertEqual(sorted(dropped), ["prompt_logging", "props", "timestamps"])
         # Unknown support -> default (mainline) flags, nothing dropped.
         tweaks, dropped = aipc_observer.resolve_preset("debug", None)
         self.assertIn(("--log-verbosity", "5"), tweaks)
