@@ -47,6 +47,9 @@ REQUEST_LOG_MAX = 200
 DETAIL_TEXT_MAX = 12000
 DETAIL_JSON_MAX = 24000
 MESSAGE_TEXT_MAX = 4000
+# How many shown (user/tool) turns to keep on a request row — the tail, since
+# the latest turns are what matter. Bounds snapshot size on long agent chats.
+MESSAGES_SHOWN_MAX = 8
 # JSON is valid YAML, so the generated compose override is written as JSON.
 OVERRIDE_FILE = "/tmp/aipc-observer-compose-override.yml"
 AUDIT_LOG = "/var/log/aipc-observer-actions.log"
@@ -609,6 +612,92 @@ def _bounded_json(value, limit=DETAIL_JSON_MAX):
     return _bounded_text(text, limit)
 
 
+# "Meaningful only" request rendering (deterministic — no LLM). System +
+# assistant turns fold into a one-line session summary; user turns show
+# verbatim; tool results become sized previews; images are stubbed. Chosen with
+# the operator so the card echoes "what was asked" without the persona/history/
+# payload bulk that upstream llama.cpp itself deemed log spam (#25078).
+TOOL_PREVIEW_MAX = 240
+SUMMARY_SYSTEM_MAX = 140
+SUMMARY_TAIL_MAX = 90
+
+
+def _content_with_image_stubs(content):
+    """Text of a message, with multimodal image parts kept as a [image] marker
+    rather than dropped (so a user turn carrying a picture still reads sensibly)
+    or dumped (base64 is exactly the bulk we exclude)."""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if isinstance(item.get("text"), str):
+                    parts.append(item["text"])
+                elif isinstance(item.get("content"), str):
+                    parts.append(item["content"])
+                elif item.get("type") in ("image_url", "image", "input_image"):
+                    parts.append("[image]")
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(" ".join(parts).split())
+    return _text_from_content(content)
+
+
+def _first_line(text):
+    """First *substantive* line — skipping markdown headers, tag/fence lines, and
+    one-or-two-word stubs (agent system prompts often open with '# Tools' or a
+    '<tools>' block, which describe nothing). Falls back to the first non-empty
+    line if nothing more descriptive is found."""
+    first_nonempty = ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not first_nonempty:
+            first_nonempty = line
+        if line.startswith(("#", "<", "```", "//", "/*", "*")):
+            continue
+        if len(line.split()) < 3:
+            continue
+        return line
+    return first_nonempty
+
+
+def _session_summary(messages):
+    """One deterministic line describing the session: the system prompt's first
+    meaningful line, plus folded assistant history (count + tail of the latest
+    reply). Falls back to the first user turn when there is no system message."""
+    system_line = ""
+    assistant_turns = 0
+    last_assistant = ""
+    first_user = ""
+    for msg in messages:
+        role = msg.get("role")
+        raw = msg.get("content")
+        text = _content_with_image_stubs(raw)
+        if role in ("system", "developer") and not system_line:
+            # First line off the RAW content — _content_with_image_stubs collapses
+            # newlines, which would merge the whole persona into one "line".
+            first = _first_line(raw) if isinstance(raw, str) else text
+            system_line = _shorten(first, SUMMARY_SYSTEM_MAX)
+        elif role == "assistant":
+            assistant_turns += 1
+            if text:
+                last_assistant = text
+        elif role == "user" and not first_user:
+            first_user = text
+    parts = []
+    if system_line:
+        parts.append(system_line)
+    elif first_user:
+        parts.append(_shorten(first_user, SUMMARY_SYSTEM_MAX))
+    if assistant_turns:
+        parts.append(f"{assistant_turns} prior repl"
+                     f"{'y' if assistant_turns == 1 else 'ies'}")
+        if last_assistant:
+            parts.append("last: " + _shorten(last_assistant, SUMMARY_TAIL_MAX))
+    return " · ".join(parts)
+
+
 def request_detail_metadata(payload):
     if not isinstance(payload, dict):
         return {}
@@ -622,16 +711,23 @@ def request_detail_metadata(payload):
         "request_detail_json": _bounded_json(payload),
     }
     if isinstance(messages, list):
-        detail["request_messages"] = [
-            {
-                "role": msg.get("role") or "",
-                "name": msg.get("name") or "",
-                "content": _bounded_text(
-                    _text_from_content(msg.get("content")), MESSAGE_TEXT_MAX
-                ),
-            }
-            for msg in messages if isinstance(msg, dict)
-        ]
+        msgs = [m for m in messages if isinstance(m, dict)]
+        detail["request_session_summary"] = _session_summary(msgs)
+        shown = []
+        for msg in msgs:
+            role = msg.get("role") or ""
+            if role in ("system", "developer", "assistant"):
+                continue  # folded into the session summary, not shown per-turn
+            if role == "tool":
+                raw = _text_from_content(msg.get("content"))
+                content = (f"[tool result · {len(raw)} chars] "
+                           + _shorten(raw, TOOL_PREVIEW_MAX))
+            else:  # user (and any other role): show verbatim, images stubbed
+                content = _bounded_text(
+                    _content_with_image_stubs(msg.get("content")), MESSAGE_TEXT_MAX)
+            shown.append({"role": role, "name": msg.get("name") or "",
+                          "content": content})
+        detail["request_messages"] = shown[-MESSAGES_SHOWN_MAX:]
     return detail
 
 
@@ -4020,10 +4116,6 @@ def _vllm_extract_output(line, limit=VLLM_OUTPUT_PREVIEW_MAX):
 # content match and is dropped.
 RE_CHATML_MSG = re.compile(
     r"<\|im_start\|>([^\n<]+)\n(.*?)(?=<\|im_end\|>|<\|im_start\|>|\Z)", re.S)
-# Most recent messages kept per row; older turns only bloat the snapshot
-# (agent prompts reach megabytes) while the group label already identifies
-# the conversation.
-VLLM_MESSAGES_KEPT = 8
 
 
 def _parse_chatml_messages(prompt):
@@ -4044,18 +4136,14 @@ def _vllm_debug_prompt_metadata(prompt_repr, token_ids_repr):
     prompt = str(prompt)
     messages = _parse_chatml_messages(prompt)
     if messages:
-        kept = [
-            {"role": m["role"], "name": "",
-             "content": _bounded_text(m["content"], MESSAGE_TEXT_MAX)}
-            for m in messages[-VLLM_MESSAGES_KEPT:]
-        ]
-        meta = {
-            "request_messages": kept,
-            "request_detail_json": _bounded_json({"messages": kept}),
-        }
-        # Same label/grouping semantics as the llama.cpp trace path: label by
-        # the first user message, group by the conversation's stable prefix.
-        meta.update(request_group_metadata({"messages": messages}))
+        # Route through the shared "meaningful only" policy so vLLM and the
+        # llama.cpp trace path render identically: a session summary (system +
+        # folded assistant history), user turns verbatim, tool results as sized
+        # previews. Grouping/label semantics come from request_group_metadata.
+        payload = {"messages": messages}
+        meta = request_detail_metadata(payload)
+        meta["request_detail_json"] = _bounded_json(payload)
+        meta.update(request_group_metadata(payload))
     else:
         prompt = _bounded_text(prompt, MESSAGE_TEXT_MAX)
         meta = {
@@ -4283,7 +4371,7 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#c9d1d9;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--red:#f85149;--purple:#bc8cff}
 *{box-sizing:border-box}body{margin:0;padding:16px;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.header,.card{background:var(--surface);border:1px solid var(--border);border-radius:8px}.header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;margin-bottom:16px}.header h1{font-size:18px;margin:0}.meta,.label{color:var(--dim)}.model{color:var(--accent);font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}.card{padding:16px}.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 12px}.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}.gpu-card{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px}.gpu-name{font-weight:650;color:var(--accent);margin-bottom:8px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:13px}.value{font-variant-numeric:tabular-nums;font-weight:600}.bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--accent);border-radius:3px}.fill.mem{background:var(--purple)}.fill.power{background:var(--yellow)}.fill.fan{background:var(--green)}.hot{color:var(--yellow)}.critical{color:var(--red)}.summary{display:flex;gap:24px;flex-wrap:wrap}.summary-item{text-align:center}.summary-value{font-size:28px;font-weight:750;font-variant-numeric:tabular-nums}.summary-label{font-size:11px;text-transform:uppercase;color:var(--dim);letter-spacing:.05em}.full{grid-column:1/-1}.requests{flex:1;min-height:0;overflow:auto}.request-row{display:grid;grid-template-columns:88px 150px minmax(150px,1.4fr) 60px 56px 70px 74px 78px 74px 60px 78px minmax(80px,1fr);gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12px}.group-label{color:var(--accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.good{color:var(--green)}.request-head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.status{border-radius:999px;padding:2px 8px;text-align:center;font-size:10px;text-transform:uppercase;font-weight:700}.completed{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.3)}.processing{background:rgba(88,166,255,.15);color:var(--accent);border:1px solid rgba(88,166,255,.3)}.cancelled{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.3)}.request-row.live{box-shadow:inset 3px 0 0 var(--accent)}
-.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.docker-logs{flex:1;min-height:0;overflow:auto;font-family:monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word}.docker-logs .log-line{padding:1px 0;border-bottom:1px solid rgba(48,54,61,.3)}.docker-logs .log-line:last-child{border-bottom:none}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.variant-table{min-width:1050px}.variant-row{display:grid;grid-template-columns:minmax(230px,1.1fr) 86px 86px minmax(140px,.8fr) minmax(260px,1.5fr) 120px;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}.variant-row.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.variant-name{font-weight:650;color:var(--accent);overflow-wrap:anywhere}.variant-note{color:var(--dim);line-height:1.35;margin-top:2px}.variant-pick{display:flex;gap:8px;align-items:flex-start}.variant-pick input{margin-top:2px}.compare-toolbar{display:flex;align-items:center;gap:8px;padding:10px 0;position:sticky;top:0;background:var(--surface);z-index:2;border-bottom:1px solid var(--border)}.compare-grid{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(260px,1fr);gap:12px;min-width:720px;padding-top:12px}.compare-card{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.compare-card h3{font-size:12px;color:var(--accent);margin:0 0 8px;overflow-wrap:anywhere}.compare-field{border-top:1px solid var(--border);padding:8px 0}.compare-field:first-of-type{border-top:0}.compare-field .label{display:block;font-size:10px;text-transform:uppercase;font-weight:700;margin-bottom:4px}.flag-compare{display:grid;min-width:860px;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg);margin-top:12px}.flag-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:7px 8px;font-size:12px;min-width:0}.flag-cell.head{position:sticky;top:0;background:var(--surface);z-index:1;color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.flag-cell.changed{background:rgba(210,153,34,.12)}.flag-cell.same{color:var(--dim)}.flag-desc{line-height:1.35}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.btn{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;font-family:inherit}.btn:hover{border-color:var(--accent)}.btn:disabled{opacity:.5;cursor:wait}.docker-logs{flex:1;min-height:0;overflow:auto;font-family:monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word}.docker-logs .log-line{padding:1px 0;border-bottom:1px solid rgba(48,54,61,.3)}.docker-logs .log-line:last-child{border-bottom:none}.controls{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}.request-row:not(.request-head){cursor:pointer}.request-row:not(.request-head):hover{background:rgba(88,166,255,.06)}.preset-pill{border:1px solid var(--border);border-radius:999px;padding:2px 8px;font-size:11px;font-weight:700}.preset-match{color:var(--green);border-color:rgba(63,185,80,.45);background:rgba(63,185,80,.12)}.preset-diff{color:var(--yellow);border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.12)}.preset-custom{color:var(--purple);border-color:rgba(188,140,255,.45);background:rgba(188,140,255,.12)}.preset-desc{line-height:1.35;max-width:360px;text-align:right}.cmd-line{font-size:11px;color:var(--dim);word-break:break-word;padding:4px 0;line-height:1.75}.cmd-token{display:inline-block;border-radius:4px;padding:0 3px;margin:1px 0}.cmd-same{color:var(--green);background:rgba(63,185,80,.12);outline:1px solid rgba(63,185,80,.25)}.cmd-change{color:var(--yellow);background:rgba(210,153,34,.13);outline:1px solid rgba(210,153,34,.32)}.cmd-remove{color:var(--red);background:rgba(248,81,73,.12);outline:1px solid rgba(248,81,73,.28);text-decoration:line-through}.cmd-add{display:inline-block;border-radius:999px;border:1px solid rgba(88,166,255,.38);background:rgba(88,166,255,.1);color:var(--accent);padding:1px 6px;margin:2px 4px 0 0;font-size:11px}.cmd-legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}.modal{display:none;position:fixed;inset:0;z-index:20;background:rgba(0,0,0,.72);padding:32px}.modal.open{display:flex}.modal-panel{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:min(1180px,100%);max-height:calc(100vh - 64px);margin:auto;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.45)}.modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 16px;border-bottom:1px solid var(--border)}.modal-head h2{font-size:14px;margin:0}.modal-body{overflow:auto;padding:0 16px 16px}.detail-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(320px,1fr);gap:12px;padding-top:12px}.detail-section{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.detail-section h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:0 0 8px}.session-summary{border:1px solid rgba(88,166,255,.3);background:rgba(88,166,255,.07);border-radius:6px;padding:8px;margin:8px 0}.message-card{border-top:1px solid var(--border);padding:8px 0}.message-card:first-child{border-top:0}.message-role{font-size:11px;font-weight:700;color:var(--accent);margin-bottom:4px}.prewrap{white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.45}.flag-guide{display:grid;grid-template-columns:minmax(140px,170px) minmax(180px,260px) minmax(460px,1fr);gap:12px;align-items:start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;min-width:820px}.flag-guide.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.flag-help{color:var(--text);line-height:1.4}.variant-table{min-width:1050px}.variant-row{display:grid;grid-template-columns:minmax(230px,1.1fr) 86px 86px minmax(140px,.8fr) minmax(260px,1.5fr) 120px;gap:10px;align-items:start;padding:9px 0;border-bottom:1px solid var(--border);font-size:12px}.variant-row.head{position:sticky;top:0;background:var(--surface);color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700;z-index:1}.variant-name{font-weight:650;color:var(--accent);overflow-wrap:anywhere}.variant-note{color:var(--dim);line-height:1.35;margin-top:2px}.variant-pick{display:flex;gap:8px;align-items:flex-start}.variant-pick input{margin-top:2px}.compare-toolbar{display:flex;align-items:center;gap:8px;padding:10px 0;position:sticky;top:0;background:var(--surface);z-index:2;border-bottom:1px solid var(--border)}.compare-grid{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(260px,1fr);gap:12px;min-width:720px;padding-top:12px}.compare-card{border:1px solid var(--border);border-radius:6px;background:var(--bg);padding:10px;min-width:0}.compare-card h3{font-size:12px;color:var(--accent);margin:0 0 8px;overflow-wrap:anywhere}.compare-field{border-top:1px solid var(--border);padding:8px 0}.compare-field:first-of-type{border-top:0}.compare-field .label{display:block;font-size:10px;text-transform:uppercase;font-weight:700;margin-bottom:4px}.flag-compare{display:grid;min-width:860px;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg);margin-top:12px}.flag-cell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:7px 8px;font-size:12px;min-width:0}.flag-cell.head{position:sticky;top:0;background:var(--surface);z-index:1;color:var(--dim);font-size:11px;text-transform:uppercase;font-weight:700}.flag-cell.changed{background:rgba(210,153,34,.12)}.flag-cell.same{color:var(--dim)}.flag-desc{line-height:1.35}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere}
 @media(max-width:900px){.detail-grid{grid-template-columns:1fr}.request-row{grid-template-columns:88px 120px minmax(140px,1fr) 52px 52px 64px 68px 72px 68px 52px 72px minmax(70px,1fr)}}
 .gpu-history-chart{position:relative;width:100%;height:160px;margin-bottom:12px;border-radius:6px;overflow:hidden;background:var(--bg);border:1px solid var(--border)}.gpu-history-chart:last-child{margin-bottom:0}.gpu-history-chart canvas{display:block;width:100%;height:100%}.gpu-history-label{position:absolute;top:8px;left:10px;font-size:11px;font-weight:650;color:var(--accent);pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend{position:absolute;top:8px;right:10px;display:flex;gap:12px;font-size:10px;font-weight:600;pointer-events:none;z-index:1;text-shadow:0 1px 3px rgba(0,0,0,.7)}.gpu-history-legend span{display:flex;align-items:center;gap:4px}.legend-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
 /* Drag & resize */
@@ -4637,8 +4725,9 @@ if(vllm){meta+=detailField('Max tokens',r.max_tokens);meta+=detailField('Tempera
 let out=r.response_output?`<div class="prewrap">${esc(r.response_output)}</div>`:`<div class="label">${vllm?'No output captured — enable debug mode (--enable-log-outputs) to log responses.':'No response body captured yet. Non-streaming responses require debug logs.'}</div>`;
 let rawReq=r.request_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw request JSON</summary><div class="prewrap">${esc(r.request_detail_json)}</div></details>`:'';
 let rawResp=r.response_detail_json?`<details><summary class="label" style="cursor:pointer;padding:8px 0">raw response JSON</summary><div class="prewrap">${esc(r.response_detail_json)}</div></details>`:'';
+let summary=r.request_session_summary?`<div class="session-summary"><div class="message-role">Session</div><div class="prewrap">${esc(r.request_session_summary)}</div></div>`:'';
 let reqBody=(vllm&&!(r.request_messages&&r.request_messages.length))?'<div class="label">Prompt not logged — restart with debug mode to enable request-logger DEBUG logging.</div>':renderMessages(r.request_messages);
-return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${reqBody}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
+return `<div class="detail-grid"><div class="detail-section"><h3>Request</h3>${meta}${summary}${reqBody}${rawReq}</div><div class="detail-section"><h3>Output</h3>${out}${rawResp}</div></div>`}
 function openRequestDetail(key){let r=requestRowsByKey[key];if(!r)return;document.getElementById('requestModalTitle').textContent=`Request ${r.task_id??''} · ${r.status||'processing'}`;document.getElementById('requestModalBody').innerHTML=renderRequestDetail(r);document.getElementById('requestModal').classList.add('open')}
 function closeRequestDetail(){document.getElementById('requestModal').classList.remove('open')}
 function renderRequests(reqs,active){requestRowsByKey={};let head='<div class="request-row request-head"><span>Status</span><span>Time</span><span>Group</span><span>PT</span><span>Cache</span><span>TTFT</span><span>P t/s</span><span>P time</span><span>G t/s</span><span>GT</span><span>G time</span><span>Total</span></div>';let act=(active||[]).slice().reverse();let actRows=act.map(r=>{let phase=r.phase==='generating'?'generating':(r.phase==='prefill'?'prefill':'processing');let ptime=r.phase==='prefill'?`<div class="bar" title="${r.prefill_pct||0}%"><div class="fill" style="width:${r.prefill_pct||0}%"></div></div>`:'-';return `<div class="request-row live"${rowAttrs(r)}>${statusCell(r,phase)}<span>${r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${ptime}</span><span>-</span><span>${r.completion_tokens||0}</span><span>-</span><span>${liveElapsed(r)}</span></div>`}).join('');let recent=reqs.slice(-40).reverse();let doneRows=recent.map(r=>`<div class="request-row"${rowAttrs(r)}>${statusCell(r,r.status)}<span>${r.end_time_str||r.start_time_str||'--'}</span>${groupCell(r)}<span>${r.prompt_tokens||0}</span>${cacheCell(r)}<span>${formatPhaseDuration(r.ttft_ms)}</span><span>${r.prompt_tps?Number(r.prompt_tps).toFixed(1):'-'}</span><span>${formatPhaseDuration(r.prompt_eval_ms)}</span><span>${r.gen_tps?Number(r.gen_tps).toFixed(1):'-'}</span><span>${r.completion_tokens||0}</span><span>${formatPhaseDuration(r.eval_ms)}</span><span>${formatDuration(r.total_ms||r.elapsed_ms)}</span></div>`).join('');let body=actRows+doneRows;let vllm=((lastRenderData||{}).metrics||{}).engine==='vllm';let empty=vllm?'<div class="request-row"><span class="label">No request rows yet — pick debug mode and Restart model to enable vLLM request logging.</span></div>':'<div class="request-row"><span class="label">No requests yet</span></div>';document.getElementById('requestList').innerHTML=head+(body||empty)}

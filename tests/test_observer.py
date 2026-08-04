@@ -398,10 +398,14 @@ class RequestTrackerTests(unittest.TestCase):
         req = self.tracker.active[100]
         self.assertEqual(req["request_group_label"], "Find MacBook Air M5 deals")
         self.assertEqual(req["request_message_count"], 3)
-        self.assertEqual(req["request_messages"][1]["role"], "user")
+        # New "meaningful only" policy: system + assistant fold into the session
+        # summary; only the user turn is shown per-message.
+        self.assertEqual([m["role"] for m in req["request_messages"]], ["user"])
         self.assertEqual(
-            req["request_messages"][1]["content"], "Find MacBook Air M5 deals"
+            req["request_messages"][0]["content"], "Find MacBook Air M5 deals"
         )
+        self.assertIn("Hermes Agent Persona", req["request_session_summary"])
+        self.assertIn("1 prior reply", req["request_session_summary"])
         self.assertIn("Hermes Agent Persona", req["request_detail_json"])
         self.assertTrue(req["request_has_tools"])
         self.assertTrue(req["request_has_response_format"])
@@ -518,6 +522,78 @@ class RequestGroupingTests(unittest.TestCase):
         })
 
         self.assertEqual(meta["request_group_label"], "Evaluate deal MacBook Air")
+
+    # --- Deterministic "meaningful only" request-detail policy ---------------
+    # Row/detail keeps: a session summary (system first-line + folded assistant
+    # history), user turns verbatim, tool results as sized previews. System and
+    # assistant messages are NOT shown per-turn (folded into the summary); images
+    # inside a user turn are stubbed. Non-message parts are not rendered.
+
+    def _agentic_payload(self):
+        return {"messages": [
+            {"role": "system", "content": "You are monitoring a product/deal web "
+                                          "page.\nRules: be terse.\nMore rules…"},
+            {"role": "user", "content": "Is the MacBook Air deal live?"},
+            {"role": "assistant", "content": "Checking the page now."},
+            {"role": "tool", "content": "X" * 5000},
+            {"role": "assistant", "content": "Yes — the deal is live at $51."},
+            {"role": "user", "content": "Great, what's the discount?"},
+        ]}
+
+    def test_session_summary_uses_system_first_line_and_folds_history(self):
+        d = aipc_observer.request_detail_metadata(self._agentic_payload())
+        s = d["request_session_summary"]
+        # system's first meaningful line only (not the whole persona)
+        self.assertIn("monitoring a product/deal web page", s)
+        self.assertNotIn("More rules", s)
+        # assistant history folded in: count + tail of the last assistant reply
+        self.assertIn("2 prior repl", s)
+        self.assertIn("deal is live at $51", s)
+
+    def test_only_user_and_tool_messages_are_shown(self):
+        d = aipc_observer.request_detail_metadata(self._agentic_payload())
+        roles = [m["role"] for m in d["request_messages"]]
+        self.assertEqual(roles, ["user", "tool", "user"],
+                         "system+assistant folded into summary, not shown")
+        # user turns verbatim
+        self.assertEqual(d["request_messages"][0]["content"],
+                         "Is the MacBook Air deal live?")
+
+    def test_tool_result_is_summarized_with_size(self):
+        d = aipc_observer.request_detail_metadata(self._agentic_payload())
+        tool = next(m for m in d["request_messages"] if m["role"] == "tool")
+        self.assertIn("5000 chars", tool["content"])       # size annotation
+        self.assertLess(len(tool["content"]), 400,          # not the full 5000
+                        "tool result must be a bounded preview")
+
+    def test_user_message_image_parts_are_stubbed(self):
+        d = aipc_observer.request_detail_metadata({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is in this picture?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA…"}},
+            ]},
+        ]})
+        c = d["request_messages"][0]["content"]
+        self.assertIn("What is in this picture?", c)
+        self.assertIn("[image]", c)
+        self.assertNotIn("base64", c)
+
+    def test_summary_skips_markdown_header_boilerplate(self):
+        # Agent system prompts often open with "# Tools" / a <tools> block; the
+        # summary should reach the first line that actually describes the task.
+        d = aipc_observer.request_detail_metadata({"messages": [
+            {"role": "system", "content": "# Tools\n<tools>…</tools>\n"
+                                          "You watch RTX prices and alert on drops."},
+            {"role": "user", "content": "status?"}]})
+        s = d["request_session_summary"]
+        self.assertIn("watch RTX prices", s)
+        self.assertNotIn("# Tools", s)
+
+    def test_summary_without_system_falls_back_to_first_user(self):
+        d = aipc_observer.request_detail_metadata({"messages": [
+            {"role": "user", "content": "Just a bare question"}]})
+        self.assertIn("Just a bare question", d["request_session_summary"])
+        self.assertEqual([m["role"] for m in d["request_messages"]], ["user"])
 
     def test_response_detail_extracts_tool_calls(self):
         detail = aipc_observer.response_detail_metadata({
@@ -2287,11 +2363,15 @@ class VllmChatmlPromptTests(unittest.TestCase):
                           ("user", "now watch VRAM temps")])
         meta = aipc_observer._vllm_debug_prompt_metadata(repr(p), "None")
         roles = [m["role"] for m in meta["request_messages"]]
-        self.assertEqual(roles, ["system", "user", "assistant", "user"])
+        # "meaningful only": system + assistant fold into the summary; only the
+        # user turns are shown per-message.
+        self.assertEqual(roles, ["user", "user"])
         # The tail (latest turn) must survive, not just the head.
         self.assertEqual(meta["request_messages"][-1]["content"],
                          "now watch VRAM temps")
         self.assertEqual(meta["request_message_count"], 4)
+        # The assistant turn is folded into the session summary, not dropped.
+        self.assertIn("curve looks fine", meta["request_session_summary"])
 
     def test_chatml_label_is_first_user_message_and_group_stable(self):
         p1 = self._prompt([("user", "monitor the deal page for RTX drops"),
@@ -2314,9 +2394,11 @@ class VllmChatmlPromptTests(unittest.TestCase):
         meta = aipc_observer._vllm_debug_prompt_metadata(
             repr(self._prompt(turns)), "None")
         self.assertEqual(meta["request_message_count"], 41)  # system + 40
+        # Only the user turns are shown (assistants folded), capped to the tail.
         self.assertEqual(len(meta["request_messages"]),
-                         aipc_observer.VLLM_MESSAGES_KEPT)
-        self.assertEqual(meta["request_messages"][-1]["content"], "reply 19")
+                         aipc_observer.MESSAGES_SHOWN_MAX)
+        self.assertTrue(all(m["role"] == "user" for m in meta["request_messages"]))
+        self.assertEqual(meta["request_messages"][-1]["content"], "turn 19")
 
     def test_non_chatml_prompt_falls_back_to_blob(self):
         meta = aipc_observer._vllm_debug_prompt_metadata(
