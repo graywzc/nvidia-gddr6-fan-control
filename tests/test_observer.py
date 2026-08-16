@@ -1041,6 +1041,95 @@ class CatalogDiffTests(unittest.TestCase):
         self.assertTrue(aipc_observer.catalog_has_changes(diff))
 
 
+class AdhocVariantTests(unittest.TestCase):
+    def _write(self, payload):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            f.write(payload if isinstance(payload, str) else json.dumps(payload))
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _entry(self, **over):
+        entry = {
+            "model": "qwen3.8-27b", "engine": "vllm",
+            "workload": "long-ctx-single", "status": "experimental",
+            "status_note": "ad-hoc", "max_ctx": 262144,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml",
+            "default_port": 8020, "kv_format": "int8_per_token_head", "tp": 2,
+            "weights_path": "/home/graywzc/models/hf/qwen3.8-27b-fp8",
+        }
+        entry.update(over)
+        return entry
+
+    def test_missing_file_yields_no_variants(self):
+        got = aipc_observer.load_adhoc_variants("/nonexistent/adhoc.json")
+        self.assertEqual(got, {})
+
+    def test_malformed_json_yields_no_variants(self):
+        path = self._write("{not json")
+        self.assertEqual(aipc_observer.load_adhoc_variants(path), {})
+
+    def test_valid_entry_is_loaded_and_marked_adhoc(self):
+        path = self._write({"variants": {"vllm/q38": self._entry()}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertIn("vllm/q38", got)
+        entry = got["vllm/q38"]
+        self.assertTrue(entry["adhoc"])
+        self.assertEqual(entry["model"], "qwen3.8-27b")
+        self.assertEqual(entry["default_port"], 8020)
+        self.assertEqual(entry["compose_path"],
+                         "/etc/aipc-observer-adhoc/q38.yml")
+        self.assertEqual(entry["weights_path"],
+                         "/home/graywzc/models/hf/qwen3.8-27b-fp8")
+
+    def test_relative_compose_path_is_rejected(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(compose_path="models/q38/compose.yml")}})
+        self.assertEqual(aipc_observer.load_adhoc_variants(path), {})
+
+    def test_status_is_forced_to_experimental(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(status="production")}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["vllm/q38"]["status"], "experimental")
+
+    def test_topology_derived_from_tp_when_absent(self):
+        path = self._write({"variants": {
+            "a": self._entry(tp=1), "b": self._entry(tp=2),
+            "c": self._entry(tp=4)}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["a"]["topology"], "single")
+        self.assertEqual(got["b"]["topology"], "dual")
+        self.assertEqual(got["c"]["topology"], "multi4")
+
+    def test_explicit_topology_wins_over_tp(self):
+        path = self._write({"variants": {
+            "a": self._entry(tp=2, topology="single")}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["a"]["topology"], "single")
+
+    def test_merge_adds_new_key(self):
+        catalog = {"variants": {"vllm/dual": {"status": "production"}}}
+        aipc_observer.merge_adhoc_variants(
+            catalog, {"vllm/q38": {"adhoc": True, "model": "qwen3.8-27b"}})
+        self.assertIn("vllm/q38", catalog["variants"])
+        self.assertIn("vllm/dual", catalog["variants"])
+
+    def test_registry_key_is_never_shadowed(self):
+        catalog = {"variants": {"vllm/q38": {"status": "production",
+                                             "model": "from-registry"}}}
+        aipc_observer.merge_adhoc_variants(
+            catalog, {"vllm/q38": {"adhoc": True, "model": "from-sidecar"}})
+        self.assertEqual(catalog["variants"]["vllm/q38"]["model"],
+                         "from-registry")
+        self.assertNotIn("adhoc", catalog["variants"]["vllm/q38"])
+
+    def test_merge_skips_errored_catalog(self):
+        catalog = {"error": "boom"}
+        aipc_observer.merge_adhoc_variants(catalog, {"vllm/q38": {"adhoc": True}})
+        self.assertNotIn("variants", catalog)
+
+
 class RepoInfoTests(unittest.TestCase):
     """collect_repo_info against real temporary git repos."""
 

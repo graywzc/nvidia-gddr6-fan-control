@@ -1341,6 +1341,98 @@ def extract_catalog(repo, ref="HEAD"):
         return {"error": str(e), "ref": ref}
 
 
+# Variants this box serves that club-3090's registry does not carry. Hand-edited
+# on the host; /etc matches VLLM_LOGGING_CONFIG_FILE (see below) and survives
+# observer redeploys, which are scp + restart with no git checkout.
+ADHOC_CATALOG_FILE = "/etc/aipc-observer-adhoc.json"
+
+# The exact fields _CATALOG_EXTRACT_CODE projects from the registry. Ad-hoc
+# entries carry the same ten so every downstream consumer — validate_switch,
+# boot_model_once, detect_installed_assets, the dashboard — treats them
+# identically to registry entries.
+_ADHOC_FIELDS = ("model", "engine", "workload", "status", "status_note",
+                 "max_ctx", "compose_path", "default_port", "kv_format", "tp")
+
+
+def _adhoc_topology(entry):
+    """Explicit topology, else derived from tensor-parallel degree.
+
+    The dashboard filters the variant list by topology. Registry entries get
+    theirs from '/dual/' or '/multi4/' in the compose path; an ad-hoc compose
+    lives at an arbitrary absolute path, so it must say so directly.
+    """
+    explicit = entry.get("topology")
+    if explicit in ("single", "dual", "multi4"):
+        return explicit
+    try:
+        tp = int(entry.get("tp") or 1)
+    except (TypeError, ValueError):
+        tp = 1
+    if tp >= 4:
+        return "multi4"
+    return "dual" if tp >= 2 else "single"
+
+
+def load_adhoc_variants(path=ADHOC_CATALOG_FILE):
+    """Load ad-hoc variant entries from the sidecar JSON.
+
+    Never raises: a missing, unreadable, or malformed sidecar means "no ad-hoc
+    variants", because the dashboard has to keep working without one.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"WARNING: ad-hoc catalog {path} unreadable: {e}",
+              file=sys.stderr)
+        return {}
+    variants = (data or {}).get("variants")
+    if not isinstance(variants, dict):
+        return {}
+    out = {}
+    for key, entry in variants.items():
+        if not isinstance(entry, dict):
+            continue
+        compose_path = str(entry.get("compose_path") or "")
+        # boot_model_once runs `docker compose -f` with cwd set to the
+        # club-3090 repo, so a relative path would resolve inside their tree.
+        if not compose_path.startswith("/"):
+            print(f"WARNING: ad-hoc variant {key!r} needs an absolute "
+                  f"compose_path; skipped", file=sys.stderr)
+            continue
+        loaded = {f: entry.get(f) for f in _ADHOC_FIELDS}
+        # Forced, not copied: a hand-edited local file must not be able to
+        # claim 'production' and skip validate_switch()'s force-confirm guard.
+        loaded["status"] = "experimental"
+        loaded["adhoc"] = True
+        loaded["topology"] = _adhoc_topology(entry)
+        loaded["weights_path"] = entry.get("weights_path")
+        out[str(key)] = loaded
+    return out
+
+
+def merge_adhoc_variants(catalog, adhoc):
+    """Fold ad-hoc entries into an extracted catalog, never shadowing it.
+
+    Registry keys always win. When club-3090 later catalogs a model we have
+    been serving ad-hoc, the real entry takes over and we log that the sidecar
+    entry is now redundant — that log line is the promotion signal.
+    """
+    if not adhoc or not isinstance(catalog, dict) or "error" in catalog:
+        return catalog
+    variants = catalog.setdefault("variants", {})
+    for key, entry in adhoc.items():
+        if key in variants:
+            print(f"[observer] ad-hoc variant {key!r} is now in the club-3090 "
+                  f"registry — sidecar entry ignored, safe to delete",
+                  flush=True)
+            continue
+        variants[key] = dict(entry)
+    return catalog
+
+
 def _clean_md_cell(value):
     value = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", str(value or ""))
     value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
