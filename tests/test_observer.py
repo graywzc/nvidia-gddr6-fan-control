@@ -2028,9 +2028,6 @@ class StopModelTests(unittest.TestCase):
         container still goes through switch.sh --down even when the catalog
         has other (non-adhoc) entries, so the ad-hoc carve-out can't regress
         the normal path."""
-        import os
-        import tempfile
-
         catalog = {"variants": {"vllm/q38": {
             "adhoc": True,
             "compose_path": "/etc/aipc-observer-adhoc/q38.yml",
@@ -2053,9 +2050,6 @@ class StopModelTests(unittest.TestCase):
         """A running ad-hoc container isn't in switch.sh's closed-world
         registry map, so --down would silently no-op and leave it serving.
         stop_model must detect that and use docker compose down directly."""
-        import os
-        import tempfile
-
         mi = dict(MODEL_INFO)
         mi["compose_file"] = "/etc/aipc-observer-adhoc/q38.yml"
         catalog = {"variants": {"vllm/q38": {

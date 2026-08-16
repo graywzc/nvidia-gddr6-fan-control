@@ -55,6 +55,21 @@ is mounted into the model container) and survives observer redeploys, which are
    that affordance for the 🧪 variants. An unvalidated ad-hoc model inherits the
    existing confirm-to-proceed guard instead of getting a bypass.
 
+### Stop must not delegate to upstream for an ad-hoc container
+
+`stop_model` prefers upstream's `scripts/switch.sh --down` whenever that script
+exists. But their `down_running()` is a deliberately *closed-world* teardown: it
+brings down only containers whose name is in their registry-derived map and
+leaves everything else alone. An ad-hoc container is by construction not in that
+map, so `--down` prints "no club-3090 container running", exits 0, and we would
+report success while the container kept serving with `restart: unless-stopped` —
+still holding port 8020, so the next switch back to a registry variant would fail
+on a bind conflict.
+
+So `stop_model` detects an ad-hoc running variant and falls through to the
+compose-based teardown below it, which works off the container's own compose
+labels. The registry path is untouched.
+
 ### Install is disabled for ad-hoc entries
 
 `/observer/api/install` drives upstream's `scripts/setup.sh <model>`, which
@@ -71,6 +86,10 @@ else, even though they have no actual dependency on the registry extraction
 succeeding. Accepted for now — this is rare, and when it happens the
 dashboard is already showing an upstream error, so the missing ad-hoc rows
 aren't a silent surprise — but it's a known wart, not an intentional coupling.
+
+It reaches the stop path too: with an errored catalog, `_running_variant_is_adhoc`
+can't recognise a running ad-hoc container, so Stop reverts to the `switch.sh`
+no-op described above. Self-correcting on the next successful poll.
 
 ## First ad-hoc variant — Qwen3.8-27B FP8, dual 3090
 
@@ -148,7 +167,8 @@ first boot because 3.8's thinking control is a different surface
 ## Bring-up
 
 1. `hf download Qwen/Qwen3.8-27B-FP8 --local-dir /home/graywzc/models/hf/qwen3.8-27b-fp8`
-2. Deploy the compose + sidecar to aipc1, restart the observer
+2. Deploy the compose + sidecar to aipc1 (no observer restart needed — the
+   sidecar is re-read every catalog poll; see `adhoc-variants/README.md`)
 3. Click the ad-hoc row in the variant page (confirm through the experimental guard)
 4. Smoke it: `MODEL=qwen3.8-27b URL=http://localhost:8020 bash scripts/verify-full.sh`
    from the club-3090 checkout — driving by endpoint, which is what
