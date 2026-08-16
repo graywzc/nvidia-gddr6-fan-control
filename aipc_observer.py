@@ -3624,35 +3624,47 @@ def poll_model_info(monitor_port):
         time.sleep(MODEL_INFO_POLL_INTERVAL)
 
 
-def refresh_catalog(repo, info, cache, observer_state=None):
+def refresh_catalog(repo, info, cache, observer_state=None,
+                    adhoc_loader=None):
     """Re-extract the catalog when HEAD or upstream moved; update the diff.
 
     `cache` maps sha -> extracted catalog so the subprocess only runs when a
     ref actually changes, not on every poll.
+
+    Ad-hoc variants are merged on top of the cached extraction on every
+    refresh — never into the cached object, because the sidecar is hand-edited
+    and has to take effect without HEAD moving. The diff against upstream uses
+    the unmerged catalog: an ad-hoc entry is a local addition, not drift.
     """
     st = observer_state or state
+    adhoc_loader = adhoc_loader or load_adhoc_variants
     head = info.get("head")
     if not head:
         return
-    local = cache.get(head)
-    if local is None:
-        local = extract_catalog(repo, "HEAD")
-        if "error" not in local:
-            cache[head] = local
+    raw_local = cache.get(head)
+    if raw_local is None:
+        raw_local = extract_catalog(repo, "HEAD")
+        if "error" not in raw_local:
+            cache[head] = raw_local
+    local = raw_local
+    if "error" not in raw_local:
+        local = dict(raw_local)
+        local["variants"] = dict(raw_local.get("variants") or {})
+        merge_adhoc_variants(local, adhoc_loader())
     st.set_catalog(local)
     if "error" not in local:
         st.merge_installed_assets(
             detect_installed_assets(repo, local, st.model_info)
         )
     upstream_sha = info.get("upstream_sha")
-    if info.get("behind") and upstream_sha and "error" not in local:
+    if info.get("behind") and upstream_sha and "error" not in raw_local:
         upstream = cache.get(upstream_sha)
         if upstream is None:
             upstream = extract_catalog(repo, "@{upstream}")
             if "error" not in upstream:
                 cache[upstream_sha] = upstream
         if "error" not in upstream:
-            st.set_catalog_diff(diff_catalogs(local, upstream))
+            st.set_catalog_diff(diff_catalogs(raw_local, upstream))
             return
     st.set_catalog_diff({})
 

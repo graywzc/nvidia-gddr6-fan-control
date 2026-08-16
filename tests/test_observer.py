@@ -1130,6 +1130,57 @@ class AdhocVariantTests(unittest.TestCase):
         self.assertNotIn("variants", catalog)
 
 
+class AdhocRefreshCatalogTests(unittest.TestCase):
+    def setUp(self):
+        self.state = aipc_observer.ObserverState()
+        self.adhoc = {"vllm/q38": {
+            "model": "qwen3.8-27b", "status": "experimental", "adhoc": True,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml", "tp": 2,
+            "topology": "dual", "weights_path": None}}
+
+    def _refresh(self, local, upstream=None, info=None):
+        cache = {}
+        calls = []
+
+        def fake_extract(repo, ref="HEAD"):
+            calls.append(ref)
+            return local if ref == "HEAD" else (upstream or {"variants": {}})
+
+        info = info or {"head": "sha1"}
+        with mock.patch.object(aipc_observer, "extract_catalog", fake_extract), \
+             mock.patch.object(aipc_observer, "detect_installed_assets",
+                               lambda *a, **k: {}):
+            aipc_observer.refresh_catalog(
+                "/repo", info, cache, observer_state=self.state,
+                adhoc_loader=lambda: dict(self.adhoc))
+        return cache
+
+    def test_adhoc_entry_appears_in_catalog(self):
+        self._refresh({"variants": {"vllm/dual": {"status": "production"}}})
+        variants = self.state.catalog["variants"]
+        self.assertIn("vllm/q38", variants)
+        self.assertIn("vllm/dual", variants)
+
+    def test_adhoc_entry_is_not_written_into_the_sha_cache(self):
+        cache = self._refresh(
+            {"variants": {"vllm/dual": {"status": "production"}}})
+        self.assertNotIn("vllm/q38", cache["sha1"]["variants"])
+
+    def test_adhoc_entry_is_absent_from_the_upstream_diff(self):
+        self._refresh(
+            {"variants": {"vllm/dual": {"status": "production"}}},
+            upstream={"variants": {"vllm/dual": {"status": "production"}}},
+            info={"head": "sha1", "behind": 1, "upstream_sha": "sha2"},
+        )
+        diff = self.state.catalog_diff
+        self.assertFalse(aipc_observer.catalog_has_changes(diff))
+
+    def test_errored_catalog_is_passed_through_untouched(self):
+        self._refresh({"error": "git show failed"})
+        self.assertEqual(self.state.catalog.get("error"), "git show failed")
+        self.assertNotIn("variants", self.state.catalog)
+
+
 class RepoInfoTests(unittest.TestCase):
     """collect_repo_info against real temporary git repos."""
 
