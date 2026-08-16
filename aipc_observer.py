@@ -2836,6 +2836,14 @@ def detect_installed_assets(repo, catalog, model_info=None):
     detected = {}
     roots = list(_model_cache_roots(repo, model_info))
     for key, entry in variants.items():
+        # Ad-hoc weights are staged by hand outside club-3090's cache roots,
+        # so they are checked directly rather than via a setup.sh hint.
+        if entry.get("adhoc"):
+            path = entry.get("weights_path")
+            if path and _asset_path_has_files(path):
+                detected[key] = {"model": entry.get("model"),
+                                 "source": "adhoc", "path": path}
+            continue
         hint = infer_variant_setup(entry)
         if not hint.get("model"):
             continue

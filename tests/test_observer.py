@@ -1181,6 +1181,32 @@ class AdhocRefreshCatalogTests(unittest.TestCase):
         self.assertNotIn("variants", self.state.catalog)
 
 
+class AdhocInstalledAssetsTests(unittest.TestCase):
+    def _catalog(self, weights_path):
+        return {"variants": {"vllm/q38": {
+            "model": "qwen3.8-27b", "adhoc": True, "weights_path": weights_path,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml"}}}
+
+    def test_adhoc_weights_on_disk_report_installed(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "model.safetensors"), "w") as f:
+                f.write("x")
+            got = aipc_observer.detect_installed_assets(
+                "/repo", self._catalog(d), {})
+        self.assertIn("vllm/q38", got)
+        self.assertEqual(got["vllm/q38"]["source"], "adhoc")
+
+    def test_adhoc_weights_missing_report_not_installed(self):
+        got = aipc_observer.detect_installed_assets(
+            "/repo", self._catalog("/nonexistent/weights"), {})
+        self.assertNotIn("vllm/q38", got)
+
+    def test_adhoc_without_weights_path_is_skipped(self):
+        got = aipc_observer.detect_installed_assets(
+            "/repo", self._catalog(None), {})
+        self.assertNotIn("vllm/q38", got)
+
+
 class RepoInfoTests(unittest.TestCase):
     """collect_repo_info against real temporary git repos."""
 
