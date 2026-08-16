@@ -1207,6 +1207,24 @@ class AdhocInstalledAssetsTests(unittest.TestCase):
         self.assertNotIn("vllm/q38", got)
 
 
+class AssertInstallableTests(unittest.TestCase):
+    def test_registry_variant_is_installable(self):
+        catalog = {"variants": {"vllm/dual": {"status": "production"}}}
+        entry = aipc_observer.assert_installable("vllm/dual", catalog)
+        self.assertEqual(entry["status"], "production")
+
+    def test_adhoc_variant_is_refused(self):
+        catalog = {"variants": {"vllm/q38": {"adhoc": True,
+                                             "status": "experimental"}}}
+        with self.assertRaises(ValueError) as ctx:
+            aipc_observer.assert_installable("vllm/q38", catalog)
+        self.assertIn("ad-hoc", str(ctx.exception))
+
+    def test_unknown_variant_is_refused(self):
+        with self.assertRaises(ValueError):
+            aipc_observer.assert_installable("vllm/nope", {"variants": {}})
+
+
 class RepoInfoTests(unittest.TestCase):
     """collect_repo_info against real temporary git repos."""
 

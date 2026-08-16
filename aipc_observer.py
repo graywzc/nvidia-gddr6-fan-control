@@ -2895,6 +2895,26 @@ def validate_switch(variant, catalog, force=False):
     return entry
 
 
+def assert_installable(variant, catalog):
+    """Reject install for variants whose weights we stage by hand.
+
+    /observer/api/install drives club-3090's scripts/setup.sh, which resolves
+    weights through their ModelProfile YAMLs. It cannot know a model that is
+    not in their registry, so an ad-hoc install would fail confusingly minutes
+    in. Raises ValueError, which the control handler maps to HTTP 400.
+    """
+    variants = (catalog or {}).get("variants") or {}
+    entry = variants.get(variant)
+    if entry is None:
+        raise ValueError(f"unknown variant {variant!r}")
+    if entry.get("adhoc"):
+        raise ValueError(
+            f"variant {variant!r} is ad-hoc; its weights are staged by hand, "
+            f"so there is nothing to install — start it instead"
+        )
+    return entry
+
+
 def normalize_switch_variant(variant, catalog):
     """Accept either a registry slug or a compose-derived variant path."""
     variants = (catalog or {}).get("variants") or {}
@@ -5267,6 +5287,7 @@ def handle_observer_post(handler):
             nvlink_mode = body.get("nvlink_mode") or None
             variant = normalize_switch_variant(variant, state.catalog)
             print(f"[observer] INSTALL: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force} retry={retry} nvlink_mode={nvlink_mode!r}", flush=True)
+            assert_installable(variant, state.catalog)
             validate_switch(variant, state.catalog, force=True)
             if retry:
                 check_restart_allowed(state, force=force)
