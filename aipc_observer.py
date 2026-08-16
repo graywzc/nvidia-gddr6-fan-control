@@ -1353,17 +1353,32 @@ ADHOC_CATALOG_FILE = "/etc/aipc-observer-adhoc.json"
 _ADHOC_FIELDS = ("model", "engine", "workload", "status", "status_note",
                  "max_ctx", "compose_path", "default_port", "kv_format", "tp")
 
+# _ADHOC_FIELDS plus the two sidecar-only keys (topology, weights_path) that
+# load_adhoc_variants also reads. Anything outside this set is silently
+# dropped from the loaded entry — which, for a file whose whole point is
+# "hand-edited on the box", would otherwise turn a typo into no signal at all.
+_ADHOC_KNOWN_FIELDS = frozenset(_ADHOC_FIELDS) | {"topology", "weights_path"}
 
-def _adhoc_topology(entry):
+_ADHOC_TOPOLOGIES = ("single", "dual", "multi4")
+
+
+def _adhoc_topology(key, entry):
     """Explicit topology, else derived from tensor-parallel degree.
 
     The dashboard filters the variant list by topology. Registry entries get
     theirs from '/dual/' or '/multi4/' in the compose path; an ad-hoc compose
-    lives at an arbitrary absolute path, so it must say so directly.
+    lives at an arbitrary absolute path, so it must say so directly. An
+    unrecognized explicit value falls back to tp-derivation (a hand-edited
+    sidecar shouldn't break the entry) but is still worth flagging, since a
+    typo here otherwise produces no signal at all.
     """
     explicit = entry.get("topology")
-    if explicit in ("single", "dual", "multi4"):
+    if explicit in _ADHOC_TOPOLOGIES:
         return explicit
+    if explicit is not None:
+        print(f"WARNING: ad-hoc variant {key!r} has topology {explicit!r}, "
+              f"expected one of {_ADHOC_TOPOLOGIES}; deriving from tp instead",
+              file=sys.stderr)
     try:
         tp = int(entry.get("tp") or 1)
     except (TypeError, ValueError):
@@ -1395,6 +1410,10 @@ def load_adhoc_variants(path=ADHOC_CATALOG_FILE):
     for key, entry in variants.items():
         if not isinstance(entry, dict):
             continue
+        unknown = sorted(set(entry) - _ADHOC_KNOWN_FIELDS)
+        if unknown:
+            print(f"WARNING: ad-hoc variant {key!r} has unrecognized "
+                  f"field(s) {unknown}; check for a typo", file=sys.stderr)
         compose_path = str(entry.get("compose_path") or "")
         # boot_model_once runs `docker compose -f` with cwd set to the
         # club-3090 repo, so a relative path would resolve inside their tree.
@@ -1407,8 +1426,17 @@ def load_adhoc_variants(path=ADHOC_CATALOG_FILE):
         # claim 'production' and skip validate_switch()'s force-confirm guard.
         loaded["status"] = "experimental"
         loaded["adhoc"] = True
-        loaded["topology"] = _adhoc_topology(entry)
-        loaded["weights_path"] = entry.get("weights_path")
+        loaded["topology"] = _adhoc_topology(key, entry)
+        weights_path = entry.get("weights_path")
+        # Unlike compose_path, a bad weights_path doesn't make the entry
+        # unbootable — only its installed/staged label is unknown — so warn
+        # and null it out rather than skipping the whole entry.
+        if weights_path and not str(weights_path).startswith("/"):
+            print(f"WARNING: ad-hoc variant {key!r} has non-absolute "
+                  f"weights_path {weights_path!r}; treating as not staged",
+                  file=sys.stderr)
+            weights_path = None
+        loaded["weights_path"] = weights_path
         out[str(key)] = loaded
     return out
 
@@ -2336,10 +2364,33 @@ def _compose_file_args(compose_file):
     return args
 
 
-def stop_model(model_info=None, repo=None, runner=_run):
+def _running_variant_is_adhoc(mi, catalog):
+    """True when the running container's compose file is an ad-hoc variant.
+
+    club-3090's switch.sh --down is closed-world: it only tears down
+    containers whose name is in its registry-derived VARIANT_CONTAINER map, so
+    an ad-hoc container is silently left running. Matches the same way
+    ObserverState._seed_running_installed_locked identifies the running
+    variant — compose_path is a substring of the running container's
+    compose_file — but restricted to entries flagged adhoc.
+    """
+    compose_file = (mi or {}).get("compose_file") or ""
+    if not compose_file:
+        return False
+    variants = (catalog or {}).get("variants") or {}
+    for entry in variants.values():
+        entry = entry or {}
+        cp = entry.get("compose_path")
+        if entry.get("adhoc") and cp and cp in compose_file:
+            return True
+    return False
+
+
+def stop_model(model_info=None, repo=None, runner=_run, catalog=None):
     """Stop the running model compose project without starting a replacement."""
     repo = repo if repo is not None else _config.get("model_repo")
     mi = model_info if model_info is not None else state.model_info
+    catalog = catalog if catalog is not None else state.catalog
     container = (mi or {}).get("container")
     if model_info is None and not container:
         container = state.container_name
@@ -2348,7 +2399,7 @@ def stop_model(model_info=None, repo=None, runner=_run):
 
     if repo:
         switch_script = os.path.join(repo, "scripts", "switch.sh")
-        if os.path.exists(switch_script):
+        if os.path.exists(switch_script) and not _running_variant_is_adhoc(mi, catalog):
             audit("stop", f"repo={repo} via switch.sh --down")
             _watchdog.mark_deliberately_stopped()
             try:
@@ -4804,7 +4855,7 @@ function renderVariantListModal(d,fits,runKey,running,topo){let c=d.catalog||{};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let visible=new Set(fits);compareSelections.forEach(k=>{if(!visible.has(k))compareSelections.delete(k)});
 let rows='<div class="compare-toolbar"><button id="btnCompareVariants" class="btn" onclick="compareSelectedVariants()">Compare commands</button><span id="compareCount" class="label">0 selected</span><span class="label">select 2-4 variants</span></div><div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let installedLabel=installed[k]?'<span class="good">installed</span>':'<span class="label">needs download</span>';let adhoc=v.adhoc?'true':'false';let action=k===runKey?`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStop()"${lastBusy?' disabled':''}>Stop</button>`:`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStartOrSwitch('${esc(k)}','${esc(v.status)}',${adhoc})"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let installing=installingVariant?`<span class="hot">installing…</span>`:'';let checked=compareSelections.has(k)?' checked':'';
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let installedLabel=v.adhoc?(installed[k]?`<span class="good" title="${esc(v.weights_path||'')}">staged</span>`:`<span class="label" title="${esc(v.weights_path||'')}">weights not staged</span>`):(installed[k]?'<span class="good">installed</span>':'<span class="label">needs download</span>');let adhoc=v.adhoc?'true':'false';let action=k===runKey?`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStop()"${lastBusy?' disabled':''}>Stop</button>`:`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStartOrSwitch('${esc(k)}','${esc(v.status)}',${adhoc})"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let installing=installingVariant?`<span class="hot">installing…</span>`:'';let checked=compareSelections.has(k)?' checked':'';
 return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}${v.adhoc?' <span class="hot" title="Ad-hoc: not in the club-3090 registry, served from a local sidecar compose">ad-hoc</span>':''}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${installing}${k!==runKey?installedLabel:''}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;

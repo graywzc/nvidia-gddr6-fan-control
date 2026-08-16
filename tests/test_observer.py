@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for integrated aipc observer request parsing."""
 
+import io
 import json
 import os
 import sys
@@ -1108,6 +1109,48 @@ class AdhocVariantTests(unittest.TestCase):
         got = aipc_observer.load_adhoc_variants(path)
         self.assertEqual(got["a"]["topology"], "single")
 
+    def test_relative_weights_path_is_dropped_not_the_entry(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(weights_path="models/hf/q38")}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertIn("vllm/q38", got)
+        self.assertIsNone(got["vllm/q38"]["weights_path"])
+        self.assertIn("weights_path", err.getvalue())
+        self.assertIn("vllm/q38", err.getvalue())
+
+    def test_missing_weights_path_stays_none_without_warning(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(weights_path=None)}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertIsNone(got["vllm/q38"]["weights_path"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_unrecognized_key_is_warned_about(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(typoed_field="oops")}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertIn("vllm/q38", got)
+        self.assertIn("typoed_field", err.getvalue())
+        self.assertIn("vllm/q38", err.getvalue())
+
+    def test_known_keys_produce_no_warning(self):
+        path = self._write({"variants": {"vllm/q38": self._entry()}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(err.getvalue(), "")
+
+    def test_invalid_topology_warns_and_falls_back_to_tp(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(tp=2, topology="Dual")}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["vllm/q38"]["topology"], "dual")
+        self.assertIn("topology", err.getvalue())
+        self.assertIn("vllm/q38", err.getvalue())
+
     def test_merge_adds_new_key(self):
         catalog = {"variants": {"vllm/dual": {"status": "production"}}}
         aipc_observer.merge_adhoc_variants(
@@ -1979,6 +2022,59 @@ class StopModelTests(unittest.TestCase):
         self.assertTrue(result["stopped"])
         self.assertEqual(result["detail"], "club-3090 switch.sh --down ran")
         self.assertEqual(runner.calls[0]["cmd"][-3:], ["bash", "scripts/switch.sh", "--down"])
+
+    def test_stop_uses_switch_down_for_running_registry_variant(self):
+        """Mirror image of the ad-hoc test below: a registry variant's running
+        container still goes through switch.sh --down even when the catalog
+        has other (non-adhoc) entries, so the ad-hoc carve-out can't regress
+        the normal path."""
+        import os
+        import tempfile
+
+        catalog = {"variants": {"vllm/q38": {
+            "adhoc": True,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml",
+        }}}
+        with tempfile.TemporaryDirectory() as repo:
+            scripts = os.path.join(repo, "scripts")
+            os.mkdir(scripts)
+            open(os.path.join(scripts, "switch.sh"), "w").close()
+            runner = FakeRunner()
+            result = aipc_observer.stop_model(
+                model_info=dict(MODEL_INFO), repo=repo, runner=runner,
+                catalog=catalog,
+            )
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["detail"], "club-3090 switch.sh --down ran")
+        self.assertEqual(runner.calls[0]["cmd"][-3:],
+                          ["bash", "scripts/switch.sh", "--down"])
+
+    def test_stop_falls_through_to_compose_down_for_running_adhoc_variant(self):
+        """A running ad-hoc container isn't in switch.sh's closed-world
+        registry map, so --down would silently no-op and leave it serving.
+        stop_model must detect that and use docker compose down directly."""
+        import os
+        import tempfile
+
+        mi = dict(MODEL_INFO)
+        mi["compose_file"] = "/etc/aipc-observer-adhoc/q38.yml"
+        catalog = {"variants": {"vllm/q38": {
+            "adhoc": True,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml",
+        }}}
+        with tempfile.TemporaryDirectory() as repo:
+            scripts = os.path.join(repo, "scripts")
+            os.mkdir(scripts)
+            open(os.path.join(scripts, "switch.sh"), "w").close()
+            runner = FakeRunner()
+            result = aipc_observer.stop_model(
+                model_info=mi, repo=repo, runner=runner, catalog=catalog,
+            )
+        self.assertTrue(result["stopped"])
+        self.assertNotIn("switch.sh", " ".join(
+            str(c) for call in runner.calls for c in call["cmd"]))
+        self.assertEqual(runner.calls[0]["cmd"][:2], ["docker", "compose"])
+        self.assertEqual(runner.calls[0]["cmd"][-1], "down")
 
     def test_stop_uses_compose_project_and_all_config_files(self):
         runner = FakeRunner()
