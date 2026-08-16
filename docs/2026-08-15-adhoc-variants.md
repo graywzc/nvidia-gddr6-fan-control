@@ -62,6 +62,16 @@ resolves weights through their ModelProfile YAMLs. It cannot know a model that
 isn't in their registry. Ad-hoc weights are staged by hand, so the Install
 affordance is hidden for these rows rather than left to fail confusingly.
 
+### Known coupling: an upstream extraction failure hides ad-hoc rows too
+
+`refresh_catalog` only merges the sidecar on top of a successful `HEAD`
+extraction (`"error" not in raw_local`); if `git show ...compose_registry.py`
+fails, ad-hoc variants disappear from the dashboard along with everything
+else, even though they have no actual dependency on the registry extraction
+succeeding. Accepted for now — this is rare, and when it happens the
+dashboard is already showing an upstream error, so the missing ad-hoc rows
+aren't a silent surprise — but it's a known wart, not an intentional coupling.
+
 ## First ad-hoc variant — Qwen3.8-27B FP8, dual 3090
 
 ### Why this is nearly free

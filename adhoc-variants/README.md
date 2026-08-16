@@ -15,10 +15,14 @@ Stage the weights (~29 GB for Qwen3.8-27B FP8; `/` has 1.4 T free):
 
 Create the cache dirs the compose mounts:
 
-    ssh aipc1 'sudo mkdir -p /var/lib/nvidia-gddr6-fan-control/adhoc/qwen3.8-27b/cache/{torch_compile,triton}'
+    ssh aipc1 'sudo mkdir -p /var/lib/nvidia-gddr6-fan-control/adhoc/qwen3.8-27b/cache/torch_compile \
+      /var/lib/nvidia-gddr6-fan-control/adhoc/qwen3.8-27b/cache/triton'
 
-Copy the compose to a path whose parent directory is the topology name, and
-the sidecar to /etc:
+Copy the compose and the sidecar to /etc. (The deploy path below must stay
+exactly as written — the sidecar's `compose_path` matches it character for
+character. The `dual` subdirectory is just where this one happens to live;
+it's the explicit `topology` field in the sidecar, not the path, that the
+dashboard actually reads.)
 
     scp adhoc-variants/qwen3.8-27b-dual-fp8.yml aipc1:/tmp/
     scp adhoc-variants/aipc-observer-adhoc.example.json aipc1:/tmp/
@@ -26,9 +30,20 @@ the sidecar to /etc:
       && sudo mv /tmp/qwen3.8-27b-dual-fp8.yml /etc/aipc-observer-adhoc/dual/qwen3.8-27b-fp8.yml \
       && sudo mv /tmp/aipc-observer-adhoc.example.json /etc/aipc-observer-adhoc.json'
 
-Restart the observer so it picks up the sidecar, then click the `ad-hoc` row on
-the variant page. Sidecar edits take effect on the next catalog poll — only the
-observer binary needs a restart, not the sidecar.
+The observer only reads the sidecar path at startup, so a *new* sidecar file
+(as above) needs an observer restart before it's picked up. *Edits* to an
+already-loaded sidecar don't — they take effect on the next catalog poll by
+themselves. Either way that poll runs at most every `REPO_POLL_INTERVAL`
+(900 s = 15 min), so a plain restart-and-wait can take up to 15 minutes;
+`POST /observer/api/update` wakes the poll immediately if you don't want to
+wait. Once it's picked up, click the `ad-hoc` row on the variant page.
+
+`weights_path` in the sidecar and the compose's `MODEL_DIR` mount are declared
+independently — `boot_model_once` builds the compose environment from
+`dict(os.environ)`, so if `MODEL_DIR` is set in the observer daemon's own
+environment it silently overrides the mount. Make sure `MODEL_DIR` is unset
+there, or that `weights_path` equals `$MODEL_DIR/<subdir>`; otherwise the
+dashboard can say "staged" while vLLM can't find the model.
 
 ## Verifying
 

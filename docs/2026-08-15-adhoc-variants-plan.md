@@ -20,7 +20,7 @@ Design doc: [docs/2026-08-15-adhoc-variants.md](2026-08-15-adhoc-variants.md)
 - An ad-hoc key must never overwrite a registry key.
 - Ad-hoc entries must never appear in the local-vs-upstream catalog diff.
 - Endpoint contract for the first ad-hoc variant, fixed and unchanging through eventual promotion: host port **8020**, `--served-model-name` **`qwen3.8-27b`**, container **`vllm-qwen38-27b-dual-max`**, sidecar key **`vllm/qwen38-27b-dual-max`**.
-- Run tests with: `python3 -m pytest tests/test_observer.py -v` from the repo root.
+- Run tests with: `PYTHONPATH=. python3 -m unittest tests.test_observer -v` from the repo root. (`pytest` is not installed in this environment; read every per-task `pytest tests/test_observer.py[::SomeClass]` command below as its `unittest` equivalent, e.g. `PYTHONPATH=. python3 -m unittest tests.test_observer.SomeClass -v`.)
 
 ---
 
