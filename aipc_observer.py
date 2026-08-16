@@ -1341,6 +1341,126 @@ def extract_catalog(repo, ref="HEAD"):
         return {"error": str(e), "ref": ref}
 
 
+# Variants this box serves that club-3090's registry does not carry. Hand-edited
+# on the host; /etc matches VLLM_LOGGING_CONFIG_FILE (see below) and survives
+# observer redeploys, which are scp + restart with no git checkout.
+ADHOC_CATALOG_FILE = "/etc/aipc-observer-adhoc.json"
+
+# The exact fields _CATALOG_EXTRACT_CODE projects from the registry. Ad-hoc
+# entries carry the same ten so every downstream consumer — validate_switch,
+# boot_model_once, detect_installed_assets, the dashboard — treats them
+# identically to registry entries.
+_ADHOC_FIELDS = ("model", "engine", "workload", "status", "status_note",
+                 "max_ctx", "compose_path", "default_port", "kv_format", "tp")
+
+# _ADHOC_FIELDS plus the two sidecar-only keys (topology, weights_path) that
+# load_adhoc_variants also reads. Anything outside this set is silently
+# dropped from the loaded entry — which, for a file whose whole point is
+# "hand-edited on the box", would otherwise turn a typo into no signal at all.
+_ADHOC_KNOWN_FIELDS = frozenset(_ADHOC_FIELDS) | {"topology", "weights_path"}
+
+_ADHOC_TOPOLOGIES = ("single", "dual", "multi4")
+
+
+def _adhoc_topology(key, entry):
+    """Explicit topology, else derived from tensor-parallel degree.
+
+    The dashboard filters the variant list by topology. Registry entries get
+    theirs from '/dual/' or '/multi4/' in the compose path; an ad-hoc compose
+    lives at an arbitrary absolute path, so it must say so directly. An
+    unrecognized explicit value falls back to tp-derivation (a hand-edited
+    sidecar shouldn't break the entry) but is still worth flagging, since a
+    typo here otherwise produces no signal at all.
+    """
+    explicit = entry.get("topology")
+    if explicit in _ADHOC_TOPOLOGIES:
+        return explicit
+    if explicit is not None:
+        print(f"WARNING: ad-hoc variant {key!r} has topology {explicit!r}, "
+              f"expected one of {_ADHOC_TOPOLOGIES}; deriving from tp instead",
+              file=sys.stderr)
+    try:
+        tp = int(entry.get("tp") or 1)
+    except (TypeError, ValueError):
+        tp = 1
+    if tp >= 4:
+        return "multi4"
+    return "dual" if tp >= 2 else "single"
+
+
+def load_adhoc_variants(path=ADHOC_CATALOG_FILE):
+    """Load ad-hoc variant entries from the sidecar JSON.
+
+    Never raises: a missing, unreadable, or malformed sidecar means "no ad-hoc
+    variants", because the dashboard has to keep working without one.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"WARNING: ad-hoc catalog {path} unreadable: {e}",
+              file=sys.stderr)
+        return {}
+    variants = (data or {}).get("variants")
+    if not isinstance(variants, dict):
+        return {}
+    out = {}
+    for key, entry in variants.items():
+        if not isinstance(entry, dict):
+            continue
+        unknown = sorted(set(entry) - _ADHOC_KNOWN_FIELDS)
+        if unknown:
+            print(f"WARNING: ad-hoc variant {key!r} has unrecognized "
+                  f"field(s) {unknown}; check for a typo", file=sys.stderr)
+        compose_path = str(entry.get("compose_path") or "")
+        # boot_model_once runs `docker compose -f` with cwd set to the
+        # club-3090 repo, so a relative path would resolve inside their tree.
+        if not compose_path.startswith("/"):
+            print(f"WARNING: ad-hoc variant {key!r} needs an absolute "
+                  f"compose_path; skipped", file=sys.stderr)
+            continue
+        loaded = {f: entry.get(f) for f in _ADHOC_FIELDS}
+        # Forced, not copied: a hand-edited local file must not be able to
+        # claim 'production' and skip validate_switch()'s force-confirm guard.
+        loaded["status"] = "experimental"
+        loaded["adhoc"] = True
+        loaded["topology"] = _adhoc_topology(key, entry)
+        weights_path = entry.get("weights_path")
+        # Unlike compose_path, a bad weights_path doesn't make the entry
+        # unbootable — only its installed/staged label is unknown — so warn
+        # and null it out rather than skipping the whole entry.
+        if weights_path and not str(weights_path).startswith("/"):
+            print(f"WARNING: ad-hoc variant {key!r} has non-absolute "
+                  f"weights_path {weights_path!r}; treating as not staged",
+                  file=sys.stderr)
+            weights_path = None
+        loaded["weights_path"] = weights_path
+        out[str(key)] = loaded
+    return out
+
+
+def merge_adhoc_variants(catalog, adhoc):
+    """Fold ad-hoc entries into an extracted catalog, never shadowing it.
+
+    Registry keys always win. When club-3090 later catalogs a model we have
+    been serving ad-hoc, the real entry takes over and we log that the sidecar
+    entry is now redundant — that log line is the promotion signal.
+    """
+    if not adhoc or not isinstance(catalog, dict) or "error" in catalog:
+        return catalog
+    variants = catalog.setdefault("variants", {})
+    for key, entry in adhoc.items():
+        if key in variants:
+            print(f"[observer] ad-hoc variant {key!r} is now in the club-3090 "
+                  f"registry — sidecar entry ignored, safe to delete",
+                  flush=True)
+            continue
+        variants[key] = dict(entry)
+    return catalog
+
+
 def _clean_md_cell(value):
     value = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", str(value or ""))
     value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
@@ -2244,10 +2364,33 @@ def _compose_file_args(compose_file):
     return args
 
 
-def stop_model(model_info=None, repo=None, runner=_run):
+def _running_variant_is_adhoc(mi, catalog):
+    """True when the running container's compose file is an ad-hoc variant.
+
+    club-3090's switch.sh --down is closed-world: it only tears down
+    containers whose name is in its registry-derived VARIANT_CONTAINER map, so
+    an ad-hoc container is silently left running. Matches the same way
+    ObserverState._seed_running_installed_locked identifies the running
+    variant — compose_path is a substring of the running container's
+    compose_file — but restricted to entries flagged adhoc.
+    """
+    compose_file = (mi or {}).get("compose_file") or ""
+    if not compose_file:
+        return False
+    variants = (catalog or {}).get("variants") or {}
+    for entry in variants.values():
+        entry = entry or {}
+        cp = entry.get("compose_path")
+        if entry.get("adhoc") and cp and cp in compose_file:
+            return True
+    return False
+
+
+def stop_model(model_info=None, repo=None, runner=_run, catalog=None):
     """Stop the running model compose project without starting a replacement."""
     repo = repo if repo is not None else _config.get("model_repo")
     mi = model_info if model_info is not None else state.model_info
+    catalog = catalog if catalog is not None else state.catalog
     container = (mi or {}).get("container")
     if model_info is None and not container:
         container = state.container_name
@@ -2256,7 +2399,7 @@ def stop_model(model_info=None, repo=None, runner=_run):
 
     if repo:
         switch_script = os.path.join(repo, "scripts", "switch.sh")
-        if os.path.exists(switch_script):
+        if os.path.exists(switch_script) and not _running_variant_is_adhoc(mi, catalog):
             audit("stop", f"repo={repo} via switch.sh --down")
             _watchdog.mark_deliberately_stopped()
             try:
@@ -2744,6 +2887,14 @@ def detect_installed_assets(repo, catalog, model_info=None):
     detected = {}
     roots = list(_model_cache_roots(repo, model_info))
     for key, entry in variants.items():
+        # Ad-hoc weights are staged by hand outside club-3090's cache roots,
+        # so they are checked directly rather than via a setup.sh hint.
+        if entry.get("adhoc"):
+            path = entry.get("weights_path")
+            if path and _asset_path_has_files(path):
+                detected[key] = {"model": entry.get("model"),
+                                 "source": "adhoc", "path": path}
+            continue
         hint = infer_variant_setup(entry)
         if not hint.get("model"):
             continue
@@ -2791,6 +2942,26 @@ def validate_switch(variant, catalog, force=False):
         print(f"[observer] validate_switch: rejected — status={status!r} force={force}", flush=True)
         raise ValueError(
             f"variant {variant!r} has status {status!r}; pass force to switch anyway"
+        )
+    return entry
+
+
+def assert_installable(variant, catalog):
+    """Reject install for variants whose weights we stage by hand.
+
+    /observer/api/install drives club-3090's scripts/setup.sh, which resolves
+    weights through their ModelProfile YAMLs. It cannot know a model that is
+    not in their registry, so an ad-hoc install would fail confusingly minutes
+    in. Raises ValueError, which the control handler maps to HTTP 400.
+    """
+    variants = (catalog or {}).get("variants") or {}
+    entry = variants.get(variant)
+    if entry is None:
+        raise ValueError(f"unknown variant {variant!r}")
+    if entry.get("adhoc"):
+        raise ValueError(
+            f"variant {variant!r} is ad-hoc; its weights are staged by hand, "
+            f"so there is nothing to install — start it instead"
         )
     return entry
 
@@ -3532,35 +3703,47 @@ def poll_model_info(monitor_port):
         time.sleep(MODEL_INFO_POLL_INTERVAL)
 
 
-def refresh_catalog(repo, info, cache, observer_state=None):
+def refresh_catalog(repo, info, cache, observer_state=None,
+                    adhoc_loader=None):
     """Re-extract the catalog when HEAD or upstream moved; update the diff.
 
     `cache` maps sha -> extracted catalog so the subprocess only runs when a
     ref actually changes, not on every poll.
+
+    Ad-hoc variants are merged on top of the cached extraction on every
+    refresh — never into the cached object, because the sidecar is hand-edited
+    and has to take effect without HEAD moving. The diff against upstream uses
+    the unmerged catalog: an ad-hoc entry is a local addition, not drift.
     """
     st = observer_state or state
+    adhoc_loader = adhoc_loader or load_adhoc_variants
     head = info.get("head")
     if not head:
         return
-    local = cache.get(head)
-    if local is None:
-        local = extract_catalog(repo, "HEAD")
-        if "error" not in local:
-            cache[head] = local
+    raw_local = cache.get(head)
+    if raw_local is None:
+        raw_local = extract_catalog(repo, "HEAD")
+        if "error" not in raw_local:
+            cache[head] = raw_local
+    local = raw_local
+    if "error" not in raw_local:
+        local = dict(raw_local)
+        local["variants"] = dict(raw_local.get("variants") or {})
+        merge_adhoc_variants(local, adhoc_loader())
     st.set_catalog(local)
     if "error" not in local:
         st.merge_installed_assets(
             detect_installed_assets(repo, local, st.model_info)
         )
     upstream_sha = info.get("upstream_sha")
-    if info.get("behind") and upstream_sha and "error" not in local:
+    if info.get("behind") and upstream_sha and "error" not in raw_local:
         upstream = cache.get(upstream_sha)
         if upstream is None:
             upstream = extract_catalog(repo, "@{upstream}")
             if "error" not in upstream:
                 cache[upstream_sha] = upstream
         if "error" not in upstream:
-            st.set_catalog_diff(diff_catalogs(local, upstream))
+            st.set_catalog_diff(diff_catalogs(raw_local, upstream))
             return
     st.set_catalog_diff({})
 
@@ -4575,11 +4758,12 @@ document.querySelectorAll('.controls .btn').forEach(b=>{if(b.id!=='btnAbort')b.d
 let running=!!d.container;let rb=document.getElementById('btnRestart'),sb=document.getElementById('btnStop');
 if(rb){rb.disabled=lastBusy||!running;rb.title=running?'':'no model running — use Start in the Catalog below'}
 if(sb){sb.disabled=lastBusy||!running;sb.title=running?'':'no model running'}}
-function doStartOrSwitch(v,status){let p=selectedPreset(),cache=selectedCacheRam(),nvlink=selectedNvlinkMode();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';let nvlinkNote=nvlink!=='auto'?`\nNVLINK_MODE=${nvlink}`:'';
-let confirmMsg=`Start/switch model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?${nvlinkNote}\nThis downloads any missing files, then boots — takes a few minutes.${exp}${warn}`;
+function doStartOrSwitch(v,status,adhoc){let p=selectedPreset(),cache=selectedCacheRam(),nvlink=selectedNvlinkMode();let warn=lastActive?`\n⚠ ${lastActive} request(s) in flight will be killed!`:'';let exp=(status!=='production'&&status!=='caveats')?`\n⚠ status is '${status}' — will pass --force.`:'';let nvlinkNote=nvlink!=='auto'?`\nNVLINK_MODE=${nvlink}`:'';
+let prep=adhoc?'Weights must already be staged on disk — nothing will be downloaded.':'This downloads any missing files, then boots — takes a few minutes.';
+let confirmMsg=`Start/switch model '${v}' with mode '${p}' and cache ${cache?'on':'off'}?${nvlinkNote}\n${prep}${exp}${warn}`;
 if(!confirm(confirmMsg))return;
 let body={variant:v,preset:p,cache_ram:cache,force:lastActive>0||(status!=='production'&&status!=='caveats'),retry:true,nvlink_mode:nvlink!=='auto'?nvlink:null};
-ctlPost('/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent='⏳ preparing & starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
+ctlPost(adhoc?'/observer/api/switch':'/observer/api/install',body).then(()=>{document.getElementById('ctlStatus').textContent='⏳ preparing & starting…'}).catch(e=>{document.getElementById('ctlStatus').textContent='✗ '+e.message})}
 function renderLastStart(d){let ls=d.last_start||{};let sumEl=document.getElementById('lastStartSummary');let logEl=document.getElementById('lastStartLog');if(!sumEl||!logEl)return;if(!ls.started_at){sumEl.innerHTML='<span class="label">No model start recorded yet.</span>';logEl.innerHTML='';return}let icon=ls.ok===true?'✓':(ls.ok===false?'✗':'⏳');let variant=ls.variant||'?';let preset=ls.preset||'?';let cacheLabel=ls.cache_ram?'on':'off';let endAt=ls.finished_at||Date.now()/1000;let dur=endAt-ls.started_at;let dm=Math.floor(dur/60);let ds=Math.floor(dur%60);let durStr=dm>0?`${dm}m ${ds}s`:`${ds}s`;let cls=ls.ok===true?'good':(ls.ok===false?'critical':'hot');sumEl.innerHTML=`<span class="${cls}">${icon} ${esc(variant)} · mode ${esc(preset)} · cache ${cacheLabel} · ${durStr}</span>`;let lines=ls.log||[];if(!lines.length){logEl.innerHTML='<div class="label" style="padding:4px 0">No log captured yet.</div>';return}let html=lines.map(l=>`<div class="log-line">${esc(l)}</div>`).join('');logEl.innerHTML=html;logEl.scrollTop=logEl.scrollHeight}
 function renderModelInfoFromState(){if(lastRenderData)renderModelInfo(lastRenderData)}
 function renderMetrics(d){let m=d.metrics||{};let el=document.getElementById('metricsInfo');let q=document.getElementById('queued');
@@ -4660,7 +4844,7 @@ function variantDoc(v){return v.doc||{}}
 function variantCtx(v){let doc=variantDoc(v);return doc.max_ctx_doc||`${v.max_ctx?Number(v.max_ctx).toLocaleString():'-'}`}
 function variantTps(v){return variantDoc(v).tps||'-'}
 function variantWhy(v){return variantDoc(v).why||v.status_note||''}
-function variantTopology(v){let p=(v&&v.compose_path)||'';return p.indexOf('/multi4/')>=0?'multi4':(p.indexOf('/dual/')>=0?'dual':'single')}
+function variantTopology(v){if(v&&v.topology)return v.topology;let p=(v&&v.compose_path)||'';return p.indexOf('/multi4/')>=0?'multi4':(p.indexOf('/dual/')>=0?'dual':'single')}
 function machineTopology(d){let ngpu=(d.gpu_stats||[]).length||1;return ngpu>=4?'multi4':(ngpu>=2?'dual':'single')}
 function topologyLabel(t){return t==='multi4'?'4-GPU':(t==='dual'?'dual-GPU':'single-GPU')}
 function defaultForVariant(c,k,v,topo){return (c.defaults||{})[`${v.model}/${k.split('/')[0]}/${topo}`]}
@@ -4671,8 +4855,8 @@ function renderVariantListModal(d,fits,runKey,running,topo){let c=d.catalog||{};
 fits=fits.slice().sort((a,b)=>(order[vars[a].status]??2)-(order[vars[b].status]??2)||(vars[a].model||'').localeCompare(vars[b].model||'')||a.localeCompare(b));
 let visible=new Set(fits);compareSelections.forEach(k=>{if(!visible.has(k))compareSelections.delete(k)});
 let rows='<div class="compare-toolbar"><button id="btnCompareVariants" class="btn" onclick="compareSelectedVariants()">Compare commands</button><span id="compareCount" class="label">0 selected</span><span class="label">select 2-4 variants</span></div><div class="variant-table"><div class="variant-row head"><span>Variant</span><span>Max ctx</span><span>Narr / Code</span><span>Workload</span><span>Why / comments</span><span>Action</span></div>';
-rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let installedLabel=installed[k]?'<span class="good">installed</span>':'<span class="label">needs download</span>';let action=k===runKey?`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStop()"${lastBusy?' disabled':''}>Stop</button>`:`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStartOrSwitch('${esc(k)}','${esc(v.status)}')"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let installing=installingVariant?`<span class="hot">installing…</span>`:'';let checked=compareSelections.has(k)?' checked':'';
-return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${installing}${k!==runKey?installedLabel:''}${action}</span></div>`}).join('');
+rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'▶ ':(isTopologyDefault(c,k,v,topo)?'⭐ ':'');let note=v.status_note&&!doc.why?`<div class="variant-note">${esc(v.status_note)}</div>`:'';let installedLabel=v.adhoc?(installed[k]?`<span class="good" title="${esc(v.weights_path||'')}">staged</span>`:`<span class="label" title="${esc(v.weights_path||'')}">weights not staged</span>`):(installed[k]?'<span class="good">installed</span>':'<span class="label">needs download</span>');let adhoc=v.adhoc?'true':'false';let action=k===runKey?`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStop()"${lastBusy?' disabled':''}>Stop</button>`:`<button class="btn switch-btn" style="padding:2px 8px;font-size:11px" onclick="doStartOrSwitch('${esc(k)}','${esc(v.status)}',${adhoc})"${lastBusy?' disabled':''}>${running?'switch':'start'}</button>`;let cs=d.control_status||{};let installingVariant=cs.action==='install'&&!cs.done&&cs.detail&&cs.detail.indexOf(k)>=0?k:null;let installing=installingVariant?`<span class="hot">installing…</span>`:'';let checked=compareSelections.has(k)?' checked':'';
+return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}${v.adhoc?' <span class="hot" title="Ad-hoc: not in the club-3090 registry, served from a local sidecar compose">ad-hoc</span>':''}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${esc(variantWhy(v))}${note}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end">${statusSpan(v.status)}${installing}${k!==runKey?installedLabel:''}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;
 document.getElementById('variantModalBody').innerHTML=rows;
@@ -5155,6 +5339,7 @@ def handle_observer_post(handler):
             nvlink_mode = body.get("nvlink_mode") or None
             variant = normalize_switch_variant(variant, state.catalog)
             print(f"[observer] INSTALL: variant={variant!r} preset={preset!r} cache_ram={cache_ram} force={force} retry={retry} nvlink_mode={nvlink_mode!r}", flush=True)
+            assert_installable(variant, state.catalog)
             validate_switch(variant, state.catalog, force=True)
             if retry:
                 check_restart_allowed(state, force=force)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for integrated aipc observer request parsing."""
 
+import io
 import json
 import os
 import sys
@@ -1041,6 +1042,232 @@ class CatalogDiffTests(unittest.TestCase):
         self.assertTrue(aipc_observer.catalog_has_changes(diff))
 
 
+class AdhocVariantTests(unittest.TestCase):
+    def _write(self, payload):
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            f.write(payload if isinstance(payload, str) else json.dumps(payload))
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def _entry(self, **over):
+        entry = {
+            "model": "qwen3.8-27b", "engine": "vllm",
+            "workload": "long-ctx-single", "status": "experimental",
+            "status_note": "ad-hoc", "max_ctx": 262144,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml",
+            "default_port": 8020, "kv_format": "int8_per_token_head", "tp": 2,
+            "weights_path": "/home/graywzc/models/hf/qwen3.8-27b-fp8",
+        }
+        entry.update(over)
+        return entry
+
+    def test_missing_file_yields_no_variants(self):
+        got = aipc_observer.load_adhoc_variants("/nonexistent/adhoc.json")
+        self.assertEqual(got, {})
+
+    def test_malformed_json_yields_no_variants(self):
+        path = self._write("{not json")
+        self.assertEqual(aipc_observer.load_adhoc_variants(path), {})
+
+    def test_valid_entry_is_loaded_and_marked_adhoc(self):
+        path = self._write({"variants": {"vllm/q38": self._entry()}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertIn("vllm/q38", got)
+        entry = got["vllm/q38"]
+        self.assertTrue(entry["adhoc"])
+        self.assertEqual(entry["model"], "qwen3.8-27b")
+        self.assertEqual(entry["default_port"], 8020)
+        self.assertEqual(entry["compose_path"],
+                         "/etc/aipc-observer-adhoc/q38.yml")
+        self.assertEqual(entry["weights_path"],
+                         "/home/graywzc/models/hf/qwen3.8-27b-fp8")
+
+    def test_relative_compose_path_is_rejected(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(compose_path="models/q38/compose.yml")}})
+        self.assertEqual(aipc_observer.load_adhoc_variants(path), {})
+
+    def test_status_is_forced_to_experimental(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(status="production")}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["vllm/q38"]["status"], "experimental")
+
+    def test_topology_derived_from_tp_when_absent(self):
+        path = self._write({"variants": {
+            "a": self._entry(tp=1), "b": self._entry(tp=2),
+            "c": self._entry(tp=4)}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["a"]["topology"], "single")
+        self.assertEqual(got["b"]["topology"], "dual")
+        self.assertEqual(got["c"]["topology"], "multi4")
+
+    def test_explicit_topology_wins_over_tp(self):
+        path = self._write({"variants": {
+            "a": self._entry(tp=2, topology="single")}})
+        got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["a"]["topology"], "single")
+
+    def test_relative_weights_path_is_dropped_not_the_entry(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(weights_path="models/hf/q38")}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertIn("vllm/q38", got)
+        self.assertIsNone(got["vllm/q38"]["weights_path"])
+        self.assertIn("weights_path", err.getvalue())
+        self.assertIn("vllm/q38", err.getvalue())
+
+    def test_missing_weights_path_stays_none_without_warning(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(weights_path=None)}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertIsNone(got["vllm/q38"]["weights_path"])
+        self.assertEqual(err.getvalue(), "")
+
+    def test_unrecognized_key_is_warned_about(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(typoed_field="oops")}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertIn("vllm/q38", got)
+        self.assertIn("typoed_field", err.getvalue())
+        self.assertIn("vllm/q38", err.getvalue())
+
+    def test_known_keys_produce_no_warning(self):
+        path = self._write({"variants": {"vllm/q38": self._entry()}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(err.getvalue(), "")
+
+    def test_invalid_topology_warns_and_falls_back_to_tp(self):
+        path = self._write({"variants": {
+            "vllm/q38": self._entry(tp=2, topology="Dual")}})
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            got = aipc_observer.load_adhoc_variants(path)
+        self.assertEqual(got["vllm/q38"]["topology"], "dual")
+        self.assertIn("topology", err.getvalue())
+        self.assertIn("vllm/q38", err.getvalue())
+
+    def test_merge_adds_new_key(self):
+        catalog = {"variants": {"vllm/dual": {"status": "production"}}}
+        aipc_observer.merge_adhoc_variants(
+            catalog, {"vllm/q38": {"adhoc": True, "model": "qwen3.8-27b"}})
+        self.assertIn("vllm/q38", catalog["variants"])
+        self.assertIn("vllm/dual", catalog["variants"])
+
+    def test_registry_key_is_never_shadowed(self):
+        catalog = {"variants": {"vllm/q38": {"status": "production",
+                                             "model": "from-registry"}}}
+        aipc_observer.merge_adhoc_variants(
+            catalog, {"vllm/q38": {"adhoc": True, "model": "from-sidecar"}})
+        self.assertEqual(catalog["variants"]["vllm/q38"]["model"],
+                         "from-registry")
+        self.assertNotIn("adhoc", catalog["variants"]["vllm/q38"])
+
+    def test_merge_skips_errored_catalog(self):
+        catalog = {"error": "boom"}
+        aipc_observer.merge_adhoc_variants(catalog, {"vllm/q38": {"adhoc": True}})
+        self.assertNotIn("variants", catalog)
+
+
+class AdhocRefreshCatalogTests(unittest.TestCase):
+    def setUp(self):
+        self.state = aipc_observer.ObserverState()
+        self.adhoc = {"vllm/q38": {
+            "model": "qwen3.8-27b", "status": "experimental", "adhoc": True,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml", "tp": 2,
+            "topology": "dual", "weights_path": None}}
+
+    def _refresh(self, local, upstream=None, info=None):
+        cache = {}
+        calls = []
+
+        def fake_extract(repo, ref="HEAD"):
+            calls.append(ref)
+            return local if ref == "HEAD" else (upstream or {"variants": {}})
+
+        info = info or {"head": "sha1"}
+        with mock.patch.object(aipc_observer, "extract_catalog", fake_extract), \
+             mock.patch.object(aipc_observer, "detect_installed_assets",
+                               lambda *a, **k: {}):
+            aipc_observer.refresh_catalog(
+                "/repo", info, cache, observer_state=self.state,
+                adhoc_loader=lambda: dict(self.adhoc))
+        return cache
+
+    def test_adhoc_entry_appears_in_catalog(self):
+        self._refresh({"variants": {"vllm/dual": {"status": "production"}}})
+        variants = self.state.catalog["variants"]
+        self.assertIn("vllm/q38", variants)
+        self.assertIn("vllm/dual", variants)
+
+    def test_adhoc_entry_is_not_written_into_the_sha_cache(self):
+        cache = self._refresh(
+            {"variants": {"vllm/dual": {"status": "production"}}})
+        self.assertNotIn("vllm/q38", cache["sha1"]["variants"])
+
+    def test_adhoc_entry_is_absent_from_the_upstream_diff(self):
+        self._refresh(
+            {"variants": {"vllm/dual": {"status": "production"}}},
+            upstream={"variants": {"vllm/dual": {"status": "production"}}},
+            info={"head": "sha1", "behind": 1, "upstream_sha": "sha2"},
+        )
+        diff = self.state.catalog_diff
+        self.assertFalse(aipc_observer.catalog_has_changes(diff))
+
+    def test_errored_catalog_is_passed_through_untouched(self):
+        self._refresh({"error": "git show failed"})
+        self.assertEqual(self.state.catalog.get("error"), "git show failed")
+        self.assertNotIn("variants", self.state.catalog)
+
+
+class AdhocInstalledAssetsTests(unittest.TestCase):
+    def _catalog(self, weights_path):
+        return {"variants": {"vllm/q38": {
+            "model": "qwen3.8-27b", "adhoc": True, "weights_path": weights_path,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml"}}}
+
+    def test_adhoc_weights_on_disk_report_installed(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "model.safetensors"), "w") as f:
+                f.write("x")
+            got = aipc_observer.detect_installed_assets(
+                "/repo", self._catalog(d), {})
+        self.assertIn("vllm/q38", got)
+        self.assertEqual(got["vllm/q38"]["source"], "adhoc")
+
+    def test_adhoc_weights_missing_report_not_installed(self):
+        got = aipc_observer.detect_installed_assets(
+            "/repo", self._catalog("/nonexistent/weights"), {})
+        self.assertNotIn("vllm/q38", got)
+
+    def test_adhoc_without_weights_path_is_skipped(self):
+        got = aipc_observer.detect_installed_assets(
+            "/repo", self._catalog(None), {})
+        self.assertNotIn("vllm/q38", got)
+
+
+class AssertInstallableTests(unittest.TestCase):
+    def test_registry_variant_is_installable(self):
+        catalog = {"variants": {"vllm/dual": {"status": "production"}}}
+        entry = aipc_observer.assert_installable("vllm/dual", catalog)
+        self.assertEqual(entry["status"], "production")
+
+    def test_adhoc_variant_is_refused(self):
+        catalog = {"variants": {"vllm/q38": {"adhoc": True,
+                                             "status": "experimental"}}}
+        with self.assertRaises(ValueError) as ctx:
+            aipc_observer.assert_installable("vllm/q38", catalog)
+        self.assertIn("ad-hoc", str(ctx.exception))
+
+    def test_unknown_variant_is_refused(self):
+        with self.assertRaises(ValueError):
+            aipc_observer.assert_installable("vllm/nope", {"variants": {}})
+
+
 class RepoInfoTests(unittest.TestCase):
     """collect_repo_info against real temporary git repos."""
 
@@ -1795,6 +2022,53 @@ class StopModelTests(unittest.TestCase):
         self.assertTrue(result["stopped"])
         self.assertEqual(result["detail"], "club-3090 switch.sh --down ran")
         self.assertEqual(runner.calls[0]["cmd"][-3:], ["bash", "scripts/switch.sh", "--down"])
+
+    def test_stop_uses_switch_down_for_running_registry_variant(self):
+        """Mirror image of the ad-hoc test below: a registry variant's running
+        container still goes through switch.sh --down even when the catalog
+        has other (non-adhoc) entries, so the ad-hoc carve-out can't regress
+        the normal path."""
+        catalog = {"variants": {"vllm/q38": {
+            "adhoc": True,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml",
+        }}}
+        with tempfile.TemporaryDirectory() as repo:
+            scripts = os.path.join(repo, "scripts")
+            os.mkdir(scripts)
+            open(os.path.join(scripts, "switch.sh"), "w").close()
+            runner = FakeRunner()
+            result = aipc_observer.stop_model(
+                model_info=dict(MODEL_INFO), repo=repo, runner=runner,
+                catalog=catalog,
+            )
+        self.assertTrue(result["stopped"])
+        self.assertEqual(result["detail"], "club-3090 switch.sh --down ran")
+        self.assertEqual(runner.calls[0]["cmd"][-3:],
+                          ["bash", "scripts/switch.sh", "--down"])
+
+    def test_stop_falls_through_to_compose_down_for_running_adhoc_variant(self):
+        """A running ad-hoc container isn't in switch.sh's closed-world
+        registry map, so --down would silently no-op and leave it serving.
+        stop_model must detect that and use docker compose down directly."""
+        mi = dict(MODEL_INFO)
+        mi["compose_file"] = "/etc/aipc-observer-adhoc/q38.yml"
+        catalog = {"variants": {"vllm/q38": {
+            "adhoc": True,
+            "compose_path": "/etc/aipc-observer-adhoc/q38.yml",
+        }}}
+        with tempfile.TemporaryDirectory() as repo:
+            scripts = os.path.join(repo, "scripts")
+            os.mkdir(scripts)
+            open(os.path.join(scripts, "switch.sh"), "w").close()
+            runner = FakeRunner()
+            result = aipc_observer.stop_model(
+                model_info=mi, repo=repo, runner=runner, catalog=catalog,
+            )
+        self.assertTrue(result["stopped"])
+        self.assertNotIn("switch.sh", " ".join(
+            str(c) for call in runner.calls for c in call["cmd"]))
+        self.assertEqual(runner.calls[0]["cmd"][:2], ["docker", "compose"])
+        self.assertEqual(runner.calls[0]["cmd"][-1], "down")
 
     def test_stop_uses_compose_project_and_all_config_files(self):
         runner = FakeRunner()
