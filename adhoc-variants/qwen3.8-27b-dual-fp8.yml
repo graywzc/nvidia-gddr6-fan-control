@@ -1,0 +1,109 @@
+# ===========================================================================
+# Ad-hoc variant — Qwen3.8-27B official FP8, dual RTX 3090 (TP=2)
+#
+#   Model:     Qwen/Qwen3.8-27B-FP8 (fine-grained block-128 e4m3)
+#   Topology:  Dual 3090 (TP=2), PCIe path — custom all-reduce off
+#   Drafter:   MTP n=3
+#   KV:        int8_per_token_head
+#   Max ctx:   262144
+#   Status:    experimental — not in the club-3090 registry
+#
+# Deliberately self-contained: nothing here resolves into the club-3090
+# checkout, which we do not own. The runtime shape is otherwise the same as
+# their validated vllm/qwen-27b-dual-max, which is sound because Qwen3.8-27B
+# and Qwen3.6-27B are the same architecture — identical architectures,
+# model_type, layer counts, head dims, GDN/attention split, vocab, and context.
+#
+# Custom all-reduce is disabled unconditionally. aipc1 does have NVLink
+# (nvidia-smi topo -m reports NV4), but the live club-3090 config there runs
+# with DISABLE_CUSTOM_ALL_REDUCE=1 and NCCL_P2P_DISABLE=1, so we match what is
+# empirically working rather than second-guess it. To experiment, delete the
+# --disable-custom-all-reduce line below and the NCCL_P2P_DISABLE env var.
+#
+# Boot via the observer's variant page. To boot by hand:
+#   PORT=8020 docker compose -f /etc/aipc-observer-adhoc/dual/qwen3.8-27b-fp8.yml up -d
+# ===========================================================================
+services:
+  vllm-qwen38-27b-dual-max:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.22.0}
+    container_name: "${ESTATE_CONTAINER:-vllm-qwen38-27b-dual-max}"
+    restart: ${CLUB3090_RESTART:-unless-stopped}
+    ports:
+      - "${BIND_HOST:-0.0.0.0}:${ESTATE_PORT:-${PORT:-8020}}:8000"
+    volumes:
+      - ${MODEL_DIR:-/home/graywzc/models/hf}:/root/.cache/huggingface
+      # torch.compile + Triton caches: first boot warms them (~60-90 s), later
+      # boots reuse the graphs. Under our own state dir, not club-3090's tree.
+      - /var/lib/nvidia-gddr6-fan-control/adhoc/qwen3.8-27b/cache/torch_compile:/root/.cache/vllm/torch_compile_cache
+      - /var/lib/nvidia-gddr6-fan-control/adhoc/qwen3.8-27b/cache/triton:/root/.triton/cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${ESTATE_GPUS:-${NVIDIA_VISIBLE_DEVICES:-all}}
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
+      - TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      - NCCL_CUMEM_ENABLE=0
+      - NCCL_P2P_DISABLE=1
+      - VLLM_NO_USAGE_STATS=1
+      - VLLM_USE_FLASHINFER_SAMPLER=1
+      - OMP_NUM_THREADS=1
+      - PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:512}
+    shm_size: "16gb"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    entrypoint: ["vllm", "serve"]
+    command:
+      - --model
+      - /root/.cache/huggingface/qwen3.8-27b-fp8
+      - --served-model-name
+      - qwen3.8-27b
+      - --quantization
+      - fp8
+      - --dtype
+      - bfloat16
+      - --tensor-parallel-size
+      - "${TP:-2}"
+      - --pipeline-parallel-size
+      - "1"
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-262144}"
+      - --gpu-memory-utilization
+      - "${GPU_MEMORY_UTILIZATION:-0.92}"
+      - --max-num-seqs
+      - "2"
+      - --max-num-batched-tokens
+      - "8192"
+      - --kv-cache-dtype
+      - "${KV_CACHE_DTYPE:-int8_per_token_head}"
+      - --disable-custom-all-reduce
+      - --trust-remote-code
+      # No --chat-template override: 3.8 ships developer-role and
+      # reasoning_effort support that club-3090's froggeric 3.6 template
+      # predates, so its own template is the correct starting point.
+      - --reasoning-parser
+      - qwen3
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --enable-prefix-caching
+      - --enable-chunked-prefill
+      - --long-prefill-token-threshold
+      - "2048"
+      # Drop this flag and re-boot if the FP8 repo turns out not to ship the
+      # MTP head — the card claims MTP training but lists no mtp.safetensors.
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+      # The model card's non-thinking recommendation. Qwen3.6's 0.6/0.95/20
+      # does not carry over.
+      - --override-generation-config
+      - '{"temperature":0.7,"top_p":0.80,"top_k":20,"min_p":0.0,"repetition_penalty":1.0}'
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"

@@ -1,0 +1,17 @@
+{
+  "variants": {
+    "vllm/qwen38-27b-dual-max": {
+      "model": "qwen3.8-27b",
+      "engine": "vllm",
+      "workload": "long-ctx-single",
+      "status_note": "Ad-hoc — not in the club-3090 registry. Qwen3.8-27B official FP8 (block-128 e4m3), TP=2, int8-PTH KV, MTP n=3 @262K. Architecture is identical to qwen3.6-27b, so upstream's dual-max runtime shape transfers unchanged.",
+      "max_ctx": 262144,
+      "compose_path": "/etc/aipc-observer-adhoc/dual/qwen3.8-27b-fp8.yml",
+      "weights_path": "/home/graywzc/models/hf/qwen3.8-27b-fp8",
+      "default_port": 8020,
+      "kv_format": "int8_per_token_head",
+      "tp": 2,
+      "topology": "dual"
+    }
+  }
+}
