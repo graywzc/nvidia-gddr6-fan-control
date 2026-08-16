@@ -30,13 +30,17 @@ dashboard actually reads.)
       && sudo mv /tmp/qwen3.8-27b-dual-fp8.yml /etc/aipc-observer-adhoc/dual/qwen3.8-27b-fp8.yml \
       && sudo mv /tmp/aipc-observer-adhoc.example.json /etc/aipc-observer-adhoc.json'
 
-The observer only reads the sidecar path at startup, so a *new* sidecar file
-(as above) needs an observer restart before it's picked up. *Edits* to an
-already-loaded sidecar don't — they take effect on the next catalog poll by
-themselves. Either way that poll runs at most every `REPO_POLL_INTERVAL`
-(900 s = 15 min), so a plain restart-and-wait can take up to 15 minutes;
-`POST /observer/api/update` wakes the poll immediately if you don't want to
-wait. Once it's picked up, click the `ad-hoc` row on the variant page.
+No observer restart is needed. `load_adhoc_variants` re-reads the sidecar from
+disk on every catalog poll, so both a brand-new file and edits to an existing
+one are picked up the same way — on the next poll. That poll runs every
+`REPO_POLL_INTERVAL` (900 s = 15 min), so allow up to 15 minutes.
+
+To see it sooner, restart the observer. Do **not** reach for
+`POST /observer/api/update` as a shortcut: it wakes the poll, but it also runs
+`git pull --ff-only` on the club-3090 checkout, which moves that repo's HEAD —
+not something you want as a side effect of impatience.
+
+Once it's picked up, click the `ad-hoc` row on the variant page.
 
 `weights_path` in the sidecar and the compose's `MODEL_DIR` mount are declared
 independently — `boot_model_once` builds the compose environment from
