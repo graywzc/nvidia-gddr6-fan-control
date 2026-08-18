@@ -3235,6 +3235,8 @@ class BootModelOnceTests(unittest.TestCase):
     def setUp(self):
         import tempfile
 
+        self.saved_watchdog = aipc_observer._watchdog
+        aipc_observer._watchdog = aipc_observer.WatchdogState()
         tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
         tmp.close()
         self.override_path = tmp.name
@@ -3242,6 +3244,7 @@ class BootModelOnceTests(unittest.TestCase):
     def tearDown(self):
         import os
 
+        aipc_observer._watchdog = self.saved_watchdog
         os.unlink(self.override_path)
 
     def _boot(self, nvlink_mode=None, config_json=VLLM_CONFIG_JSON,
@@ -3302,6 +3305,171 @@ class BootModelOnceTests(unittest.TestCase):
         self.assertEqual(cfg["loggers"]["vllm.entrypoints"]["level"], "DEBUG")
         os.unlink(self.logging_config_path)
 
+    def test_stops_different_compose_project_after_config_before_boot(self):
+        runner = FakeRunner(CONFIG_JSON)
+        entry = {
+            "compose_path": "models/m1/eng/compose/dual/new/fp8.yml",
+        }
+        running = dict(MODEL_INFO)
+
+        aipc_observer.boot_model_once(
+            "/repo", "eng/new", entry, 8020, runner=runner,
+            cache_ram=False, override_path=self.override_path,
+            running_model_info=running,
+            catalog={"variants": {}},
+        )
+
+        self.assertEqual(len(runner.calls), 3)
+        self.assertIn("config", runner.calls[0]["cmd"])
+        self.assertEqual(runner.calls[1]["cmd"][-1], "down")
+        self.assertIn("up", runner.calls[2]["cmd"])
+
+    def test_same_compose_project_is_recreated_without_explicit_stop(self):
+        config_json = '{"name": "q", "services": ' \
+                      '{"svc": {"command": ["--ctx-size", "102400"], ' \
+                      '"image": "example/model:latest"}}}'
+        runner = FakeRunner(config_json)
+        compose_path = "models/m1/eng/compose/dual/new/fp8.yml"
+        entry = {"compose_path": compose_path}
+        running = dict(MODEL_INFO)
+        running["compose_file"] = f"/repo/{compose_path},/tmp/observer.yml"
+
+        aipc_observer.boot_model_once(
+            "/repo", "eng/new", entry, 8020, runner=runner,
+            cache_ram=False, override_path=self.override_path,
+            running_model_info=running,
+            catalog={"variants": {}},
+        )
+
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("config", runner.calls[0]["cmd"])
+        self.assertIn("up", runner.calls[1]["cmd"])
+
+    def test_same_compose_file_with_different_project_is_stopped(self):
+        config_json = '{"name": "target", "services": ' \
+                      '{"svc": {"command": ["--ctx-size", "102400"], ' \
+                      '"image": "example/model:latest"}}}'
+        runner = FakeRunner(config_json)
+        compose_path = "models/m1/eng/compose/dual/new/fp8.yml"
+        running = dict(MODEL_INFO)
+        running["compose_file"] = f"/repo/{compose_path}"
+        running["project"] = "other"
+
+        aipc_observer.boot_model_once(
+            "/repo", "eng/new", {"compose_path": compose_path}, 8020,
+            runner=runner, cache_ram=False, override_path=self.override_path,
+            running_model_info=running, catalog={"variants": {}},
+        )
+
+        self.assertEqual(runner.calls[1]["cmd"][-1], "down")
+        self.assertIn("up", runner.calls[2]["cmd"])
+
+    def test_same_compose_file_without_running_project_is_stopped(self):
+        config_json = '{"name": "target", "services": ' \
+                      '{"svc": {"command": ["--ctx-size", "102400"], ' \
+                      '"image": "example/model:latest"}}}'
+        runner = FakeRunner(config_json)
+        compose_path = "models/m1/eng/compose/dual/new/fp8.yml"
+        running = dict(MODEL_INFO)
+        running["compose_file"] = f"/repo/{compose_path}"
+        running["project"] = None
+
+        aipc_observer.boot_model_once(
+            "/repo", "eng/new", {"compose_path": compose_path}, 8020,
+            runner=runner, cache_ram=False, override_path=self.override_path,
+            running_model_info=running, catalog={"variants": {}},
+        )
+
+        self.assertEqual(runner.calls[1]["cmd"][-1], "down")
+
+    def test_refreshes_port_owner_after_target_preparation(self):
+        owner = {"info": dict(MODEL_INFO)}
+        live = dict(MODEL_INFO)
+        live.update({
+            "container": "live-owner",
+            "compose_file": "/live/compose.yml",
+            "working_dir": "/live",
+            "project": "live",
+        })
+
+        class OwnerChangingRunner(FakeRunner):
+            def __call__(self, cmd, **kwargs):
+                result = super().__call__(cmd, **kwargs)
+                if "config" in cmd:
+                    owner["info"] = live
+                return result
+
+        runner = OwnerChangingRunner(CONFIG_JSON)
+        aipc_observer.boot_model_once(
+            "/repo", "eng/new",
+            {"compose_path": "models/m1/new/fp8.yml"}, 8020,
+            runner=runner, cache_ram=False, override_path=self.override_path,
+            running_model_info=dict(MODEL_INFO),
+            running_model_info_getter=lambda: owner["info"],
+            catalog={"variants": {}},
+        )
+
+        down = runner.calls[1]
+        self.assertIn("/live/compose.yml", down["cmd"])
+        self.assertEqual(down["cwd"], "/live")
+
+    def test_running_relative_compose_path_uses_its_working_directory(self):
+        config_json = '{"name": "q", "services": ' \
+                      '{"svc": {"command": ["--ctx-size", "102400"], ' \
+                      '"image": "example/model:latest"}}}'
+        runner = FakeRunner(config_json)
+        target = "/repo/models/m1/fp8.yml"
+        running = dict(MODEL_INFO)
+        running.update({
+            "compose_file": "fp8.yml",
+            "working_dir": "/repo/models/m1",
+            "project": "q",
+        })
+
+        aipc_observer.boot_model_once(
+            "/repo", "eng/new", {"compose_path": target}, 8020,
+            runner=runner, cache_ram=False, override_path=self.override_path,
+            running_model_info=running, catalog={"variants": {}},
+        )
+
+        self.assertEqual(len(runner.calls), 2)
+        self.assertIn("up", runner.calls[1]["cmd"])
+
+    def test_failed_boot_clears_watchdog_suppression_after_stop(self):
+        class FailUpRunner(FakeRunner):
+            def __call__(self, cmd, **kwargs):
+                result = super().__call__(cmd, **kwargs)
+                if "up" in cmd:
+                    raise RuntimeError("boot failed")
+                return result
+
+        runner = FailUpRunner(CONFIG_JSON)
+        with self.assertRaisesRegex(RuntimeError, "boot failed"):
+            aipc_observer.boot_model_once(
+                "/repo", "eng/new",
+                {"compose_path": "models/m1/new/fp8.yml"}, 8020,
+                runner=runner, cache_ram=False,
+                override_path=self.override_path,
+                running_model_info=dict(MODEL_INFO), catalog={"variants": {}},
+            )
+
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
+
+
+class CurrentRunningModelInfoTests(unittest.TestCase):
+    def test_refreshes_metadata_for_container_currently_owning_port(self):
+        stale = dict(MODEL_INFO)
+        live = dict(MODEL_INFO)
+        live.update({"container": "live-owner", "compose_file": "/live.yml"})
+
+        result = aipc_observer.current_running_model_info(
+            8020, stale, detector=lambda port: "live-owner",
+            inspector=lambda name: live,
+        )
+
+        self.assertEqual(result["container"], "live-owner")
+        self.assertEqual(result["compose_file"], "/live.yml")
+
 
 class SwitchWorkerTests(unittest.TestCase):
     def setUp(self):
@@ -3312,6 +3480,12 @@ class SwitchWorkerTests(unittest.TestCase):
         self.assertTrue(aipc_observer._control_lock.acquire(blocking=False))
         self.saved_status = aipc_observer.state.control_status
         self.saved_installed_assets = dict(aipc_observer.state.installed_assets)
+        self.saved_model_info = dict(aipc_observer.state.model_info)
+        self.saved_container = aipc_observer.state.container_name
+        self.saved_watchdog = aipc_observer._watchdog
+        aipc_observer.state.set_model_info({})
+        aipc_observer.state.set_container(None)
+        aipc_observer._watchdog = aipc_observer.WatchdogState()
         # Never touch the real OVERRIDE_FILE: on the deploy host it exists
         # root-owned (written by the daemon), so tests must use their own.
         tmp = tempfile.NamedTemporaryFile(suffix=".yml", delete=False)
@@ -3325,7 +3499,79 @@ class SwitchWorkerTests(unittest.TestCase):
             aipc_observer._control_lock.release()
         aipc_observer.state.set_control_status(self.saved_status)
         aipc_observer.state.installed_assets = self.saved_installed_assets
+        aipc_observer.state.set_model_info(self.saved_model_info)
+        aipc_observer.state.set_container(self.saved_container)
+        aipc_observer._watchdog = self.saved_watchdog
         os.unlink(self.override_path)
+
+    def test_switch_stops_running_different_model_before_boot(self):
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer.state.set_catalog(SWITCH_CATALOG)
+        aipc_observer.state.set_model_info(dict(MODEL_INFO))
+        aipc_observer.state.set_container(MODEL_INFO["container"])
+
+        aipc_observer._switch_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
+            override_path=self.override_path,
+            ready_waiter=lambda port: 0.0,
+        )
+
+        self.assertTrue(aipc_observer.state.control_status["ok"])
+        self.assertIn("config", runner.calls[0]["cmd"])
+        self.assertEqual(runner.calls[1]["cmd"][-1], "down")
+        self.assertIn("up", runner.calls[2]["cmd"])
+
+    def test_install_retry_stops_running_different_model_before_boot(self):
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer.state.set_catalog(SWITCH_CATALOG)
+        aipc_observer.state.set_model_info(dict(MODEL_INFO))
+        aipc_observer.state.set_container(MODEL_INFO["container"])
+
+        aipc_observer._install_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, True, {},
+            runner=runner, override_path=self.override_path,
+            ready_waiter=lambda port: 0.0,
+        )
+
+        self.assertTrue(aipc_observer.state.control_status["ok"])
+        self.assertIn("scripts/setup.sh", runner.calls[0]["cmd"])
+        self.assertIn("config", runner.calls[1]["cmd"])
+        self.assertEqual(runner.calls[2]["cmd"][-1], "down")
+        self.assertIn("up", runner.calls[3]["cmd"])
+
+    def test_readiness_failure_clears_watchdog_suppression(self):
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer.state.set_catalog(SWITCH_CATALOG)
+        aipc_observer.state.set_model_info(dict(MODEL_INFO))
+        aipc_observer.state.set_container(MODEL_INFO["container"])
+
+        aipc_observer._switch_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, runner=runner,
+            override_path=self.override_path,
+            ready_waiter=lambda port: (_ for _ in ()).throw(
+                RuntimeError("never became ready")
+            ),
+        )
+
+        self.assertFalse(aipc_observer.state.control_status["ok"])
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
+
+    def test_install_retry_readiness_failure_clears_watchdog_suppression(self):
+        runner = FakeRunner(CONFIG_JSON)
+        aipc_observer.state.set_catalog(SWITCH_CATALOG)
+        aipc_observer.state.set_model_info(dict(MODEL_INFO))
+        aipc_observer.state.set_container(MODEL_INFO["container"])
+
+        aipc_observer._install_worker(
+            "/repo", "eng/prod", "baseline", 8020, False, True, {},
+            runner=runner, override_path=self.override_path,
+            ready_waiter=lambda port: (_ for _ in ()).throw(
+                RuntimeError("never became ready")
+            ),
+        )
+
+        self.assertFalse(aipc_observer.state.control_status["ok"])
+        self.assertFalse(aipc_observer._watchdog.deliberately_stopped)
 
     def test_baseline_switch_still_reups_for_log_rotation(self):
         runner = FakeRunner(CONFIG_JSON)
