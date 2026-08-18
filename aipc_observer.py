@@ -2166,10 +2166,84 @@ def resolve_preset(preset_name, supported):
     return tweaks, dropped
 
 
+def _compose_includes_target(model_info, target_compose, target_project, repo):
+    """Whether the running container belongs to the target Compose project."""
+    mi = model_info or {}
+    compose_file = mi.get("compose_file")
+    if not compose_file or not target_compose:
+        return False
+    running_project = mi.get("project")
+    if ((running_project or target_project)
+            and running_project != target_project):
+        return False
+    target = os.path.normpath(target_compose)
+    target_abs = target if os.path.isabs(target) else os.path.normpath(
+        os.path.join(repo, target)
+    )
+    target_abs = os.path.realpath(target_abs)
+    running_dir = mi.get("working_dir") or repo
+    for current in (p.strip() for p in compose_file.split(",")):
+        if not current:
+            continue
+        normalized = os.path.normpath(current)
+        current_abs = normalized if os.path.isabs(normalized) else os.path.normpath(
+            os.path.join(running_dir, normalized)
+        )
+        if os.path.realpath(current_abs) == target_abs:
+            return True
+    return False
+
+
+def current_running_model_info(monitor_port, stale_info=None,
+                               detector=detect_container,
+                               inspector=inspect_container):
+    """Inspect the container currently publishing the model frontend port."""
+    name = detector(monitor_port)
+    if not name:
+        return {}
+    info = inspector(name)
+    if info:
+        return {**info, "container": name}
+    stale = stale_info or {}
+    if stale.get("container") == name:
+        return dict(stale)
+    return {"container": name}
+
+
+def _running_model_info_for_boot(monitor_port, runner):
+    return {
+        **(state.model_info or {}),
+        "container": state.container_name
+        or (state.model_info or {}).get("container"),
+    }
+
+
+def _running_model_info_getter_for_boot(monitor_port, runner):
+    if runner is not _run:
+        return None
+    return lambda: current_running_model_info(monitor_port, state.model_info)
+
+
+def stop_conflicting_model(repo, entry, running_model_info, target_project=None,
+                           runner=_run, catalog=None):
+    """Stop a different running Compose project before binding its port."""
+    mi = running_model_info or {}
+    if not mi.get("container"):
+        return {"stopped": False, "detail": "model container is not running"}
+    target_compose = (entry or {}).get("compose_path")
+    if _compose_includes_target(mi, target_compose, target_project, repo):
+        return {"stopped": False, "detail": "target compose project is running"}
+    return stop_model(
+        model_info=mi, repo=repo, runner=runner, catalog=catalog,
+    )
+
+
 def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
                     cache_ram=True, force=False, runner=_run,
                     override_path=OVERRIDE_FILE, nvlink_mode=None,
-                    logging_config_path=VLLM_LOGGING_CONFIG_FILE):
+                    logging_config_path=VLLM_LOGGING_CONFIG_FILE,
+                    running_model_info=None, running_model_info_getter=None,
+                    catalog=None):
     """Boot a model variant in a single phase — no switch.sh + restart dance.
 
     Resolves the compose config, builds the override with preset flags
@@ -2190,6 +2264,7 @@ def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
         env=cfg_env, cwd=repo, timeout=60,
     )
     cfg = json.loads(raw)
+    project_name = cfg.get("name")
     services = cfg.get("services") or {}
     svc = None
     service_name = None
@@ -2266,13 +2341,25 @@ def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
     if dropped:
         detail += f" dropped={','.join(dropped)}"
     audit("boot", detail)
-    runner(
-        ["docker", "compose", "-f", compose_path, "-f", override_path,
-         "up", "-d", "--remove-orphans"],
-        env=env, cwd=cwd,
+    if running_model_info_getter is not None:
+        running_model_info = running_model_info_getter()
+    stop_result = stop_conflicting_model(
+        repo, entry, running_model_info, target_project=project_name,
+        runner=runner, catalog=catalog,
     )
+    try:
+        runner(
+            ["docker", "compose", "-f", compose_path, "-f", override_path,
+             "up", "-d", "--remove-orphans"],
+            env=env, cwd=cwd,
+        )
+    except Exception:
+        if stop_result.get("stopped"):
+            _watchdog.clear_deliberately_stopped()
+        raise
     return {"booted": True, "preset": mode, "cache_ram": effective_cache_ram,
-            "variant": key, "dropped_capabilities": dropped}
+            "variant": key, "dropped_capabilities": dropped,
+            "stopped_previous_model": bool(stop_result.get("stopped"))}
 
 
 def restart_model(preset_name, model_info=None, runner=_run, cache_ram=None,
@@ -3086,6 +3173,7 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
     ready_waiter = ready_waiter or wait_until_serving
     _boot_abort.clear()
     state.start_run("start", variant, preset, cache_ram)
+    result = None
     try:
         with profiled_load("switch", variant=variant, preset=preset,
                            started_at=started_at) as profile:
@@ -3102,7 +3190,13 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                     result = boot_model_once(
                         repo, variant, entry, monitor_port, preset=preset,
                         cache_ram=cache_ram, force=force, runner=runner,
-                        override_path=override_path, nvlink_mode=nvlink_mode)
+                        override_path=override_path, nvlink_mode=nvlink_mode,
+                        running_model_info=_running_model_info_for_boot(
+                            monitor_port, runner),
+                        running_model_info_getter=
+                            _running_model_info_getter_for_boot(
+                                monitor_port, runner),
+                        catalog=state.catalog)
                 with profile.phase("ready_wait"):
                     ready_waiter(monitor_port)
                 dropped = result.get("dropped_capabilities") or []
@@ -3119,6 +3213,8 @@ def _switch_worker(repo, variant, preset, monitor_port, force, runner=_run,
                 audit("switch-done", f"variant={variant} preset={preset} "
                                      f"cache_ram={cache_ram}")
             except Exception as e:
+                if result and result.get("stopped_previous_model"):
+                    _watchdog.clear_deliberately_stopped()
                 profile.fail(e)
                 print(f"[observer] _switch_worker: FAILED variant={variant!r} error={e!r}", flush=True)
                 audit("switch-failed", f"variant={variant}: {e}")
@@ -3142,6 +3238,7 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
     ready_waiter = ready_waiter or wait_until_serving
     _boot_abort.clear()
     state.start_run("start", variant, preset, cache_ram)
+    boot_result = None
     try:
         with profiled_load("install", variant=variant, preset=preset,
                            started_at=started_at) as profile:
@@ -3193,10 +3290,16 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 with profile.phase("boot"):
                     variants = (state.catalog or {}).get("variants") or {}
                     entry = variants.get(variant) or {}
-                    result = boot_model_once(
+                    boot_result = boot_model_once(
                         repo, variant, entry, monitor_port, preset=preset,
                         cache_ram=cache_ram, force=force, runner=runner,
-                        override_path=override_path, nvlink_mode=nvlink_mode)
+                        override_path=override_path, nvlink_mode=nvlink_mode,
+                        running_model_info=_running_model_info_for_boot(
+                            monitor_port, runner),
+                        running_model_info_getter=
+                            _running_model_info_getter_for_boot(
+                                monitor_port, runner),
+                        catalog=state.catalog)
                 with profile.phase("ready_wait"):
                     ready_waiter(monitor_port)
                 detail = f"switched to {variant} (mode {preset}, " \
@@ -3210,6 +3313,8 @@ def _install_worker(repo, variant, preset, monitor_port, force, retry,
                 audit("install-switch-done", f"variant={variant} preset={preset} "
                                              f"cache_ram={cache_ram}")
             except Exception as e:
+                if boot_result and boot_result.get("stopped_previous_model"):
+                    _watchdog.clear_deliberately_stopped()
                 profile.fail(e)
                 print(f"[observer] _install_worker: FAILED variant={variant!r} error={e!r}", flush=True)
                 audit("install-failed", f"variant={variant}: {e}")
