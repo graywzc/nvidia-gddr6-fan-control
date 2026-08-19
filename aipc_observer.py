@@ -3483,6 +3483,12 @@ def summarize_metrics(values):
                 "decode_calls_total"):
         if key in out:
             out[key] = int(out[key])
+    # llama.cpp's *_tokens_seconds gauges are lifetime busy-time averages
+    # (tokens / processing time), so they double as the session averages the
+    # summary cards show; vLLM derives the same keys from counter deltas.
+    for kind in ("prompt", "gen"):
+        if f"{kind}_tps_avg" in out:
+            out[f"{kind}_tps_session_avg"] = out[f"{kind}_tps_avg"]
     return out
 
 
@@ -3609,6 +3615,30 @@ def summarize_vllm_metrics(text, prev=None):
             if gt is not None and prev.get("gen_tokens_total") is not None:
                 out["gen_tps_avg"] = max(
                     0.0, (out["gen_tokens_total"] - prev["gen_tokens_total"]) / dt)
+    # Session-average throughput: token deltas accumulated over only the scrape
+    # intervals where tokens actually moved, so idle time doesn't dilute the
+    # average. The _busy accumulators ride the snapshot (poll_metrics feeds each
+    # snapshot back as the next `prev`); a counter that shrank means the model
+    # server restarted, which drops the stale accumulation.
+    for kind, total_key in (("prompt", "prompt_tokens_total"),
+                            ("gen", "gen_tokens_total")):
+        if total_key not in out:
+            continue
+        tokens_key, secs_key = f"_{kind}_busy_tokens", f"_{kind}_busy_secs"
+        busy_tokens = (prev or {}).get(tokens_key) or 0
+        busy_secs = (prev or {}).get(secs_key) or 0.0
+        if prev and prev.get("scraped_at") and prev.get(total_key) is not None:
+            dt = out["scraped_at"] - prev["scraped_at"]
+            delta = out[total_key] - prev[total_key]
+            if delta < 0:
+                busy_tokens, busy_secs = 0, 0.0
+            elif delta > 0 and dt > 0:
+                busy_tokens += delta
+                busy_secs += dt
+        out[tokens_key] = busy_tokens
+        out[secs_key] = busy_secs
+        if busy_secs > 0:
+            out[f"{kind}_tps_session_avg"] = round(busy_tokens / busy_secs, 1)
     return out
 
 
@@ -4778,6 +4808,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div class="summary-item"><div id="gpuTemp" class="summary-value">--</div><div class="summary-label">GPU Temp</div></div>
 <div class="summary-item"><div id="memTemp" class="summary-value">--</div><div class="summary-label">VRAM Temp</div></div>
 <div class="summary-item"><div id="avgTps" class="summary-value">0</div><div class="summary-label">Avg Gen t/s</div></div>
+<div class="summary-item"><div id="avgPromptTps" class="summary-value">-</div><div class="summary-label">Avg Prompt t/s</div></div>
 <div class="summary-item"><div id="queued" class="summary-value">-</div><div class="summary-label">Queued</div></div>
 </div></section>
 <section class="card"><h2><span>Context / KV Cache</span><div><span class="drag-handle" title="Drag to reorder">⠿</span><button class="resize-btn resize-btn-w" title="Toggle width">⇔</button><button class="resize-btn resize-btn-h" title="Toggle height">⇕</button></div></h2><div id="slotInfo" class="gpu-grid"></div></section>
@@ -4880,6 +4911,8 @@ rows+=infoRow('Running / waiting',`${m.processing??'-'} / ${(m.queued||0)>0?`<sp
 let tpsNote=vllm?'throughput over the last scrape interval (derived from token counters)':'server-lifetime average';
 if(m.prompt_tps_avg!=null)rows+=infoRow('Prompt t/s',Number(m.prompt_tps_avg).toFixed(1),tpsNote+' prompt processing throughput');
 if(m.gen_tps_avg!=null)rows+=infoRow('Gen t/s',Number(m.gen_tps_avg).toFixed(1),tpsNote+' generation throughput');
+if(vllm&&m.prompt_tps_session_avg!=null)rows+=infoRow('Prompt t/s (session avg)',Number(m.prompt_tps_session_avg).toFixed(1),'token-weighted average over scrape intervals with prompt activity since model start');
+if(vllm&&m.gen_tps_session_avg!=null)rows+=infoRow('Gen t/s (session avg)',Number(m.gen_tps_session_avg).toFixed(1),'token-weighted average over scrape intervals with generation activity since model start');
 if(m.prompt_tokens_total!=null)rows+=infoRow('Prompt tokens',Number(m.prompt_tokens_total).toLocaleString()+(m.prompt_seconds_total!=null?` <span class="label">(${Number(m.prompt_seconds_total).toFixed(0)}s)</span>`:''));
 if(m.gen_tokens_total!=null)rows+=infoRow('Generated tokens',Number(m.gen_tokens_total).toLocaleString()+(m.gen_seconds_total!=null?` <span class="label">(${Number(m.gen_seconds_total).toFixed(0)}s)</span>`:''));
 if(m.decode_calls_total!=null)rows+=infoRow('Decode calls',Number(m.decode_calls_total).toLocaleString());
@@ -5091,7 +5124,7 @@ function renderCaseFans(fans){var card=document.getElementById('caseFanCard');if
 (showDuty?('<div class="row"><span class="label">Duty</span><span class="value" id="cfval-'+i+'">'+dutyTxt+'</span></div>'+ctrl):'')+
 '<div class="row"><span class="label">Source</span><span class="value" style="font-weight:500;color:var(--dim)">'+src+'</span></div></div>'}).join('');
 grid.querySelectorAll('input.cf-slider').forEach(function(sl){sl.addEventListener('input',function(){caseFanFreezeUntil=Date.now()+3000;var lab=document.getElementById('cfval-'+sl.dataset.idx);if(lab)lab.textContent=sl.value+'%';});sl.addEventListener('change',function(){setCaseFanDuty(sl.dataset.fan,sl.value,sl.dataset.idx);});});}
-function renderSummary(d){let m=d.metrics||{};let vllm=m.engine==='vllm';let activeEl=document.getElementById('active');let requestsEl=document.getElementById('requests');let gpuTempEl=document.getElementById('gpuTemp');let memTempEl=document.getElementById('memTemp');let avgTpsEl=document.getElementById('avgTps');activeEl.textContent=vllm?(m.processing??0):d.active_count;requestsEl.textContent=vllm?Number(m.requests_total||0).toLocaleString():(d.requests||[]).length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTempEl.textContent=`${g.temp_c}°C`;gpuTempEl.className='summary-value '+cls(g.temp_c);memTempEl.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTempEl.className='summary-value '+cls(g.mem_temp_c)}let done=(d.requests||[]).filter(r=>r.status==='completed'&&r.gen_tps>0);avgTpsEl.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):(vllm&&m.gen_tps_avg!=null?Number(m.gen_tps_avg).toFixed(1):'0')}
+function renderSummary(d){let m=d.metrics||{};let vllm=m.engine==='vllm';let activeEl=document.getElementById('active');let requestsEl=document.getElementById('requests');let gpuTempEl=document.getElementById('gpuTemp');let memTempEl=document.getElementById('memTemp');let avgTpsEl=document.getElementById('avgTps');activeEl.textContent=vllm?(m.processing??0):d.active_count;requestsEl.textContent=vllm?Number(m.requests_total||0).toLocaleString():(d.requests||[]).length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTempEl.textContent=`${g.temp_c}°C`;gpuTempEl.className='summary-value '+cls(g.temp_c);memTempEl.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTempEl.className='summary-value '+cls(g.mem_temp_c)}let done=(d.requests||[]).filter(r=>r.status==='completed'&&r.gen_tps>0);avgTpsEl.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):(m.gen_tps_session_avg!=null?Number(m.gen_tps_session_avg).toFixed(1):'0');let doneP=(d.requests||[]).filter(r=>r.status==='completed'&&r.prompt_tps>0);document.getElementById('avgPromptTps').textContent=doneP.length?(doneP.reduce((s,r)=>s+r.prompt_tps,0)/doneP.length).toFixed(1):(m.prompt_tps_session_avg!=null?Number(m.prompt_tps_session_avg).toFixed(1):'-')}
 function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getElementById('slotInfo').innerHTML=slots.length?slots.map(s=>{let hit=(s.cache_hit_pct==null)?'-':s.cache_hit_pct+'%';let badge=s.is_processing?'<span class="status processing">busy</span>':'<span class="status completed">idle</span>';return `<div class="gpu-card"><div class="gpu-name">Slot ${s.id} ${badge}</div>
 <div class="row"><span class="label">Context</span><span class="value ${cls(s.kv_pct)}">${(s.kv_used||0).toLocaleString()} / ${(s.n_ctx||nctx).toLocaleString()} (${s.kv_pct}%)</span></div><div class="bar"><div class="fill mem" style="width:${pct(s.kv_pct,100)}%"></div></div>
 <div class="row"><span class="label">Prompt cache hit</span><span class="value">${hit}</span></div><div class="bar"><div class="fill fan" style="width:${s.cache_hit_pct||0}%"></div></div>

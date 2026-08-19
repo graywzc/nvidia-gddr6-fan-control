@@ -2255,6 +2255,14 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(m["prompt_tokens_total"], 16185)
         self.assertEqual(m["decode_calls_total"], 125)
 
+    def test_summarize_exposes_session_averages(self):
+        # llama.cpp's *_tokens_seconds gauges are lifetime busy-time averages,
+        # so they double as the session averages the summary cards show.
+        values = aipc_observer.parse_prometheus(PROMETHEUS_SAMPLE)
+        m = aipc_observer.summarize_metrics(values)
+        self.assertEqual(m["gen_tps_session_avg"], m["gen_tps_avg"])
+        self.assertEqual(m["prompt_tps_session_avg"], m["prompt_tps_avg"])
+
     def test_summarize_omits_absent_metrics(self):
         m = aipc_observer.summarize_metrics({"llamacpp:requests_deferred": 0})
         self.assertEqual(m["queued"], 0)
@@ -2362,6 +2370,51 @@ class VllmMetricsTests(unittest.TestCase):
         m = aipc_observer.summarize_vllm_metrics("")
         self.assertEqual(m["engine"], "vllm")
         self.assertNotIn("processing", m)
+
+    def test_session_avg_from_busy_intervals(self):
+        prev = {
+            "scraped_at": aipc_observer.time.time() - 10,
+            "prompt_tokens_total": 12947409 - 1000,
+            "gen_tokens_total": 81664 - 200,
+        }
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
+        # 1000 prompt tokens / ~10 s and 200 gen tokens / ~10 s.
+        self.assertAlmostEqual(m["prompt_tps_session_avg"], 100.0, delta=2)
+        self.assertAlmostEqual(m["gen_tps_session_avg"], 20.0, delta=1)
+        # No prior scrape → no session average yet.
+        first = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        self.assertNotIn("prompt_tps_session_avg", first)
+        self.assertNotIn("gen_tps_session_avg", first)
+
+    def test_session_avg_ignores_idle_intervals(self):
+        prev = {
+            "scraped_at": aipc_observer.time.time() - 10,
+            "prompt_tokens_total": 12947409 - 1000,
+            "gen_tokens_total": 81664 - 200,
+        }
+        m1 = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
+        # Second scrape 30 s later with unchanged counters: the idle window
+        # must not dilute the busy-time average.
+        m1["scraped_at"] = aipc_observer.time.time() - 30
+        m2 = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, m1)
+        self.assertAlmostEqual(
+            m2["prompt_tps_session_avg"], m1["prompt_tps_session_avg"], delta=0.2)
+        self.assertAlmostEqual(
+            m2["gen_tps_session_avg"], m1["gen_tps_session_avg"], delta=0.2)
+
+    def test_session_avg_resets_on_counter_reset(self):
+        # prev has larger totals than the current scrape → the model server
+        # restarted; stale accumulators must be dropped.
+        prev = {
+            "scraped_at": aipc_observer.time.time() - 10,
+            "prompt_tokens_total": 12947409 + 5000,
+            "gen_tokens_total": 81664 + 5000,
+            "_prompt_busy_tokens": 999999, "_prompt_busy_secs": 1.0,
+            "_gen_busy_tokens": 999999, "_gen_busy_secs": 1.0,
+        }
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
+        self.assertNotIn("prompt_tps_session_avg", m)
+        self.assertNotIn("gen_tps_session_avg", m)
 
     def test_timeline_sample_is_compact(self):
         m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
@@ -4486,9 +4539,11 @@ class DashboardHtmlTests(unittest.TestCase):
         self.assertIn("document.getElementById('gpuTemp')", html)
         self.assertIn("document.getElementById('memTemp')", html)
         self.assertIn("document.getElementById('avgTps')", html)
+        self.assertIn("document.getElementById('avgPromptTps')", html)
         self.assertNotRegex(html, r"(?<![A-Za-z0-9_$])gpuTemp\.")
         self.assertNotRegex(html, r"(?<![A-Za-z0-9_$])memTemp\.")
         self.assertNotRegex(html, r"(?<![A-Za-z0-9_$])avgTps\.")
+        self.assertNotRegex(html, r"(?<![A-Za-z0-9_$])avgPromptTps\.")
 
 
 if __name__ == "__main__":
