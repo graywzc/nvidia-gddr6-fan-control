@@ -1287,18 +1287,42 @@ def collect_repo_info(repo, fetch=True):
     return info
 
 
-# club-3090's machine-readable variant catalog: a pure-data module (no
-# imports), which is what makes ref-based extraction via `git show` possible.
+# club-3090's machine-readable variant catalog. It used to be a pure-data
+# module; it now loads its ~100 slug rows from registry.yaml sitting next to
+# it, resolved through __file__ at import. Ref-based extraction therefore has
+# to materialize the module AND its sibling data files, not just `git show`
+# the one source file.
 REGISTRY_MODULE_PATH = "scripts/lib/profiles/compose_registry.py"
 DUAL_CARD_DOC_PATH = "docs/DUAL_CARD.md"
 
-# Runs in an isolated subprocess with the registry module source on stdin.
-# exec'ing repo code is confined to that process, never the daemon, and
-# _repo_owner_cmd drops it to the repo owner when the daemon is root.
+# Suffixes of the sibling files shipped alongside the module. The registry
+# reads data, never imports its neighbouring .py, so .py is deliberately out.
+_REGISTRY_DATA_SUFFIXES = (".yaml", ".yml", ".json")
+# Ceiling on the materialized sibling payload, so a stray large blob in that
+# directory can't turn a dashboard refresh into a multi-megabyte pipe.
+_REGISTRY_DATA_BUDGET = 4 * 1024 * 1024
+
+# Runs in an isolated subprocess, taking {"module", "files"} as JSON on stdin:
+# it writes the files to a temp tree, points __file__ at the module there, and
+# execs it. exec'ing repo code is confined to that process, never the daemon,
+# and _repo_owner_cmd drops it to the repo owner when the daemon is root.
 _CATALOG_EXTRACT_CODE = """
-import json, sys, types
-mod = types.ModuleType("compose_registry")
-exec(compile(sys.stdin.read(), "compose_registry.py", "exec"), mod.__dict__)
+import json, os, shutil, sys, tempfile, types
+payload = json.loads(sys.stdin.read())
+root = tempfile.mkdtemp(prefix="aipc-catalog-")
+try:
+    for rel, text in payload["files"].items():
+        dest = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    path = os.path.join(root, payload["module"])
+    mod = types.ModuleType("compose_registry")
+    mod.__file__ = path
+    with open(path, encoding="utf-8") as fh:
+        exec(compile(fh.read(), path, "exec"), mod.__dict__)
+finally:
+    shutil.rmtree(root, ignore_errors=True)
 fields = ("model", "engine", "workload", "status", "status_note", "max_ctx",
           "compose_path", "default_port", "kv_format", "tp")
 variants = {}
@@ -1314,6 +1338,44 @@ print(json.dumps({"variants": variants, "defaults": defaults}))
 """
 
 
+def registry_sibling_files(repo, ref):
+    """Data files sitting next to the registry module at `ref`, by repo path.
+
+    The module resolves registry.yaml through __file__, so extraction has to
+    hand it a directory, not a lone source string. Best-effort: a listing that
+    fails yields {} and lets the extraction itself report the real error.
+    """
+    tree = REGISTRY_MODULE_PATH.rsplit("/", 1)[0]
+    files = {}
+    budget = _REGISTRY_DATA_BUDGET
+    try:
+        listing = repo_git(repo, "ls-tree", "-l", f"{ref}:{tree}")
+    except Exception:
+        return files
+    for line in listing.splitlines():
+        meta, _, name = line.partition("\t")
+        parts = meta.split()
+        if len(parts) < 4 or parts[1] != "blob":
+            continue
+        if not name.endswith(_REGISTRY_DATA_SUFFIXES):
+            continue
+        try:
+            size = int(parts[3])
+        except ValueError:
+            continue
+        if size > budget:
+            print(f"WARNING: skipping registry data file {name!r} at {ref}: "
+                  f"{size} bytes exceeds the remaining {budget}-byte budget",
+                  file=sys.stderr)
+            continue
+        try:
+            files[f"{tree}/{name}"] = repo_git(repo, "show", f"{ref}:{tree}/{name}")
+        except Exception:
+            continue
+        budget -= size
+    return files
+
+
 def extract_catalog(repo, ref="HEAD"):
     """Load the compose registry at a git ref without checking it out.
 
@@ -1322,12 +1384,15 @@ def extract_catalog(repo, ref="HEAD"):
     upstream now recommends before any pull happens.
     """
     try:
-        src = repo_git(repo, "show", f"{ref}:{REGISTRY_MODULE_PATH}")
+        module_src = repo_git(repo, "show", f"{ref}:{REGISTRY_MODULE_PATH}")
+        files = {REGISTRY_MODULE_PATH: module_src}
+        files.update(registry_sibling_files(repo, ref))
+        payload = json.dumps({"module": REGISTRY_MODULE_PATH, "files": files})
         cmd = _repo_owner_cmd(
             repo, [sys.executable or "python3", "-c", _CATALOG_EXTRACT_CODE]
         )
         result = subprocess.run(
-            cmd, input=src, capture_output=True, text=True, timeout=30
+            cmd, input=payload, capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             raise RuntimeError(

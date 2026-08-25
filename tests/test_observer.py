@@ -1346,6 +1346,29 @@ COMPOSE_REGISTRY = {
 DEFAULTS = {("m1", "eng", "single"): "eng/var-b"}
 '''
 
+# The shape club-3090's registry took on 2026-08-23: a loader module whose rows
+# live in a sibling data file, resolved through __file__ at import time.
+REGISTRY_DATA_MODULE = '''
+import json
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+# parents[3] is the repo root — the module derives it, so the extraction has to
+# preserve the scripts/lib/profiles nesting, not just drop the file somewhere.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+_DATA = json.loads((_HERE / "registry.json").read_text())
+COMPOSE_REGISTRY = _DATA["entries"]
+DEFAULTS = {tuple(k.split("/")): v for k, v in _DATA["defaults"].items()}
+'''
+
+REGISTRY_DATA_FILE = '''
+{"entries": {"eng/var-a": {"model": "m1", "engine": "eng-local",
+  "workload": "fast-chat", "status": "production", "status_note": "from yaml",
+  "max_ctx": 1000, "compose_path": "models/m1/eng/compose/single/q/a.yml",
+  "default_port": 8060, "kv_format": "q5_0", "tp": 1}},
+ "defaults": {"m1/eng/single": "eng/var-a"}}
+'''
+
 DUAL_CARD_DOC = '''
 | What you're doing | Compose | Max ctx | Narr / Code TPS | VRAM per card | Why |
 |---|---|---|---|---|---|
@@ -1420,6 +1443,32 @@ class CatalogExtractTests(unittest.TestCase):
         self.assertNotIn("error", cat)
         self.assertEqual(cat["variants"]["eng/var-a"]["status"], "production")
         self.assertIn("eng/var-b", cat["variants"])
+
+    def test_registry_loading_sibling_data_via_file_attr(self):
+        """A registry module is allowed to read data next to itself.
+
+        club-3090 moved its slug rows into a data file loaded through
+        Path(__file__); extraction has to materialize that neighbour too, or
+        every catalog read dies with "name '__file__' is not defined".
+        """
+        import os
+
+        repo = os.path.join(self.tmp.name, "datarepo")
+        self._git_in(self.tmp.name, "init", "-q", "-b", "main", repo)
+        self._write_registry(repo, REGISTRY_DATA_MODULE)
+        sibling = os.path.join(
+            repo,
+            os.path.dirname(aipc_observer.REGISTRY_MODULE_PATH),
+            "registry.json",
+        )
+        with open(sibling, "w") as f:
+            f.write(REGISTRY_DATA_FILE)
+        self._commit(repo, "data-driven registry")
+
+        cat = aipc_observer.extract_catalog(repo, "HEAD")
+        self.assertNotIn("error", cat)
+        self.assertEqual(cat["variants"]["eng/var-a"]["status_note"], "from yaml")
+        self.assertEqual(cat["defaults"]["m1/eng/single"], "eng/var-a")
 
     def test_missing_registry_reports_error(self):
         cat = aipc_observer.extract_catalog(self.tmp.name, "HEAD")
