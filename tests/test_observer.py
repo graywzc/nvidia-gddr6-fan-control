@@ -1376,6 +1376,73 @@ DUAL_CARD_DOC = '''
 '''
 
 
+# The shape club-3090's docs/DUAL_CARD.md ships today: a per-topology table
+# that leads with Slug/Weights/KV, and a per-model table with different columns
+# again. Neither puts "Max ctx" where the old "What you're doing | Compose"
+# table did.
+DUAL_CARD_DOC_CURRENT = '''
+## Dual-3090
+
+| Slug | Weights | KV | Max ctx | Narr / Code TPS | Port | State |
+|---|---|---|--:|---|--:|---|
+| `eng/var-a` ⭐ | official FP8 | fp8 e4m3 | 262144 | **67.4 / 85.8** | 8091 | 🧪 needs `--force` |
+| `eng/var-b` | unsloth Q8_K_XL | q8_0 | 131072 | — | 8087 | 🐣 `--force` |
+
+## Other models
+
+| Model | Slug | Max ctx | Port | Notes |
+|---|---|--:|--:|---|
+| **M2** | `eng/var-c` | 224K | 8032 | Dual-only on 24 GB. |
+'''
+
+
+class DualCardDocTests(unittest.TestCase):
+    """Doc cells are located by header name, not column position."""
+
+    def rows_by_compose(self, markdown):
+        return {
+            r["compose"]: r for r in aipc_observer._dual_card_rows(markdown)
+        }
+
+    def test_current_upstream_table_shape(self):
+        rows = self.rows_by_compose(DUAL_CARD_DOC_CURRENT)
+        a = rows["eng/var-a ⭐"]
+        self.assertEqual(a["max_ctx_doc"], "262144")
+        self.assertEqual(a["tps"], "67.4 / 85.8")
+        # No "What you're doing"/"Why" column in this table: empty, so the UI
+        # falls back to the registry's workload and status_note.
+        self.assertEqual(a["workload_label"], "")
+        self.assertEqual(a["why"], "")
+        self.assertEqual(rows["eng/var-b"]["max_ctx_doc"], "131072")
+
+    def test_second_table_remaps_columns(self):
+        rows = self.rows_by_compose(DUAL_CARD_DOC_CURRENT)
+        c = rows["eng/var-c"]
+        self.assertEqual(c["max_ctx_doc"], "224K")
+        self.assertEqual(c["why"], "Dual-only on 24 GB.")
+
+    def test_legacy_table_shape_still_parses(self):
+        rows = aipc_observer._dual_card_rows(DUAL_CARD_DOC)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["max_ctx_doc"], "1K")
+        self.assertEqual(rows[0]["tps"], "10 / 20")
+        self.assertEqual(rows[0]["workload_label"], "General default")
+
+    def test_header_rows_are_never_emitted_as_data(self):
+        for row in aipc_observer._dual_card_rows(DUAL_CARD_DOC_CURRENT):
+            self.assertNotEqual(row["max_ctx_doc"].lower(), "max ctx")
+
+    def test_unrecognized_table_is_skipped_not_misread(self):
+        doc = DUAL_CARD_DOC_CURRENT + """
+| Alpha | Beta | Gamma |
+|---|---|---|
+| one | two | three |
+"""
+        composes = set(self.rows_by_compose(doc))
+        self.assertNotIn("one", composes)
+        self.assertIn("eng/var-c", composes)
+
+
 class CatalogExtractTests(unittest.TestCase):
     """extract_catalog/refresh_catalog against real temporary git repos."""
 
