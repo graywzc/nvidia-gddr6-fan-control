@@ -4967,7 +4967,7 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="requestModalBody" class="modal-body"></div>
 </div></div>
 <script>
-let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};let cacheRamUserEdited=false;let lastCacheSourceKey='';let compareSelections=new Set();let whyExpanded=new Set();
+let es;let lastModelInfo={};let lastRenderData=null;let flagModalOpen=false;let requestRowsByKey={};let cacheRamUserEdited=false;let lastCacheSourceKey='';let compareSelections=new Set();let whyExpanded=new Set();let lastVariantRowsHtml='';
 const PRESET_LABELS={'baseline':'baseline','debug':'debug','insight':'debug','insight-cache':'debug','insight-debug':'debug','custom':'custom'};
 const PRESET_DESCRIPTIONS={
 baseline:'club-3090 compose command with no observer insight flags added',
@@ -5116,15 +5116,19 @@ rows+=fits.map(k=>{let v=vars[k]||{};let doc=variantDoc(v);let mark=k===runKey?'
 return `<div class="variant-row"><span class="variant-pick"><input type="checkbox"${checked} onchange="toggleCompareVariant('${esc(k)}',this.checked)"><span><div class="variant-name">${mark}${esc(k)}${v.adhoc?' <span class="hot" title="Ad-hoc: not in the club-3090 registry, served from a local sidecar compose">ad-hoc</span>':''}</div><div class="variant-note">${esc(v.model||'')}${v.kv_format?' · '+esc(v.kv_format):''}${v.tp?` · TP=${esc(v.tp)}`:''}</div></span></span><span class="value">${esc(variantCtx(v))}</span><span class="value">${esc(variantTps(v))}</span><span>${esc(doc.workload_label||v.workload||'-')}</span><span>${whyCell(k,why,whyOpen)}</span><span style="display:flex;gap:8px;align-items:center;justify-content:flex-end;flex-wrap:wrap">${statusSpan(v.status)}${installing}${k!==runKey?installedLabel:''}${action}</span></div>`}).join('');
 rows+='</div>';
 document.getElementById('variantModalTitle').textContent=`${topologyLabel(topo)} variants for this machine (${fits.length})`;
-document.getElementById('variantModalBody').innerHTML=rows;
-pruneWhyToggles();
+// The dashboard re-renders on every snapshot, and replacing innerHTML nudges
+// the scroll position down a few pixels each time — which reads as the modal
+// creeping back up on its own while you scroll. Re-render only when the
+// markup actually changed, and put the scroll offsets back when it does.
+let vbody=document.getElementById('variantModalBody');
+if(rows!==lastVariantRowsHtml){let sy=vbody.scrollTop,sx=vbody.scrollLeft;vbody.innerHTML=rows;lastVariantRowsHtml=rows;pruneWhyToggles();vbody.scrollTop=sy;vbody.scrollLeft=sx}
 updateCompareToolbar();
 let cs=d.control_status||{};let vms=document.getElementById('variantModalStatus');
 if(cs.action&&!cs.done){let icon=cs.action==='install'?'📦 ':'⏳ ';vms.textContent=icon+esc(cs.detail||cs.action+'…');vms.style.display=''}else{vms.style.display='none'}
 }
 function openVariantList(){if(!lastRenderData)return;let d=lastRenderData;let c=d.catalog||{};let vars=c.variants||{};let keys=Object.keys(vars);let mi=d.model_info||{};let running=!!d.container;let runKey=running?keys.find(k=>vars[k].compose_path&&mi.compose_file&&mi.compose_file.indexOf(vars[k].compose_path)>=0):null;let ngpu=(d.gpu_stats||[]).length||1;let topo=machineTopology(d);let fits=keys.filter(k=>variantTopology(vars[k])===topo&&(vars[k].tp||1)<=ngpu);renderVariantListModal(d,fits,runKey,running,topo);document.getElementById('variantModal').classList.add('open')}
 function refreshVariantListIfOpen(){let m=document.getElementById('variantModal');if(m&&m.classList.contains('open'))openVariantList()}
-function closeVariantList(){document.getElementById('variantModal').classList.remove('open')}
+function closeVariantList(){document.getElementById('variantModal').classList.remove('open');lastVariantRowsHtml=''}
 function closeCompareModal(){document.getElementById('compareModal').classList.remove('open')}
 function commandText(v){let c=v.command;if(Array.isArray(c))return c.join(' ');if(c==null)return '-';return String(c)}
 function entrypointText(v){let e=v.entrypoint;if(Array.isArray(e))return e.join(' ');if(e==null)return '-';return String(e)}
