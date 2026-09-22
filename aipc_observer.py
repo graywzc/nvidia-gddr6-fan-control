@@ -2380,9 +2380,10 @@ def boot_model_once(repo, key, entry, monitor_port, preset="baseline",
                     catalog=None):
     """Boot a model variant in a single phase — no switch.sh + restart dance.
 
-    Resolves the compose config, builds the override with preset flags
-    and --disable-custom-all-reduce (if AIPC_OBSERVER_DISABLE_CUSTOM_ALL_REDUCE=1),
-    writes it, and runs docker compose up -d directly.
+    Resolves the compose config, builds the override with the preset flags,
+    writes it, and runs docker compose up -d directly. Custom all-reduce is
+    not an observer knob: the compose's detect_nvlink.sh decides it from the
+    interconnect (DISABLE_CUSTOM_ALL_REDUCE in the compose env overrides).
     """
     compose_path = (entry or {}).get("compose_path")
     if not compose_path:
