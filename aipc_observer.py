@@ -114,6 +114,25 @@ CRASH_DUMP_KEEP = 20    # newest dump files retained; older pruned
 HOSTNAME = socket.gethostname().split(".")[0]
 
 
+
+def derive_vllm_prompt_tps(req):
+    """Prefill rate estimate for a vLLM row: computed prompt tokens / TTFT.
+
+    vLLM emits nothing between arrival and the first streaming delta, so
+    TTFT ~= prefill time. Only the tokens vLLM actually prefilled count:
+    prefix-cache hits (``cached_tokens``, stamped by attribute_vllm_cache)
+    cost no compute, so including them would overstate the rate by the
+    cache-hit factor. Understates the rate for requests that sat in the
+    queue first (TTFT includes the wait) — acceptable for a dashboard column
+    that would otherwise always be empty.
+    """
+    pt = req.get("prompt_tokens")
+    ttft = req.get("ttft_ms")
+    if not pt or not ttft:
+        return
+    computed = max(0, pt - (req.get("cached_tokens") or 0))
+    req["prompt_tps"] = round(computed / (ttft / 1000.0), 1)
+
 class ObserverState:
     def __init__(self):
         self.lock = threading.Lock()
@@ -304,6 +323,10 @@ class ObserverState:
             req = candidates[0]
             req["cache_hit_pct"] = round(100.0 * delta_h / delta_q, 1)
             req["cached_tokens"] = delta_h
+            # The first streaming delta may already have derived P t/s from
+            # the full prompt length; now that the cached share is known,
+            # restate it over the tokens vLLM actually prefilled.
+            derive_vllm_prompt_tps(req)
             return 1
 
     def prune_vllm_inactive_requests(self, metrics=None):
@@ -3643,6 +3666,11 @@ def variant_is_gguf(entry):
 RE_VLLM_SUCCESS = re.compile(
     r'vllm:request_success_total\{[^}]*finished_reason="([^"]+)"[^}]*\}\s+([\d.eE+]+)'
 )
+# Prompt tokens vLLM actually ran through prefill (newer builds split
+# prompt_tokens_total by source; local_compute excludes prefix-cache hits).
+RE_VLLM_PROMPT_COMPUTED = re.compile(
+    r'vllm:prompt_tokens_by_source_total\{[^}]*source="local_compute"[^}]*\}\s+([\d.eE+]+)'
+)
 
 
 def summarize_vllm_metrics(text, prev=None):
@@ -3675,6 +3703,24 @@ def summarize_vllm_metrics(text, prev=None):
         out["gen_tokens_total"] = int(gt)
     pq = num("vllm:prefix_cache_queries_total")
     ph = num("vllm:prefix_cache_hits_total")
+    # prompt_tokens_total counts every prompt token, cached or not, so a
+    # throughput derived from it is inflated by the prefix-cache hit rate.
+    # Prefer the engine's own computed-tokens counter; older builds only
+    # expose the cached total (or just the prefix-cache hit counter), in
+    # which case computed = total - cached.
+    if pt is not None:
+        cached = num("vllm:prompt_tokens_cached_total")
+        if cached is None and ph is not None:
+            cached = ph
+        if cached is not None:
+            out["prompt_tokens_cached_total"] = int(cached)
+        mc = RE_VLLM_PROMPT_COMPUTED.search(text or "")
+        if mc:
+            out["prompt_tokens_computed_total"] = int(safe_float(mc.group(1)) or 0)
+        elif cached is not None:
+            out["prompt_tokens_computed_total"] = max(0, int(pt) - int(cached))
+        else:
+            out["prompt_tokens_computed_total"] = int(pt)
     if pq:
         out["prefix_cache_hit_pct"] = round(100.0 * (ph or 0) / pq, 1)
     if pq is not None:
@@ -3720,9 +3766,10 @@ def summarize_vllm_metrics(text, prev=None):
     if prev and prev.get("scraped_at"):
         dt = out["scraped_at"] - prev["scraped_at"]
         if dt > 0:
-            if pt is not None and prev.get("prompt_tokens_total") is not None:
+            if pt is not None and prev.get("prompt_tokens_computed_total") is not None:
                 out["prompt_tps_avg"] = max(
-                    0.0, (out["prompt_tokens_total"] - prev["prompt_tokens_total"]) / dt)
+                    0.0, (out["prompt_tokens_computed_total"]
+                          - prev["prompt_tokens_computed_total"]) / dt)
             if gt is not None and prev.get("gen_tokens_total") is not None:
                 out["gen_tps_avg"] = max(
                     0.0, (out["gen_tokens_total"] - prev["gen_tokens_total"]) / dt)
@@ -3730,8 +3777,9 @@ def summarize_vllm_metrics(text, prev=None):
     # intervals where tokens actually moved, so idle time doesn't dilute the
     # average. The _busy accumulators ride the snapshot (poll_metrics feeds each
     # snapshot back as the next `prev`); a counter that shrank means the model
-    # server restarted, which drops the stale accumulation.
-    for kind, total_key in (("prompt", "prompt_tokens_total"),
+    # server restarted, which drops the stale accumulation. Prompt throughput
+    # is over computed tokens only (prefix-cache hits excluded).
+    for kind, total_key in (("prompt", "prompt_tokens_computed_total"),
                             ("gen", "gen_tokens_total")):
         if total_key not in out:
             continue
@@ -4736,17 +4784,7 @@ class VllmLogTracker:
 
     @staticmethod
     def _derive_prompt_tps(req):
-        """Prefill rate estimate: PT / TTFT.
-
-        vLLM emits nothing between arrival and the first streaming delta, so
-        TTFT ~= prefill time. Understates the rate for requests that sat in
-        the queue first (TTFT includes the wait) — acceptable for a dashboard
-        column that would otherwise always be empty.
-        """
-        pt = req.get("prompt_tokens")
-        ttft = req.get("ttft_ms")
-        if pt and ttft:
-            req["prompt_tps"] = round(pt / (ttft / 1000.0), 1)
+        derive_vllm_prompt_tps(req)
 
     def process_line(self, line):
         m = RE_VLLM_DEBUG.search(line)
@@ -5020,11 +5058,12 @@ q.textContent=m.queued??'-';q.className='summary-value '+((m.queued||0)>0?'hot':
 let rows='';
 rows+=infoRow('Running / waiting',`${m.processing??'-'} / ${(m.queued||0)>0?`<span class="hot">${m.queued}</span>`:m.queued??'-'}`,vllm?'num_requests_running / num_requests_waiting':'requests_processing / requests_deferred — queued means all slots are busy');
 let tpsNote=vllm?'throughput over the last scrape interval (derived from token counters)':'server-lifetime average';
-if(m.prompt_tps_avg!=null)rows+=infoRow('Prompt t/s',Number(m.prompt_tps_avg).toFixed(1),tpsNote+' prompt processing throughput');
+if(m.prompt_tps_avg!=null)rows+=infoRow('Prompt t/s',Number(m.prompt_tps_avg).toFixed(1),tpsNote+' prompt processing throughput'+(vllm?' — computed tokens only, prefix-cache hits excluded':''));
 if(m.gen_tps_avg!=null)rows+=infoRow('Gen t/s',Number(m.gen_tps_avg).toFixed(1),tpsNote+' generation throughput');
-if(vllm&&m.prompt_tps_session_avg!=null)rows+=infoRow('Prompt t/s (session avg)',Number(m.prompt_tps_session_avg).toFixed(1),'token-weighted average over scrape intervals with prompt activity since model start');
+if(vllm&&m.prompt_tps_session_avg!=null)rows+=infoRow('Prompt t/s (session avg)',Number(m.prompt_tps_session_avg).toFixed(1),'token-weighted average over scrape intervals with prompt activity since model start — computed tokens only, prefix-cache hits excluded');
 if(vllm&&m.gen_tps_session_avg!=null)rows+=infoRow('Gen t/s (session avg)',Number(m.gen_tps_session_avg).toFixed(1),'token-weighted average over scrape intervals with generation activity since model start');
-if(m.prompt_tokens_total!=null)rows+=infoRow('Prompt tokens',Number(m.prompt_tokens_total).toLocaleString()+(m.prompt_seconds_total!=null?` <span class="label">(${Number(m.prompt_seconds_total).toFixed(0)}s)</span>`:''));
+if(m.prompt_tokens_total!=null)rows+=infoRow('Prompt tokens',Number(m.prompt_tokens_total).toLocaleString()+(m.prompt_seconds_total!=null?` <span class="label">(${Number(m.prompt_seconds_total).toFixed(0)}s)</span>`:''),vllm?'all prompt tokens received, cached or not':'');
+if(vllm&&m.prompt_tokens_cached_total!=null&&m.prompt_tokens_computed_total!=null)rows+=infoRow('Prompt tokens computed',Number(m.prompt_tokens_computed_total).toLocaleString()+` <span class="label">(${Number(m.prompt_tokens_cached_total).toLocaleString()} cached)</span>`,'prompt tokens that actually went through prefill vs. served from the prefix cache');
 if(m.gen_tokens_total!=null)rows+=infoRow('Generated tokens',Number(m.gen_tokens_total).toLocaleString()+(m.gen_seconds_total!=null?` <span class="label">(${Number(m.gen_seconds_total).toFixed(0)}s)</span>`:''));
 if(m.decode_calls_total!=null)rows+=infoRow('Decode calls',Number(m.decode_calls_total).toLocaleString());
 if(m.busy_slots_per_decode!=null)rows+=infoRow('Busy slots / decode',Number(m.busy_slots_per_decode).toFixed(2));
@@ -5248,7 +5287,12 @@ function renderCaseFans(fans){var card=document.getElementById('caseFanCard');if
 (showDuty?('<div class="row"><span class="label">Duty</span><span class="value" id="cfval-'+i+'">'+dutyTxt+'</span></div>'+ctrl):'')+
 '<div class="row"><span class="label">Source</span><span class="value" style="font-weight:500;color:var(--dim)">'+src+'</span></div></div>'}).join('');
 grid.querySelectorAll('input.cf-slider').forEach(function(sl){sl.addEventListener('input',function(){caseFanFreezeUntil=Date.now()+3000;var lab=document.getElementById('cfval-'+sl.dataset.idx);if(lab)lab.textContent=sl.value+'%';});sl.addEventListener('change',function(){setCaseFanDuty(sl.dataset.fan,sl.value,sl.dataset.idx);});});}
-function renderSummary(d){let m=d.metrics||{};let vllm=m.engine==='vllm';let activeEl=document.getElementById('active');let requestsEl=document.getElementById('requests');let gpuTempEl=document.getElementById('gpuTemp');let memTempEl=document.getElementById('memTemp');let avgTpsEl=document.getElementById('avgTps');activeEl.textContent=vllm?(m.processing??0):d.active_count;requestsEl.textContent=vllm?Number(m.requests_total||0).toLocaleString():(d.requests||[]).length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTempEl.textContent=`${g.temp_c}°C`;gpuTempEl.className='summary-value '+cls(g.temp_c);memTempEl.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTempEl.className='summary-value '+cls(g.mem_temp_c)}let done=(d.requests||[]).filter(r=>r.status==='completed'&&r.gen_tps>0);avgTpsEl.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):(m.gen_tps_session_avg!=null?Number(m.gen_tps_session_avg).toFixed(1):'0');let doneP=(d.requests||[]).filter(r=>r.status==='completed'&&r.prompt_tps>0);document.getElementById('avgPromptTps').textContent=doneP.length?(doneP.reduce((s,r)=>s+r.prompt_tps,0)/doneP.length).toFixed(1):(m.prompt_tps_session_avg!=null?Number(m.prompt_tps_session_avg).toFixed(1):'-')}
+function renderSummary(d){let m=d.metrics||{};let vllm=m.engine==='vllm';let activeEl=document.getElementById('active');let requestsEl=document.getElementById('requests');let gpuTempEl=document.getElementById('gpuTemp');let memTempEl=document.getElementById('memTemp');let avgTpsEl=document.getElementById('avgTps');activeEl.textContent=vllm?(m.processing??0):d.active_count;requestsEl.textContent=vllm?Number(m.requests_total||0).toLocaleString():(d.requests||[]).length;if(d.gpu_stats&&d.gpu_stats.length){let g=d.gpu_stats[0];gpuTempEl.textContent=`${g.temp_c}°C`;gpuTempEl.className='summary-value '+cls(g.temp_c);memTempEl.textContent=g.mem_temp_c>=0?`${g.mem_temp_c}°C`:'N/A';memTempEl.className='summary-value '+cls(g.mem_temp_c)}let done=(d.requests||[]).filter(r=>r.status==='completed'&&r.gen_tps>0);avgTpsEl.textContent=done.length?(done.reduce((s,r)=>s+r.gen_tps,0)/done.length).toFixed(1):(m.gen_tps_session_avg!=null?Number(m.gen_tps_session_avg).toFixed(1):'0');let doneP=(d.requests||[]).filter(r=>r.status==='completed'&&r.prompt_tps>0);let avgPromptEl=document.getElementById('avgPromptTps');
+// vLLM: use the engine's counters (computed tokens only, same figure as the
+// Server Metrics session avg) so the two cards agree; the per-request mean is
+// TTFT-based and unweighted, and rows without cache attribution overstate it.
+avgPromptEl.textContent=(vllm&&m.prompt_tps_session_avg!=null)?Number(m.prompt_tps_session_avg).toFixed(1):doneP.length?(doneP.reduce((s,r)=>s+r.prompt_tps,0)/doneP.length).toFixed(1):(m.prompt_tps_session_avg!=null?Number(m.prompt_tps_session_avg).toFixed(1):'-');
+avgPromptEl.title=vllm?'computed prompt tokens per second, prefix-cache hits excluded (engine counters, session average)':''}
 function renderSlots(d){let slots=d.slots||[];let nctx=d.n_ctx||0;document.getElementById('slotInfo').innerHTML=slots.length?slots.map(s=>{let hit=(s.cache_hit_pct==null)?'-':s.cache_hit_pct+'%';let badge=s.is_processing?'<span class="status processing">busy</span>':'<span class="status completed">idle</span>';return `<div class="gpu-card"><div class="gpu-name">Slot ${s.id} ${badge}</div>
 <div class="row"><span class="label">Context</span><span class="value ${cls(s.kv_pct)}">${(s.kv_used||0).toLocaleString()} / ${(s.n_ctx||nctx).toLocaleString()} (${s.kv_pct}%)</span></div><div class="bar"><div class="fill mem" style="width:${pct(s.kv_pct,100)}%"></div></div>
 <div class="row"><span class="label">Prompt cache hit</span><span class="value">${hit}</span></div><div class="bar"><div class="fill fan" style="width:${s.cache_hit_pct||0}%"></div></div>

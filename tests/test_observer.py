@@ -2398,6 +2398,9 @@ vllm:kv_cache_usage_perc{engine="0",model_name="qwen3.6-27b"} 0.031
 vllm:prompt_tokens_total{engine="0",model_name="qwen3.6-27b"} 12947409.0
 vllm:generation_tokens_total{engine="0",model_name="qwen3.6-27b"} 81664.0
 vllm:prompt_tokens_cached_total{engine="0",model_name="qwen3.6-27b"} 900000.0
+vllm:prompt_tokens_by_source_total{engine="0",model_name="qwen3.6-27b",source="local_compute"} 12047409.0
+vllm:prompt_tokens_by_source_total{engine="0",model_name="qwen3.6-27b",source="local_cache_hit"} 900000.0
+vllm:prompt_tokens_by_source_total{engine="0",model_name="qwen3.6-27b",source="external_kv_transfer"} 0.0
 vllm:prefix_cache_queries_total{engine="0",model_name="qwen3.6-27b"} 1000.0
 vllm:prefix_cache_hits_total{engine="0",model_name="qwen3.6-27b"} 826.0
 vllm:spec_decode_num_draft_tokens_total{engine="0",model_name="qwen3.6-27b"} 3000.0
@@ -2473,6 +2476,7 @@ class VllmMetricsTests(unittest.TestCase):
         prev = {
             "scraped_at": aipc_observer.time.time() - 10,
             "prompt_tokens_total": 12947409 - 1000,
+            "prompt_tokens_computed_total": 12047409 - 1000,
             "gen_tokens_total": 81664 - 200,
         }
         m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
@@ -2491,6 +2495,7 @@ class VllmMetricsTests(unittest.TestCase):
         prev = {
             "scraped_at": aipc_observer.time.time() - 10,
             "prompt_tokens_total": 12947409 - 1000,
+            "prompt_tokens_computed_total": 12047409 - 1000,
             "gen_tokens_total": 81664 - 200,
         }
         m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
@@ -2506,6 +2511,7 @@ class VllmMetricsTests(unittest.TestCase):
         prev = {
             "scraped_at": aipc_observer.time.time() - 10,
             "prompt_tokens_total": 12947409 - 1000,
+            "prompt_tokens_computed_total": 12047409 - 1000,
             "gen_tokens_total": 81664 - 200,
         }
         m1 = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
@@ -2524,6 +2530,7 @@ class VllmMetricsTests(unittest.TestCase):
         prev = {
             "scraped_at": aipc_observer.time.time() - 10,
             "prompt_tokens_total": 12947409 + 5000,
+            "prompt_tokens_computed_total": 12047409 + 5000,
             "gen_tokens_total": 81664 + 5000,
             "_prompt_busy_tokens": 999999, "_prompt_busy_secs": 1.0,
             "_gen_busy_tokens": 999999, "_gen_busy_secs": 1.0,
@@ -2531,6 +2538,50 @@ class VllmMetricsTests(unittest.TestCase):
         m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
         self.assertNotIn("prompt_tps_session_avg", m)
         self.assertNotIn("gen_tps_session_avg", m)
+
+    def test_computed_prompt_tokens_from_source_counter(self):
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
+        self.assertEqual(m["prompt_tokens_total"], 12947409)
+        self.assertEqual(m["prompt_tokens_computed_total"], 12047409)
+        self.assertEqual(m["prompt_tokens_cached_total"], 900000)
+
+    def test_computed_prompt_tokens_fallbacks(self):
+        # No by_source series: computed = total - prompt_tokens_cached_total.
+        no_source = "\n".join(
+            l for l in VLLM_METRICS_SAMPLE.splitlines()
+            if "prompt_tokens_by_source_total" not in l)
+        m = aipc_observer.summarize_vllm_metrics(no_source)
+        self.assertEqual(m["prompt_tokens_computed_total"], 12947409 - 900000)
+        # No cached counter either: fall back to the prefix-cache hit counter.
+        no_cached = "\n".join(
+            l for l in no_source.splitlines()
+            if "prompt_tokens_cached_total" not in l)
+        m = aipc_observer.summarize_vllm_metrics(no_cached)
+        self.assertEqual(m["prompt_tokens_computed_total"], 12947409 - 826)
+        self.assertEqual(m["prompt_tokens_cached_total"], 826)
+        # Nothing about the cache at all: computed == total (no correction).
+        bare = "\n".join(
+            l for l in no_cached.splitlines()
+            if "prefix_cache_hits_total" not in l)
+        m = aipc_observer.summarize_vllm_metrics(bare)
+        self.assertEqual(m["prompt_tokens_computed_total"], 12947409)
+        self.assertNotIn("prompt_tokens_cached_total", m)
+
+    def test_prompt_tps_excludes_cache_hits(self):
+        # 1000 prompt tokens arrived in ~10 s but only 100 were computed (the
+        # rest were prefix-cache hits): throughput must be ~10 t/s, not ~100.
+        prev = {
+            "scraped_at": aipc_observer.time.time() - 10,
+            "prompt_tokens_total": 12947409 - 1000,
+            "prompt_tokens_computed_total": 12047409 - 100,
+            "gen_tokens_total": 81664 - 200,
+        }
+        m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE, prev)
+        self.assertAlmostEqual(m["prompt_tps_avg"], 10.0, delta=0.5)
+        self.assertAlmostEqual(m["prompt_tps_session_avg"], 10.0, delta=0.5)
+        # The sparkline rides the same corrected figure.
+        s = aipc_observer.vllm_timeline_sample(m)
+        self.assertAlmostEqual(s["prompt_tps"], 10.0, delta=0.5)
 
     def test_timeline_sample_is_compact(self):
         m = aipc_observer.summarize_vllm_metrics(VLLM_METRICS_SAMPLE)
@@ -2786,6 +2837,26 @@ class VllmLogTrackerTests(unittest.TestCase):
         self.tracker.process_line(self.COMPLETE)
         done = self.state.snapshot()["requests"][0]
         self.assertGreater(done["prompt_tps"], 0)
+
+    def test_cache_attribution_restates_prompt_tps_over_computed_tokens(self):
+        # P t/s derived at the first delta uses the full PT; once the metrics
+        # poll attributes the prefix-cache share, only the tokens vLLM
+        # actually prefilled count (PT 3, 2 cached -> 1 computed).
+        self.tracker.process_line(self.DEBUG_PROMPT)  # PT = 3
+        self.tracker.process_line(self.RECV)
+        self.tracker.active["chatcmpl-abc"]["start_time"] -= 0.5
+        self.tracker.process_line(self.DELTA1)
+        before = self.state.snapshot()["active_requests"][0]["prompt_tps"]
+        self.assertEqual(self.state.attribute_vllm_cache(3, 2), 1)
+        row = self.state.snapshot()["active_requests"][0]
+        self.assertEqual(row["cached_tokens"], 2)
+        self.assertAlmostEqual(
+            row["prompt_tps"], 1 / (row["ttft_ms"] / 1000.0), delta=0.5)
+        self.assertAlmostEqual(row["prompt_tps"], before / 3, delta=0.5)
+        # Completion keeps the corrected figure rather than re-inflating it.
+        self.tracker.process_line(self.COMPLETE)
+        done = self.state.snapshot()["requests"][0]
+        self.assertAlmostEqual(done["prompt_tps"], row["prompt_tps"], delta=0.5)
 
     def test_streaming_delta_reinserts_pruned_row(self):
         # If the metrics pruner wrongly dropped a live row (gauge-lag race),
