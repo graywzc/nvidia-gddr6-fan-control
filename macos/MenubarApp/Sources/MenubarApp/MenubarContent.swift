@@ -257,7 +257,7 @@ struct AddHostWindow: View {
     var onClose: (() -> Void)? = nil
     @State private var name = ""
     @State private var hostname = ""
-    @State private var port = "8765"
+    @State private var port = "443"
     @State private var token = ""
 
     var body: some View {
@@ -266,14 +266,14 @@ struct AddHostWindow: View {
             Form {
                 TextField("Display name (e.g. aipc1)", text: $name)
                 TextField("Hostname or IP (e.g. aipc1.tail-abc.ts.net)", text: $hostname)
-                TextField("Port", text: $port)
+                TextField("Port (443 = HTTPS via tailscale serve)", text: $port)
                 SecureField("Bearer token (optional)", text: $token)
             }
             HStack {
                 Spacer()
                 Button("Cancel") { close() }
                 Button("Add") {
-                    let portInt = Int(port) ?? 8765
+                    let portInt = Int(port) ?? 443
                     poller.addHost(Host(
                         name: name.isEmpty ? hostname : name,
                         hostname: hostname,

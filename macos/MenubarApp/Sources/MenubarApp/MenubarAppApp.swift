@@ -126,7 +126,7 @@ private final class StatusItemController: NSObject {
     }
 
     private func openHostDashboard(host: Host) {
-        guard let url = URL(string: "http://\(host.hostname):\(host.port)/observer") else {
+        guard let url = host.url("/observer") else {
             return
         }
         NSWorkspace.shared.open(url)
