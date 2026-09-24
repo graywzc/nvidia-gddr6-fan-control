@@ -163,7 +163,7 @@ cd nvidia-gddr6-fan-control
 
 The installer runs `swift build -c release`, assembles `/Applications/MenubarApp.app`, and registers a per-user LaunchAgent so the app starts at every login.
 
-After install, click the menubar item → **Add Host…** and enter each Linux host's Tailscale name (e.g. `aipc1`, `aipc`) with port `8765`. The temp appears within ~1 second.
+After install, click the menubar item → **Add Host…** and enter each Linux host's Tailscale MagicDNS name (e.g. `aipc1.<tailnet>.ts.net`) with port `443` — that goes over HTTPS via `sudo tailscale serve --bg --https=443 http://<tailscale-ip>:8765` on the host. Any other port (e.g. `8765`) talks to the observer over plain HTTP. The temp appears within ~1 second.
 
 ### iOS
 

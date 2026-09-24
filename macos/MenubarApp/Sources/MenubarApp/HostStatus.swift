@@ -107,7 +107,7 @@ struct Host: Identifiable, Codable, Hashable {
     var port: Int
     var token: String         // empty string = no token
 
-    init(id: UUID = UUID(), name: String, hostname: String, port: Int = 8765, token: String = "") {
+    init(id: UUID = UUID(), name: String, hostname: String, port: Int = 443, token: String = "") {
         self.id = id
         self.name = name
         self.hostname = hostname
@@ -115,9 +115,18 @@ struct Host: Identifiable, Codable, Hashable {
         self.token = token
     }
 
-    var statusURL: URL? {
-        URL(string: "http://\(hostname):\(port)/status")
+    /// Port 443 means the host is fronted by `tailscale serve` (HTTPS with a
+    /// tailnet cert on the ts.net name); any other port is the observer's
+    /// plain-HTTP listener.
+    var baseURL: String {
+        port == 443 ? "https://\(hostname)" : "http://\(hostname):\(port)"
     }
+
+    func url(_ path: String) -> URL? {
+        URL(string: baseURL + path)
+    }
+
+    var statusURL: URL? { url("/status") }
 }
 
 /// Live per-host state held by the poller.

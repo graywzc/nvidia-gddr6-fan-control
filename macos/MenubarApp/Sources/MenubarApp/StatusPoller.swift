@@ -79,7 +79,7 @@ final class StatusPoller: ObservableObject {
 
     /// Send a new fan curve to the host. Throws on validation/network failure.
     func putCurve(host: Host, curve: [[Int]], gpuIndex: Int? = nil) async throws {
-        guard let url = URL(string: "http://\(host.hostname):\(host.port)/curve") else {
+        guard let url = host.url("/curve") else {
             throw NSError(
                 domain: "MenubarApp", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "bad url"]
@@ -125,7 +125,7 @@ final class StatusPoller: ObservableObject {
 
     /// Send a new board power limit to the host. nil restores the default limit.
     func putPowerLimit(host: Host, watts: Double?, gpuIndex: Int? = nil) async throws {
-        guard let url = URL(string: "http://\(host.hostname):\(host.port)/power-limit") else {
+        guard let url = host.url("/power-limit") else {
             throw NSError(
                 domain: "MenubarApp", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "bad url"]
